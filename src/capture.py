@@ -1,117 +1,112 @@
-import threading
-import ctypes
-import numpy as np
-import time
 import objc
+import time
+import cv2
+import numpy as np
+import os
+import Quartz
+from Foundation import NSObject, NSRunLoop, NSDate
+from ScreenCaptureKit import SCStream, SCStreamConfiguration, SCShareableContent, SCContentFilter
+from CoreMedia import CMSampleBufferGetImageBuffer, CMSampleBufferIsValid
 
-from Foundation import NSObject, NSRunLoop
-
-from ScreenCaptureKit import SCStream, SCStreamConfiguration, SCContentFilter, SCShareableContent, SCStreamOutputTypeScreen
-
-from Quartz import CVPixelBufferLockBaseAddress, CVPixelBufferUnlockBaseAddress, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetWidth, kCVPixelBufferLock_ReadOnly, kCVPixelFormatType_32BGRA
-
-from CoreMedia import CMSampleBufferGetImageBuffer, CMSampleBufferIsValid, CMTimeMake
-
-
-class CaptureDelegate(NSObject):
+class SingleFrameDelegate(NSObject):
     def init(self):
-        self = objc.super(CaptureDelegate, self).init()
-        self.frame = None
-        self.event = threading.Event()
-
+        self = objc.super(SingleFrameDelegate, self).init()
+        self.context = Quartz.CIContext.contextWithOptions_(None)
+        self.captured = False
         return self
 
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
-        if kind != SCStreamOutputTypeScreen or not CMSampleBufferIsValid(sampleBuffer):
+        if self.captured or not CMSampleBufferIsValid(sampleBuffer):
             return
 
         pixel_buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
-        CVPixelBufferLockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly)
+        ci_image = Quartz.CIImage.imageWithCVPixelBuffer_(pixel_buffer)
 
-        try:
-            width = CVPixelBufferGetWidth(pixel_buffer)
-            height = CVPixelBufferGetHeight(pixel_buffer)
-            row_bytes = CVPixelBufferGetBytesPerRow(pixel_buffer)
-            base_address = CVPixelBufferGetBaseAddress(pixel_buffer)
+        if ci_image is None:
+            return
 
-            ctypes_array = (ctypes.c_uint8 * (height * row_bytes)).from_address(int(base_address))
-            image = np.ctypeslib.as_array(ctypes_array).reshape(height, row_bytes)
-            self.frame = image[:, :width*4].reshape(height, width, 4)[:, :, :3].copy()
+        # Get window dimensions
+        extent = ci_image.extent()
+        width = int(extent.size.width)
+        height = int(extent.size.height)
 
-            self.event.set()
+        cg_image = self.context.createCGImage_fromRect_(ci_image, extent)
+        if not cg_image:
+            return
 
-        finally:
-            CVPixelBufferUnlockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly)
+        bytes_per_row = Quartz.CGImageGetBytesPerRow(cg_image)
+        data_provider = Quartz.CGImageGetDataProvider(cg_image)
+        pixel_data = Quartz.CGDataProviderCopyData(data_provider)
+        raw_bytes = np.frombuffer(pixel_data, dtype=np.uint8)
 
+        # 1. Reconstruct clean frame (This avoids the reshape crash)
+        clean_frame = np.zeros((height, width, 4), dtype=np.uint8)
+        for y in range(height):
+            start = y * bytes_per_row
+            end = start + (width * 4)
+            clean_frame[y] = raw_bytes[start:end].reshape(width, 4)
 
-class ScreenCapture:
-    def __init__(self):
-        self.window_name = "Geometry Dash"
-        self.delegate = CaptureDelegate.alloc().init()
-        self.width = 588
-        self.height = 332
-        self.thread = None
+        if not np.any(clean_frame):
+            return
 
-    def start(self):
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
+        # 2. Crop Title Bar (28px) if windowed
+        if height == 692:
+            clean_frame = clean_frame[28:, :]
 
-    def get_latest_frame(self):
-        self.delegate.event.wait()
-        self.delegate.event.clear()
+        # 3. THE COLOR SHIFT LINE
+        # This is the line that produces the "Red is Yellow" or "Yellow is Blue" result.
+        # ScreenCaptureKit usually outputs BGRA, and OpenCV imwrite expects BGR.
+        bgr_frame = cv2.cvtColor(clean_frame, cv2.COLOR_RGBA2BGR)
 
-        return self.delegate.frame
+        # 4. Save
+        path = os.path.join(os.getcwd(), "gd_test_frame.png")
+        cv2.imwrite(path, bgr_frame)
 
-    def _run_loop(self):
-        def content_callback(content, error):
-            if error:
-                return
+        print(f"\n>>> SUCCESS: Captured {bgr_frame.shape[1]}x{bgr_frame.shape[0]}")
+        self.captured = True
 
-            target = None
-            for window in content.windows():
-                if self.window_name.lower() in (window.title() or "").lower():
-                    target = window
-                    break
+def capture_one_frame():
+    delegate = SingleFrameDelegate.alloc().init()
 
-            if target:
-                filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
-            else:
-                filter_ = SCContentFilter.alloc().initWithDisplay_excludingWindows_(content.displays()[0], [])
+    def handler(content, error):
+        if error:
+            print(f"Content Error: {error}")
+            return
 
-            config = SCStreamConfiguration.alloc().init()
-            config.setWidth_(self.width)
-            config.setHeight_(self.height)
-            config.setMinimumFrameInterval_(CMTimeMake(1, 120))
-            config.setPixelFormat_(kCVPixelFormatType_32BGRA)
-            config.setQueueDepth_(3)
+        target = next((w for w in content.windows() if "geometry dash" in (w.title() or "").lower()), None)
+        if not target:
+            print("!!! ERROR: Geometry Dash window not found.")
+            return
 
-            stream = SCStream.alloc().initWithFilter_configuration_delegate_(filter_, config, self.delegate)
+        filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
+        config = SCStreamConfiguration.alloc().init()
+        config.setWidth_(target.frame().size.width)
+        config.setHeight_(target.frame().size.height)
+        config.setQueueDepth_(5)
+        config.setPixelFormat_(1111970369)  # 'BGRA'
 
-        SCShareableContent.getShareableContentWithCompletionHandler_(content_callback)
-        NSRunLoop.currentRunLoop().run()
+        stream = SCStream.alloc().initWithFilter_configuration_delegate_(filter_, config, delegate)
+        stream.addStreamOutput_type_sampleHandlerQueue_error_(delegate, 0, None, None)
 
+        def start_handler(err):
+            if err: print(f"Stream Start Error: {err}")
+            else: print("Stream is LIVE. Waiting for pixels...")
+
+        stream.startCaptureWithCompletionHandler_(start_handler)
+
+    SCShareableContent.getShareableContentWithCompletionHandler_(handler)
+    return delegate
 
 if __name__ == "__main__":
     from AppKit import NSApplication
-    app = NSApplication.sharedApplication()
+    _ = NSApplication.sharedApplication()
+    active_delegate = capture_one_frame()
 
-    cap = ScreenCapture()
-    cap.start()
+    timeout = 10
+    start_wait = time.time()
+    while not active_delegate.captured and (time.time() - start_wait) < timeout:
+        NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
 
-    print(1)
-    try:
-        print(2)
-        frame_count = 0
-        start_time = time.time()
-
-        while frame_count < 1000:
-            print(3)
-            frame = cap.get_latest_frame()
-
-            frame_count += 1
-            if frame_count % 120 == 0:
-                print(f"FPS: {frame_count / (time.time() - start_time):.2f}")
-
-    except KeyboardInterrupt:
-        print("Stopped.")
+    if not active_delegate.captured:
+        print("\n!!! TIMEOUT: No frame received.")
