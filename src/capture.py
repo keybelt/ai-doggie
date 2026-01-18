@@ -1,112 +1,126 @@
 import objc
-import time
 import cv2
 import numpy as np
-import os
+import time
 import Quartz
 from Foundation import NSObject, NSRunLoop, NSDate
 from ScreenCaptureKit import SCStream, SCStreamConfiguration, SCShareableContent, SCContentFilter
 from CoreMedia import CMSampleBufferGetImageBuffer, CMSampleBufferIsValid
 
-class SingleFrameDelegate(NSObject):
+
+class GDAIVision(NSObject):
     def init(self):
-        self = objc.super(SingleFrameDelegate, self).init()
+        self = objc.super(GDAIVision, self).init()
+        if self is None: return None
         self.context = Quartz.CIContext.contextWithOptions_(None)
-        self.captured = False
+
+        # Performance Tracking
+        self.frame_times = []
+        self.last_frame_time = time.time()
+        self.latest_frame = None
+        self.new_frame_available = False
         return self
 
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
-        if self.captured or not CMSampleBufferIsValid(sampleBuffer):
+        if not CMSampleBufferIsValid(sampleBuffer):
             return
 
+        # 1. Update FPS Tracking
+        current_time = time.time()
+        delta = current_time - self.last_frame_time
+        self.frame_times.append(delta)
+        if len(self.frame_times) > 120: self.frame_times.pop(0)
+        self.last_frame_time = current_time
+
+        # 2. Extract Buffer
         pixel_buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         ci_image = Quartz.CIImage.imageWithCVPixelBuffer_(pixel_buffer)
+        if ci_image is None: return
 
-        if ci_image is None:
-            return
-
-        # Get window dimensions
         extent = ci_image.extent()
-        width = int(extent.size.width)
-        height = int(extent.size.height)
+        width, height = int(extent.size.width), int(extent.size.height)
 
+        # 3. Fast Render
         cg_image = self.context.createCGImage_fromRect_(ci_image, extent)
-        if not cg_image:
-            return
+        if not cg_image: return
 
         bytes_per_row = Quartz.CGImageGetBytesPerRow(cg_image)
         data_provider = Quartz.CGImageGetDataProvider(cg_image)
         pixel_data = Quartz.CGDataProviderCopyData(data_provider)
         raw_bytes = np.frombuffer(pixel_data, dtype=np.uint8)
 
-        # 1. Reconstruct clean frame (This avoids the reshape crash)
-        clean_frame = np.zeros((height, width, 4), dtype=np.uint8)
+        # 4. Safe Memory Map (Optimized Row-Slicing)
+        clean_rgba = np.zeros((height, width, 4), dtype=np.uint8)
         for y in range(height):
-            start = y * bytes_per_row
-            end = start + (width * 4)
-            clean_frame[y] = raw_bytes[start:end].reshape(width, 4)
+            offset = y * bytes_per_row
+            row_end = offset + (width * 4)
+            if row_end <= len(raw_bytes):
+                clean_rgba[y] = raw_bytes[offset:row_end].reshape(width, 4)
 
-        if not np.any(clean_frame):
-            return
+        # 5. Crop Title Bar & Convert (BGR for AI/OpenCV)
+        y_start = 28 if height == 692 else 0
 
-        # 2. Crop Title Bar (28px) if windowed
-        if height == 692:
-            clean_frame = clean_frame[28:, :]
+        # We store the frame in a way the AI can grab it
+        self.latest_frame = cv2.cvtColor(clean_rgba[y_start:, :], cv2.COLOR_RGBA2BGR)
+        self.new_frame_available = True
 
-        # 3. THE COLOR SHIFT LINE
-        # This is the line that produces the "Red is Yellow" or "Yellow is Blue" result.
-        # ScreenCaptureKit usually outputs BGRA, and OpenCV imwrite expects BGR.
-        bgr_frame = cv2.cvtColor(clean_frame, cv2.COLOR_RGBA2BGR)
 
-        # 4. Save
-        path = os.path.join(os.getcwd(), "gd_test_frame.png")
-        cv2.imwrite(path, bgr_frame)
-
-        print(f"\n>>> SUCCESS: Captured {bgr_frame.shape[1]}x{bgr_frame.shape[0]}")
-        self.captured = True
-
-def capture_one_frame():
-    delegate = SingleFrameDelegate.alloc().init()
+def start_continuous_capture():
+    vision = GDAIVision.alloc().init()
 
     def handler(content, error):
-        if error:
-            print(f"Content Error: {error}")
-            return
-
+        if error: return
         target = next((w for w in content.windows() if "geometry dash" in (w.title() or "").lower()), None)
-        if not target:
-            print("!!! ERROR: Geometry Dash window not found.")
-            return
+        if not target: return
 
         filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
         config = SCStreamConfiguration.alloc().init()
+
+        # Use target dimensions
         config.setWidth_(target.frame().size.width)
         config.setHeight_(target.frame().size.height)
-        config.setQueueDepth_(5)
+
+        # CRITICAL FOR 120 FPS:
+        config.setQueueDepth_(3)  # Small queue reduces latency
         config.setPixelFormat_(1111970369)  # 'BGRA'
 
-        stream = SCStream.alloc().initWithFilter_configuration_delegate_(filter_, config, delegate)
-        stream.addStreamOutput_type_sampleHandlerQueue_error_(delegate, 0, None, None)
-
-        def start_handler(err):
-            if err: print(f"Stream Start Error: {err}")
-            else: print("Stream is LIVE. Waiting for pixels...")
-
-        stream.startCaptureWithCompletionHandler_(start_handler)
+        stream = SCStream.alloc().initWithFilter_configuration_delegate_(filter_, config, vision)
+        vision.stream_ref = stream
+        stream.addStreamOutput_type_sampleHandlerQueue_error_(vision, 0, None, None)
+        stream.startCaptureWithCompletionHandler_(lambda err: print("120Hz Pipeline Online") if not err else print(err))
 
     SCShareableContent.getShareableContentWithCompletionHandler_(handler)
-    return delegate
+    return vision
+
 
 if __name__ == "__main__":
     from AppKit import NSApplication
+
     _ = NSApplication.sharedApplication()
-    active_delegate = capture_one_frame()
 
-    timeout = 10
-    start_wait = time.time()
-    while not active_delegate.captured and (time.time() - start_wait) < timeout:
-        NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+    vision_engine = start_continuous_capture()
 
-    if not active_delegate.captured:
-        print("\n!!! TIMEOUT: No frame received.")
+    print("Press 'q' to stop.")
+    try:
+        while True:
+            # Pumping the event loop at high frequency
+            NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.001))
+
+            if vision_engine.new_frame_available:
+                # Calculate current average FPS
+                avg_fps = 1.0 / (sum(vision_engine.frame_times) / len(
+                    vision_engine.frame_times)) if vision_engine.frame_times else 0
+
+                # Show frame with FPS overlay
+                frame = vision_engine.latest_frame
+                cv2.putText(frame, f"FPS: {int(avg_fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                cv2.imshow("M4 Pro High-Speed Vision", frame)
+                vision_engine.new_frame_available = False  # Reset flag
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+    except KeyboardInterrupt:
+        pass
+    cv2.destroyAllWindows()
