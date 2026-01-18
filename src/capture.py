@@ -4,6 +4,7 @@ import time
 import Quartz
 import CoreMedia
 import queue
+import collections
 from Foundation import NSObject, NSRunLoop, NSDate
 from ScreenCaptureKit import SCStream, SCStreamConfiguration, SCShareableContent, SCContentFilter
 from libdispatch import dispatch_queue_create
@@ -19,6 +20,13 @@ class GDAIVision(NSObject):
         self.idle_queue = queue.Queue()
         self.ready_queue = queue.Queue()
         self.true_drop_count = 0
+
+        self.stack_size = 4
+        self.frame_stack = collections.deque(maxlen=self.stack_size)
+
+        blank = np.zeros((332, 588, 3), dtype=np.uint8)
+        for _ in range(self.stack_size):
+            self.frame_stack.append(blank)
 
         for _ in range(self.BUFFER_SIZE):
             buf = np.zeros((332, 588, 3), dtype=np.uint8)
