@@ -78,7 +78,6 @@ class GeometryDashEnv:
             return np.zeros((332, 588, 12), dtype=np.uint8)
         return np.concatenate(self.frame_stack, axis=2)
 
-    Python
 
     def step(self, action):
         self.controller.act(action)
