@@ -10,10 +10,13 @@ class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.conv1 = nn.Conv2d(12, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        # Reduced filters for speed & memory
+        # Input: (Batch, 12, 332, 588)
+        self.conv1 = nn.Conv2d(12, 16, kernel_size=8, stride=4)  # 32 -> 16
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=4, stride=2)  # 64 -> 32
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1)  # Keep 64 for features
 
+        # Calculate flat size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.conv1(dummy)
@@ -21,10 +24,10 @@ class GDPolicy(nn.Module):
             x = self.conv3(x)
             self.flat_size = x.numel()
 
-        self.fc = nn.Linear(self.flat_size, 512)
+        self.fc = nn.Linear(self.flat_size, 256)  # 512 -> 256
 
-        self.actor = nn.Linear(512, 2)
-        self.critic = nn.Linear(512, 1)
+        self.actor = nn.Linear(256, 2)
+        self.critic = nn.Linear(256, 1)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
@@ -61,9 +64,12 @@ class PPOAgent:
         returns = torch.tensor(returns, dtype=torch.float32).to(device)
         returns = (returns - returns.mean()) / (returns.std() + 1e-7)
 
-        old_states = torch.stack(states).to(device).detach()
-        old_actions = torch.stack(actions).to(device).detach()
-        old_log_probs = torch.stack(log_probs).to(device).detach()
+        # --- MEMORY FIX: CONVERT UINT8 TO FLOAT ON THE FLY ---
+        # The states came in as uint8 (CPU). We stack them, move to GPU, then float.
+        # This saves VRAM/RAM during the 'stack' operation.
+        old_states = torch.stack(states).to(device).float().div(255.0).squeeze(1)
+        old_actions = torch.stack(actions).to(device).detach().squeeze(1)
+        old_log_probs = torch.stack(log_probs).to(device).detach().squeeze(1)
 
         for _ in range(4):
             logits, new_values = self.model(old_states)
@@ -73,11 +79,13 @@ class PPOAgent:
             new_log_probs = dist.log_prob(old_actions)
             entropy = dist.entropy().mean()
 
+            # Ratio (pi_theta / pi_theta_old)
             ratio = torch.exp(new_log_probs - old_log_probs)
 
-            advantage = returns - new_values.squeeze().detach()
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
+            # Surrogate Loss
+            advantage = returns - new_values.squeeze()
+            surr1 = ratio * advantage.detach()
+            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage.detach()
 
             actor_loss = -torch.min(surr1, surr2).mean()
             critic_loss = self.mse_loss(new_values.squeeze(), returns)
