@@ -1,13 +1,12 @@
 import objc
-import cv2
 import numpy as np
 import time
 import Quartz
 import CoreMedia
-import threading
+import queue
 from Foundation import NSObject, NSRunLoop, NSDate
 from ScreenCaptureKit import SCStream, SCStreamConfiguration, SCShareableContent, SCContentFilter
-from libdispatch import dispatch_get_global_queue
+from libdispatch import dispatch_queue_create
 
 
 class GDAIVision(NSObject):
@@ -15,49 +14,61 @@ class GDAIVision(NSObject):
         self = objc.super(GDAIVision, self).init()
         if self is None: return None
 
-        # PRE-ALLOCATE: Stop the Garbage Collector from triggering
-        # This is a massive win for high-frequency loops
-        self.latest_frame = np.zeros((332, 588, 3), dtype=np.uint8)
+        # --- CONFIGURATION ---
+        # 60 Frames = 0.5 seconds of buffer at 120Hz.
+        # This absorbs massive lag spikes without dropping a single frame.
+        self.BUFFER_SIZE = 60
 
-        self.frame_ready_event = threading.Event()
+        self.idle_queue = queue.Queue()
+        self.ready_queue = queue.Queue()
+        self.true_drop_count = 0  # ACTUAL data loss counter
+
+        # Pre-allocate ALL memory upfront. Zero allocations during runtime.
+        for _ in range(self.BUFFER_SIZE):
+            buf = np.zeros((332, 588, 3), dtype=np.uint8)
+            self.idle_queue.put(buf)
+
         self.processing_latency_ms = 0.0
-        self.total_frames_produced = 0
-        self.total_frames_processed = 0
         return self
 
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
-        self.total_frames_produced += 1
-        start_ts = time.perf_counter()
+        # 1. HARDWARE INTERRUPT (Run as fast as possible)
+        # Check if we have a free buffer to write into
+        try:
+            frame_buffer = self.idle_queue.get_nowait()
+        except queue.Empty:
+            # CRITICAL: This is the ONLY time a real drop happens.
+            # It means Main Thread fell 0.5 seconds behind.
+            self.true_drop_count += 1
+            return
 
-        # 1. Get Buffer
         pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
-        if not pixel_buffer: return
+        if not pixel_buffer:
+            self.idle_queue.put(frame_buffer)  # Return unused buffer
+            return
 
-        # 2. Lock
+        # 2. ZERO-COPY MAP & FAST COPY
+        # We use the raw address to avoid ObjC overhead
         Quartz.CVPixelBufferLockBaseAddress(pixel_buffer, 1)
-
         try:
             width = Quartz.CVPixelBufferGetWidth(pixel_buffer)
             height = Quartz.CVPixelBufferGetHeight(pixel_buffer)
             bpr = Quartz.CVPixelBufferGetBytesPerRow(pixel_buffer)
+            address = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
 
-            # 3. Direct Map
-            address_varlist = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
-            raw_buffer = address_varlist.as_buffer(bpr * height)
-
-            # 4. View Creation (Zero-Copy)
+            # Create a numpy view directly on the IOSurface (Hardware Memory)
+            raw_buffer = address.as_buffer(bpr * height)
             raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(height, bpr)
 
-            # 5. Fast Copy-to-Preallocated (Slices BGRA -> BGR)
-            # np.copyto is significantly faster than .copy() as it doesn't allocate new RAM
-            np.copyto(self.latest_frame, raw_array[:, :width * 4].reshape(height, width, 4)[:, :, :3])
+            # Fast memcpy to our private buffer
+            np.copyto(frame_buffer, raw_array[:, :width * 4].reshape(height, width, 4)[:, :, :3])
 
         finally:
             Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
 
-        self.processing_latency_ms = (time.perf_counter() - start_ts) * 1000
-        self.frame_ready_event.set()
+        # 3. PUSH TO CONSUMER
+        self.ready_queue.put((frame_buffer, time.perf_counter()))
 
 
 def start_continuous_capture():
@@ -70,28 +81,21 @@ def start_continuous_capture():
 
         filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
         config = SCStreamConfiguration.alloc().init()
-
-        # Hardware scaling
         config.setSourceRect_(Quartz.CGRectMake(0, 28, 1176, 664))
         config.setWidth_(588)
         config.setHeight_(332)
-
-        # 120Hz Config
         config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, 120))
         config.setShowsCursor_(False)
-
-        # INCREASE QUEUE DEPTH: Essential for 120Hz.
-        # 8 frames provides ~66ms of "buffer" against Python jitter.
-        config.setQueueDepth_(8)
-        config.setPixelFormat_(1111970369)  # 'BGRA'
+        config.setQueueDepth_(10)
+        config.setPixelFormat_(1111970369)  # BGRA
 
         stream = SCStream.alloc().initWithFilter_configuration_delegate_(filter_, config, vision)
         vision.stream_ref = stream
 
-        queue = dispatch_get_global_queue(33, 0)
-        stream.addStreamOutput_type_sampleHandlerQueue_error_(vision, 0, queue, None)
-        stream.startCaptureWithCompletionHandler_(
-            lambda err: print("\n[M4 Pro] 120Hz Zero-Copy Engine Online") if not err else print(err))
+        # Serial Queue ensures frames arrive in order 1, 2, 3...
+        queue_gcd = dispatch_queue_create(b"com.gdai.capture", None)
+        stream.addStreamOutput_type_sampleHandlerQueue_error_(vision, 0, queue_gcd, None)
+        stream.startCaptureWithCompletionHandler_(lambda err: print("\n[M4 Pro] High-Performance Engine Started"))
 
     SCShareableContent.getShareableContentWithCompletionHandler_(handler)
     return vision
@@ -103,18 +107,38 @@ if __name__ == "__main__":
     _ = NSApplication.sharedApplication()
     engine = start_continuous_capture()
 
+    total_processed = 0
+
     try:
         while True:
-            # High-resolution runloop pump
-            NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.0001))
+            try:
+                # 1. ATTEMPT TO GET FRAME (Non-Blocking)
+                # We do not wait here because we want to manage the RunLoop manually
+                frame_data = engine.ready_queue.get_nowait()
 
-            if engine.frame_ready_event.wait(timeout=0.001):
-                engine.frame_ready_event.clear()
-                engine.total_frames_processed += 1
+                # --- [HOT PATH] WE HAVE DATA ---
+                current_frame, produced_ts = frame_data
 
-                if engine.total_frames_processed % 120 == 0:
-                    drops = engine.total_frames_produced - engine.total_frames_processed
-                    print(f"\rLatency: {engine.processing_latency_ms:.2f}ms | Drops: {drops} | FPS: 120 ", end="")
+                # ... YOUR LOGIC HERE ...
+
+                # Metrics
+                latency = (time.perf_counter() - produced_ts) * 1000
+                total_processed += 1
+
+                # Recycle Buffer Immediately
+                engine.idle_queue.put(current_frame)
+
+                if total_processed % 120 == 0:
+                    # Queue Depth = How many frames are waiting
+                    q_depth = engine.ready_queue.qsize()
+                    print(f"\rLatency: {latency:.2f}ms | Queue Depth: {q_depth} | TRUE DROPS: {engine.true_drop_count}",
+                          end="")
+
+            except queue.Empty:
+                # --- [COLD PATH] NO DATA ---
+                # Only pump the OS loop when we are waiting.
+                # This prevents the OS loop from stealing cycles during active processing.
+                NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.001))
 
     except KeyboardInterrupt:
-        print("\nTerminated.")
+        pass
