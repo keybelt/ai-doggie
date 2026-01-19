@@ -18,7 +18,7 @@ MAX_TIMESTEPS = 20_000_000
 ROLLOUT_STEPS = 1024
 ACCUMULATION_STEPS = 4
 SAVE_INTERVAL = 25
-LOAD_CHECKPOINT = "Pretrain_exit.pt"
+LOAD_CHECKPOINT = None
 
 os_keyboard = Controller()
 
@@ -29,12 +29,12 @@ def safe_pause():
     time.sleep(0.6)
 
 def safe_resume(env):
-    env.flush_vision()
+    """Resumes the game without wiping the AI's internal memory stack."""
     os_keyboard.press(Key.space)
     time.sleep(0.05)
     os_keyboard.release(Key.space)
-    time.sleep(0.4)
-    return env.reset()
+    time.sleep(0.1)
+    return env.get_state()
 
 
 class ControlRoom:
@@ -45,14 +45,16 @@ class ControlRoom:
         self.loaded_from = loaded_from if loaded_from else "Fresh Start"
         self.latencies = deque(maxlen=20)
         self.confidences = deque(maxlen=20)
+        self.total_drops = 0
         self.current_entropy = 0.0
         self.current_policy_loss = 0.0
         self.session_deaths = 0
         self.status_message = "Active"
 
-    def log_step(self, inference_ms, confidence):
+    def log_step(self, inference_ms, confidence, drops):
         self.latencies.append(inference_ms)
         self.confidences.append(confidence)
+        self.total_drops = drops  # Update tracking
 
     def log_update(self, policy_loss, entropy):
         self.current_policy_loss = policy_loss
@@ -64,6 +66,7 @@ class ControlRoom:
         avg_conf = sum(self.confidences) / len(self.confidences) * 100 if self.confidences else 0
         c_reset, c_green, c_yellow, c_red, c_cyan = "\033[0m", "\033[92m", "\033[93m", "\033[91m", "\033[96m"
         lat_color = c_green if avg_lat < 8.33 else c_red
+        drop_color = c_green if self.total_drops == 0 else c_red
         ent_color = c_yellow if self.current_entropy > 0.4 else c_green
         loss_color = c_red if abs(self.current_policy_loss) > 2.0 else c_cyan
         progress = self.update_count % SAVE_INTERVAL
@@ -79,8 +82,9 @@ class ControlRoom:
   > Starting Step:     {self.start_step_static:,}
 
  [LIVE PERFORMANCE]
-  > Latency (120Hz):   {lat_color}{avg_lat:.2f} ms{c_reset}
+  > Inference Latency: {lat_color}{avg_lat:.2f} ms{c_reset}
   > AI Confidence:     {c_green}{avg_conf:.1f}%{c_reset}
+  > Capture Drops:     {drop_color}{self.total_drops}{c_reset}
   > Session Deaths:    {c_red}{self.session_deaths}{c_reset}
 
  [RL BRAIN METRICS]
@@ -156,13 +160,13 @@ def train():
 
                 state_tensor = torch.from_numpy(state).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
 
+                t_compute_start = time.perf_counter()
                 with torch.no_grad():
                     action, log_prob, value = model.get_action(state_tensor)
                     confidence = torch.exp(log_prob).item()
+                inference_time = (time.perf_counter() - t_compute_start) * 1000
 
-                t_start = time.perf_counter()
                 next_state, reward, done, info = env.step(action.item())
-                inf_ms = (time.perf_counter() - t_start) * 1000
 
                 # Handle internal warnings from env without stopping the whole loop
                 if "warning" in info:
@@ -177,7 +181,8 @@ def train():
 
                 state = next_state
                 dash.total_frames += 1
-                dash.log_step(inf_ms, confidence)
+                drops = info.get("drops")
+                dash.log_step(inference_time, confidence, drops)
 
                 if done:
                     dash.session_deaths += 1
@@ -186,7 +191,9 @@ def train():
         if not shutdown_flag:
             dash.status_message = "⏸ Updating Weights..."
             dash.render()
+
             safe_pause()
+            env.engine.stop_stream()
 
             loss, entropy = agent.update(states, actions, log_probs, rewards, dones, values)
             dash.log_update(loss, entropy)
@@ -201,6 +208,13 @@ def train():
             if dash.update_count % SAVE_INTERVAL == 0:
                 save_checkpoint(model, agent, dash.total_frames,
                                 os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_Step_{dash.total_frames // 1000}k.pt"))
+
+            dash.status_message = "🔄 Reconnecting Vision..."
+            dash.render()
+            env.engine.resume_stream()
+
+            time.sleep(0.5)
+            env.flush_vision()
 
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()

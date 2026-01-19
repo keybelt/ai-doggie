@@ -1,7 +1,6 @@
 import numpy as np
 import collections
 import cv2
-import time
 import sys
 import Quartz
 from AppKit import NSApplication
@@ -55,7 +54,6 @@ class GeometryDashEnv:
             self.frame_stack.append(np.zeros((332, 588, 3), dtype=np.uint8))
 
         self.last_color_mask = None
-        self.death_lockout_until = 0
         self.steps_since_reset = 0
 
     def reset(self):
@@ -66,14 +64,26 @@ class GeometryDashEnv:
         return self.get_state()
 
     def flush_vision(self):
-        """Clears the queue until only the bare minimum for the stack remains."""
+        """
+        Clears the capture queue of all 'stale' frames that arrived while the
+        system was paused or updating, while preserving the internal 4-frame
+        stack for motion continuity.
+        """
+        # 1. Clear the hardware queue entirely
+        # We don't want any frames captured during the 'Update' pause
         q_size = self.engine.ready_queue.qsize()
-        if q_size > self.stack_size:
-            for _ in range(q_size - self.stack_size):
-                try:
-                    self.engine.ready_queue.get_nowait()
-                except:
-                    break
+        for _ in range(q_size):
+            try:
+                self.engine.ready_queue.get_nowait()
+            except:
+                break
+
+        # 2. Maintain Stack Continuity
+        # We don't touch self.frame_stack here.
+        # It still contains the 4 frames from RIGHT BEFORE the pause.
+        # When step() is called next, it will get 1 fresh frame,
+        # push it onto the stack, and the oldest pre-pause frame will drop off.
+        # Result: The model sees [Pre-Pause 2, Pre-Pause 3, Pre-Pause 4, Live Frame 1]
 
     def get_state(self):
         return np.concatenate(list(self.frame_stack), axis=2)
@@ -110,24 +120,23 @@ class GeometryDashEnv:
         color_mask = cv2.inRange(hsv_crop, self.lower_spectrum, self.upper_spectrum)
 
         is_dead = False
-        current_time = time.time()
-        if self.last_color_mask is not None and current_time > self.death_lockout_until:
+        if self.last_color_mask is not None:
             mask_diff = cv2.bitwise_xor(color_mask, self.last_color_mask)
             if cv2.countNonZero(mask_diff) > 5:
                 is_dead = True
-                self.death_lockout_until = current_time + 0.35
 
         self.last_color_mask = color_mask.copy()
         self.frame_stack.append(current_frame)
 
         if is_dead:
-            reward = -20.0
+            reward = -25.0
             done = True
         else:
-            reward = 0.1
+            survival_reward = 0.1 + (self.steps_since_reset * 0.001)
+            reward = survival_reward
             done = False
 
-        return self.get_state(), reward, done, {}
+        return self.get_state(), reward, done, {"drops": self.engine.drop_count}
 
 
 _ = NSApplication.sharedApplication()

@@ -18,17 +18,28 @@ class GDAIVision(NSObject):
         self.idle_queue = queue.Queue()
         self.ready_queue = queue.Queue()
 
+        self.drop_count = 0
+
         for _ in range(self.BUFFER_SIZE):
             buf = np.zeros((332, 588, 3), dtype=np.uint8)
             self.idle_queue.put(buf)
 
         return self
 
+    def stop_stream(self):
+        if hasattr(self, 'stream_ref'):
+            self.stream_ref.stopCaptureWithCompletionHandler_(lambda err: None)
+
+    def resume_stream(self):
+        if hasattr(self, 'stream_ref'):
+            self.stream_ref.startCaptureWithCompletionHandler_(lambda err: None)
+
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
         try:
             frame_buffer = self.idle_queue.get_nowait()
         except queue.Empty:
+            self.drop_count += 1
             return
 
         pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
