@@ -15,8 +15,8 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 RUN_NAME = "Pretrain"
 MAX_TIMESTEPS = 20_000_000
-ROLLOUT_STEPS = 1024
-ACCUMULATION_STEPS = 2
+ROLLOUT_STEPS = 4096
+ACCUMULATION_STEPS = 1
 SAVE_INTERVAL = 100
 LOAD_CHECKPOINT = None
 
@@ -182,7 +182,7 @@ def train():
 
                 if "warning" in info: continue
 
-                states.append(torch.from_numpy(state).permute(2, 0, 1).cpu())
+                states.append(state)
                 actions.append(action)
                 log_probs.append(log_prob)
                 rewards.append(reward)

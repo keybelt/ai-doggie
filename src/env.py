@@ -8,6 +8,29 @@ from AppKit import NSApplication
 from capture import start_capture
 
 
+class RewardScaler:
+    def __init__(self, gamma=0.99):
+        self.gamma = gamma
+        self.running_return = 0.0
+        self.running_var = 1.0
+
+    def normalize(self, reward, done):
+        # Update running return (discounted sum of rewards)
+        self.running_return = reward + self.gamma * self.running_return * (1.0 - float(done))
+
+        # Update running variance (approximate moving average of squared returns)
+        self.running_var = 0.99 * self.running_var + 0.01 * (self.running_return ** 2)
+
+        # Scale the reward
+        scaled_reward = reward / (np.sqrt(self.running_var) + 1e-8)
+
+        # Reset return if episode finished
+        if done:
+            self.running_return = 0.0
+
+        return scaled_reward
+
+
 class KeyboardController:
     def __init__(self):
         self.is_holding = False
@@ -35,6 +58,7 @@ class GeometryDashEnv:
     def __init__(self):
         self.engine = start_capture()
         self.controller = KeyboardController()
+        self.scaler = RewardScaler()
 
         print("[Env] Connecting to Vision Engine...")
         try:
@@ -115,10 +139,17 @@ class GeometryDashEnv:
             reward = -25.0
             done = True
         else:
+            # Note: Constant rewards usually stabilize training better than linear ramping.
+            # Consider changing to fixed 0.1, but your logic is fine with the scaler.
             reward = 0.1 + (self.steps_since_reset * 0.001)
             done = False
 
-        return self.get_state(), reward, done, {"drops": self.engine.drop_count}
+            # [NEW] Apply Scaling
+            # We clamp it to [-10, 10] just to prevent crazy outliers from exploding the gradient
+        scaled_reward = self.scaler.normalize(reward, done)
+        scaled_reward = np.clip(scaled_reward, -10.0, 10.0)
+
+        return self.get_state(), scaled_reward, done, {"drops": self.engine.drop_count}
 
     def resume_session(self):
         """
