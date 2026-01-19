@@ -194,9 +194,9 @@ def train():
 
             safe_pause()
             env.engine.stop_stream()
+            time.sleep(0.5)
 
             loss, entropy = agent.update(states, actions, log_probs, rewards, dones, values)
-            dash.log_update(loss, entropy)
 
             states.clear();
             actions.clear();
@@ -216,6 +216,7 @@ def train():
             time.sleep(0.5)
             env.flush_vision()
 
+            dash.log_update(loss, entropy)
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()
             state = safe_resume(env)

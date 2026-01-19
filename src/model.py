@@ -10,9 +10,10 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Standard ResBlock but without heavy padding overhead
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
@@ -27,19 +28,24 @@ class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # --- 1. The Stem (Lightened) ---
-        # 12 -> 48 filters (Reduces memory pressure significantly)
-        self.conv1 = nn.Conv2d(12, 48, kernel_size=7, stride=4, padding=3)
+        # --- THE STABILITY STEM ---
+        # 12 -> 48 Filters: Fast initial reduction
+        self.conv1 = nn.Conv2d(12, 48, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(48)
-        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(48)
 
-        # --- 2. The Body (Balanced ResNet) ---
+        # --- THE WIDE BODY ---
+        # Layer 1: 48 filters
         self.layer1 = ResBlock(48)
 
-        self.conv_up1 = nn.Conv2d(48, 96, kernel_size=3, stride=2, padding=1)
+        # Layer 2: 96 filters
+        self.conv_up1 = nn.Conv2d(48, 96, kernel_size=3, stride=2, padding=1, bias=False)
         self.layer2 = ResBlock(96)
 
-        self.conv_up2 = nn.Conv2d(96, 192, kernel_size=3, stride=2, padding=1)
+        # Layer 3: 192 filters (The "Demon Logic" sweet spot)
+        # We cap at 192 to eliminate those 26 drops while keeping the 256-style IQ
+        self.conv_up2 = nn.Conv2d(96, 192, kernel_size=3, stride=2, padding=1, bias=False)
         self.layer3 = ResBlock(192)
 
         with torch.no_grad():
@@ -47,14 +53,13 @@ class GDPolicy(nn.Module):
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
 
-        # --- 3. The Brain ---
         self.fc = nn.Linear(self.flat_size, 512)
         self.actor = nn.Linear(512, 2)
         self.critic = nn.Linear(512, 1)
 
     def forward_features(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
-        x = self.pool(x)
+        x = F.relu(self.bn2(self.conv2(x)))
         x = self.layer1(x)
         x = F.relu(self.conv_up1(x))
         x = self.layer2(x)
@@ -77,7 +82,7 @@ class GDPolicy(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, model, lr=2.5e-4, gamma=0.99, eps_clip=0.2, batch_size=256):
+    def __init__(self, model, lr=1e-4, gamma=0.995, eps_clip=0.1, batch_size=256):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma

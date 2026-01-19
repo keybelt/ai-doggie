@@ -14,7 +14,7 @@ class GDAIVision(NSObject):
         self = objc.super(GDAIVision, self).init()
         if self is None: return None
 
-        self.BUFFER_SIZE = 60
+        self.BUFFER_SIZE = 120
         self.idle_queue = queue.Queue()
         self.ready_queue = queue.Queue()
 
