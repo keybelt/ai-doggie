@@ -26,15 +26,21 @@ def safe_pause():
     os_keyboard.press(Key.esc)
     time.sleep(0.05)
     os_keyboard.release(Key.esc)
-    time.sleep(0.6)
+    time.sleep(0.02)
+
 
 def safe_resume(env):
     env.flush_vision()
+    # Press space to unpause (assuming Space unpauses in your config)
     os_keyboard.press(Key.space)
     time.sleep(0.05)
     os_keyboard.release(Key.space)
-    time.sleep(0.4)
-    return env.reset()
+    time.sleep(0.02)
+
+    # CHANGED: Use resume_session() instead of reset()
+    # This prevents the "Black Frame" blindness after updates
+    return env.resume_session()
+
 
 class ControlRoom:
     def __init__(self, loaded_from, start_step=0):
@@ -70,7 +76,8 @@ class ControlRoom:
         avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
         lat_color = c_green if avg_lat < 6.0 else c_yellow if avg_lat < 8.0 else c_red
 
-        drop_pct = (self.total_drops / (self.total_frames or 1)) * 100
+        total_generated = (self.total_drops + self.total_frames)
+        drop_pct = (self.total_drops / total_generated * 100) if total_generated > 0 else 0
         drop_color = c_green if drop_pct == 0 else (c_yellow if drop_pct < 0.05 else c_red)
 
         ent_color = c_green if self.current_entropy > 0.4 else c_yellow if self.current_entropy > 0.15 else c_red
@@ -195,7 +202,21 @@ def train():
             dash.render()
             safe_pause()
 
+            # 1. Snapshot drop count BEFORE update
+            drops_before_update = env.engine.drop_count
+
+            # 2. Perform the heavy update (blocking the queue consumer)
             loss, entropy = agent.update(states, actions, log_probs, rewards, dones, values)
+
+            # 3. Snapshot drop count AFTER update
+            drops_after_update = env.engine.drop_count
+
+            # 4. Calculate "Maintenance Drops" that shouldn't count towards performance
+            ignored_drops = drops_after_update - drops_before_update
+
+            # 5. Subtract these from the dashboard's total so the metric stays clean
+            dash.total_drops -= ignored_drops
+
             dash.log_update(loss, entropy)
 
             states.clear(); actions.clear(); log_probs.clear()

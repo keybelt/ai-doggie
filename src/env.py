@@ -3,6 +3,7 @@ import collections
 import cv2
 import sys
 import Quartz
+import time
 from AppKit import NSApplication
 from capture import start_capture
 
@@ -118,6 +119,28 @@ class GeometryDashEnv:
             done = False
 
         return self.get_state(), reward, done, {"drops": self.engine.drop_count}
+
+    def resume_session(self):
+        """
+        Resumes the environment without wiping the frame stack.
+        Used after unpausing to maintain temporal continuity for the model.
+        """
+        # 1. Clear any old frames buffered during the pause/training loop
+        self.flush_vision()
+
+        # 2. Re-acquire the latest state (wait for next frame)
+        # We perform a dummy step of 'no action' to sync with the engine
+        # but we do NOT clear self.frame_stack
+
+        # Wait for at least one fresh frame to arrive after flush
+        start_wait = time.perf_counter()
+        while self.engine.ready_queue.empty():
+            if time.perf_counter() - start_wait > 2.0:
+                print("[Env] Warning: Resume timed out waiting for frame.")
+                break
+            time.sleep(0.005)
+
+        return self.get_state()
 
 
 _ = NSApplication.sharedApplication()

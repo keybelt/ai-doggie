@@ -26,34 +26,60 @@ class ResBlock(nn.Module):
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
+
+        # Initial entry: 12 channels (4 frames * 3 colors) -> 48
         self.conv1 = nn.Conv2d(12, 48, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(48)
-        self.conv2 = nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(48)
 
+        # Layer 1: 48 Channels (Res: 166x294)
         self.layer1 = ResBlock(48)
+
+        # Layer 2: 96 Channels (Res: 83x147)
         self.conv_up1 = nn.Conv2d(48, 96, kernel_size=3, stride=2, padding=1, bias=False)
         self.layer2 = ResBlock(96)
+
+        # Layer 3: 192 Channels (Res: 42x74)
         self.conv_up2 = nn.Conv2d(96, 192, kernel_size=3, stride=2, padding=1, bias=False)
         self.layer3 = ResBlock(192)
 
+        # [NEW] Layer 4: 256 Channels (Res: 21x37)
+        # We increase width to 256 to capture complex "Demon" mechanics
+        self.conv_up3 = nn.Conv2d(192, 256, kernel_size=3, stride=2, padding=1, bias=False)
+        self.layer4 = ResBlock(256)
+
+        # [NEW] Projection Head (The Latency Saver)
+        # Instead of flattening 256 channels (expensive), we compress to 32 spatial-aware channels.
+        # This preserves the "Where is the gap?" info but discards redundant filter info.
+        self.projection = nn.Conv2d(256, 32, kernel_size=1)
+
+        # Calculate flat size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
+            print(f"Feature Map: {x.shape} | Flat Size: {self.flat_size}")
+            # Expected: [1, 32, 21, 37] -> ~24,864 features
+            # This is significantly lighter than the previous ~149k, allowing for the extra depth.
 
         self.fc = nn.Linear(self.flat_size, 512)
         self.actor = nn.Linear(512, 2)
         self.critic = nn.Linear(512, 1)
 
     def forward_features(self, x):
+        # Initial
         x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
+
+        # ResNet Stack
         x = self.layer1(x)
         x = F.relu(self.conv_up1(x))
         x = self.layer2(x)
         x = F.relu(self.conv_up2(x))
         x = self.layer3(x)
+        x = F.relu(self.conv_up3(x))
+        x = self.layer4(x)
+
+        # Projection (Compress Channels, Keep Grid)
+        x = F.relu(self.projection(x))
         return x
 
     def forward(self, x):
