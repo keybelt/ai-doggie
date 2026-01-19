@@ -49,7 +49,6 @@ class GeometryDashEnv:
         self.upper_spectrum = np.array([90, 255, 255])
 
         self.frame_stack = collections.deque(maxlen=self.stack_size)
-        # Initialize with dummy frames to avoid empty stack errors
         for _ in range(self.stack_size):
             self.frame_stack.append(np.zeros((332, 588, 3), dtype=np.uint8))
 
@@ -64,26 +63,13 @@ class GeometryDashEnv:
         return self.get_state()
 
     def flush_vision(self):
-        """
-        Clears the capture queue of all 'stale' frames that arrived while the
-        system was paused or updating, while preserving the internal 4-frame
-        stack for motion continuity.
-        """
-        # 1. Clear the hardware queue entirely
-        # We don't want any frames captured during the 'Update' pause
         q_size = self.engine.ready_queue.qsize()
-        for _ in range(q_size):
-            try:
-                self.engine.ready_queue.get_nowait()
-            except:
-                break
-
-        # 2. Maintain Stack Continuity
-        # We don't touch self.frame_stack here.
-        # It still contains the 4 frames from RIGHT BEFORE the pause.
-        # When step() is called next, it will get 1 fresh frame,
-        # push it onto the stack, and the oldest pre-pause frame will drop off.
-        # Result: The model sees [Pre-Pause 2, Pre-Pause 3, Pre-Pause 4, Live Frame 1]
+        if q_size > self.stack_size:
+            for _ in range(q_size - self.stack_size):
+                try:
+                    self.engine.ready_queue.get_nowait()
+                except:
+                    break
 
     def get_state(self):
         return np.concatenate(list(self.frame_stack), axis=2)
@@ -92,12 +78,10 @@ class GeometryDashEnv:
         self.controller.act(action)
         self.steps_since_reset += 1
 
-        # Aggressively keep queue size low to maintain 120Hz sync
         if self.engine.ready_queue.qsize() > 2:
             self.flush_vision()
 
         raw_frame = None
-        # Retry loop to prevent "freezing" if a frame is momentarily unavailable
         for _ in range(3):
             try:
                 raw_frame, _ = self.engine.ready_queue.get(timeout=0.1)
@@ -106,14 +90,12 @@ class GeometryDashEnv:
                 continue
 
         if raw_frame is None:
-            # Fallback: use last frame if capture stutters, but don't count it as progress
             return self.get_state(), 0.0, False, {"warning": "frame_skip"}
 
         current_frame = raw_frame.copy()
         if hasattr(self.engine, 'idle_queue'):
             self.engine.idle_queue.put(raw_frame)
 
-        # --- DEATH DETECTION ---
         tx, ty, tw, th = self.attempt_roi
         text_crop = current_frame[ty:ty + th, tx:tx + tw]
         hsv_crop = cv2.cvtColor(text_crop, cv2.COLOR_BGR2HSV)
@@ -132,8 +114,7 @@ class GeometryDashEnv:
             reward = -25.0
             done = True
         else:
-            survival_reward = 0.1 + (self.steps_since_reset * 0.001)
-            reward = survival_reward
+            reward = 0.1 + (self.steps_since_reset * 0.001)
             done = False
 
         return self.get_state(), reward, done, {"drops": self.engine.drop_count}

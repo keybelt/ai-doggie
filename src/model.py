@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
 from torch.distributions import Categorical
+import numpy as np
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -10,7 +10,6 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        # Standard ResBlock but without heavy padding overhead
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
@@ -27,24 +26,14 @@ class ResBlock(nn.Module):
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-
-        # --- THE STABILITY STEM ---
-        # 12 -> 48 Filters: Fast initial reduction
         self.conv1 = nn.Conv2d(12, 48, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(48)
         self.conv2 = nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(48)
 
-        # --- THE WIDE BODY ---
-        # Layer 1: 48 filters
         self.layer1 = ResBlock(48)
-
-        # Layer 2: 96 filters
         self.conv_up1 = nn.Conv2d(48, 96, kernel_size=3, stride=2, padding=1, bias=False)
         self.layer2 = ResBlock(96)
-
-        # Layer 3: 192 filters (The "Demon Logic" sweet spot)
-        # We cap at 192 to eliminate those 26 drops while keeping the 256-style IQ
         self.conv_up2 = nn.Conv2d(96, 192, kernel_size=3, stride=2, padding=1, bias=False)
         self.layer3 = ResBlock(192)
 
@@ -115,12 +104,12 @@ class PPOAgent:
 
         for _ in range(self.epochs):
             np.random.shuffle(indices)
+
             for start in range(0, dataset_size, self.batch_size):
                 end = start + self.batch_size
                 batch_idx = indices[start:end]
 
-                raw_chunk = full_states[batch_idx]
-                batch_states = raw_chunk.to(device).float().div(255.0)
+                batch_states = full_states[batch_idx].to(device).float().div(255.0)
                 batch_actions = full_actions[batch_idx]
                 batch_old_log_probs = full_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
@@ -132,9 +121,9 @@ class PPOAgent:
                 entropy = dist.entropy().mean()
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                advantage = batch_returns - new_values.squeeze()
-                surr1 = ratio * advantage.detach()
-                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage.detach()
+                advantage = (batch_returns - new_values.squeeze()).detach()
+                surr1 = ratio * advantage
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = self.mse_loss(new_values.squeeze(), batch_returns)

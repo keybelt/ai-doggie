@@ -8,16 +8,16 @@ from env import GeometryDashEnv
 from model import GDPolicy, PPOAgent
 from pynput.keyboard import Key, Controller
 
-# ... [Config remains same] ...
+# Config
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "..", "checkpoints")
+CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "checkpoints")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 RUN_NAME = "Pretrain"
 MAX_TIMESTEPS = 20_000_000
 ROLLOUT_STEPS = 1024
-ACCUMULATION_STEPS = 4
-SAVE_INTERVAL = 25
+ACCUMULATION_STEPS = 2
+SAVE_INTERVAL = 100
 LOAD_CHECKPOINT = None
 
 os_keyboard = Controller()
@@ -29,13 +29,12 @@ def safe_pause():
     time.sleep(0.6)
 
 def safe_resume(env):
-    """Resumes the game without wiping the AI's internal memory stack."""
+    env.flush_vision()
     os_keyboard.press(Key.space)
     time.sleep(0.05)
     os_keyboard.release(Key.space)
-    time.sleep(0.1)
-    return env.get_state()
-
+    time.sleep(0.4)
+    return env.reset()
 
 class ControlRoom:
     def __init__(self, loaded_from, start_step=0):
@@ -54,7 +53,7 @@ class ControlRoom:
     def log_step(self, inference_ms, confidence, drops):
         self.latencies.append(inference_ms)
         self.confidences.append(confidence)
-        self.total_drops = drops  # Update tracking
+        self.total_drops = drops
 
     def log_update(self, policy_loss, entropy):
         self.current_policy_loss = policy_loss
@@ -62,15 +61,23 @@ class ControlRoom:
         self.update_count += 1
 
     def render(self):
-        avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
-        avg_conf = sum(self.confidences) / len(self.confidences) * 100 if self.confidences else 0
-        c_reset, c_green, c_yellow, c_red, c_cyan = "\033[0m", "\033[92m", "\033[93m", "\033[91m", "\033[96m"
-        lat_color = c_green if avg_lat < 8.33 else c_red
-        drop_color = c_green if self.total_drops == 0 else c_red
-        ent_color = c_yellow if self.current_entropy > 0.4 else c_green
-        loss_color = c_red if abs(self.current_policy_loss) > 2.0 else c_cyan
+        c_reset, c_green, c_yellow, c_red = "\033[0m", "\033[92m", "\033[93m", "\033[91m"
         progress = self.update_count % SAVE_INTERVAL
-        bar = "█" * int((progress / SAVE_INTERVAL) * 10) + "░" * (10 - int((progress / SAVE_INTERVAL) * 10))
+
+        avg_conf = sum(self.confidences) / len(self.confidences) * 100 if self.confidences else 0
+        conf_color = c_green if avg_conf > 85 else c_yellow if avg_conf > 65 else c_red
+
+        avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
+        lat_color = c_green if avg_lat < 6.0 else c_yellow if avg_lat < 8.0 else c_red
+
+        drop_pct = (self.total_drops / (self.total_frames or 1)) * 100
+        drop_color = c_green if drop_pct == 0 else (c_yellow if drop_pct < 0.05 else c_red)
+
+        ent_color = c_green if self.current_entropy > 0.4 else c_yellow if self.current_entropy > 0.15 else c_red
+        ent_label = "EXPLORING" if self.current_entropy > 0.4 else "LEARNING" if self.current_entropy > 0.15 else "STUCK"
+
+        loss_color = c_green if abs(self.current_policy_loss) < 0.02 else c_yellow if abs(self.current_policy_loss) < 0.05 else c_red
+        loss_label = "HEALTHY" if abs(self.current_policy_loss) < 0.02 else "WARNING" if abs(self.current_policy_loss) < 0.05 else "CRITICAL"
 
         os.system('clear')
         print(f"""
@@ -78,26 +85,26 @@ class ControlRoom:
    AI Zoink | {RUN_NAME}
 ============================================================
  [SOURCE]
-  > Loaded From:       {c_cyan}{self.loaded_from}{c_reset}
+  > Loaded From:       {self.loaded_from}
   > Starting Step:     {self.start_step_static:,}
 
  [LIVE PERFORMANCE]
   > Inference Latency: {lat_color}{avg_lat:.2f} ms{c_reset}
-  > AI Confidence:     {c_green}{avg_conf:.1f}%{c_reset}
-  > Capture Drops:     {drop_color}{self.total_drops}{c_reset}
-  > Session Deaths:    {c_red}{self.session_deaths}{c_reset}
+  > AI Confidence:     {conf_color}{avg_conf:.1f}%{c_reset}
+  > Capture Drops:     {self.total_drops} ({drop_color}{drop_pct:.3f}%{c_reset})
+  > Session Deaths:    {self.session_deaths}
 
  [RL BRAIN METRICS]
-  > Curiosity (Ent):   {ent_color}{self.current_entropy:.4f}{c_reset}
-  > Policy Loss:       {loss_color}{self.current_policy_loss:.4f}{c_reset}
+  > Curiosity (Ent):   {self.current_entropy:.3f} ({ent_color}{ent_label}{c_reset})
+  > Policy Loss:       {self.current_policy_loss:.3f} ({loss_color}{loss_label}{c_reset})
 
  [TRAINING PROGRESS]
-  > Global Steps:      {c_cyan}{self.total_frames:,}{c_reset}
+  > Global Steps:      {self.total_frames:,}
   > Weight Updates:    {self.update_count}
-  > Next Checkpoint:   [{bar}] {progress}/{SAVE_INTERVAL}
+  > Next Checkpoint:   {progress}/{SAVE_INTERVAL}
 
  [STATUS]
-  > {c_yellow}{self.status_message}{c_reset}
+  > {self.status_message}
 ============================================================
 """)
 
@@ -114,10 +121,11 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def save_checkpoint(model, agent, step_count, filename):
-    torch.save(
-        {'model_state': model.state_dict(), 'optimizer_state': agent.optimizer.state_dict(), 'global_step': step_count},
-        filename)
-
+    torch.save({
+        'model_state': model.state_dict(),
+        'optimizer_state': agent.optimizer.state_dict(),
+        'global_step': step_count
+    }, filename)
 
 def train():
     global shutdown_flag
@@ -129,7 +137,6 @@ def train():
     model = GDPolicy().to(device)
     agent = PPOAgent(model)
 
-    # Load Logic
     start_step = 0
     loaded_name = None
     if LOAD_CHECKPOINT:
@@ -154,23 +161,19 @@ def train():
 
             for i in range(ROLLOUT_STEPS):
                 if shutdown_flag: break
-
-                # Ensure the dashboard renders regularly to prevent freezing appearance
                 if i % 50 == 0: dash.render()
 
                 state_tensor = torch.from_numpy(state).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
 
-                t_compute_start = time.perf_counter()
+                t_start = time.perf_counter()
                 with torch.no_grad():
                     action, log_prob, value = model.get_action(state_tensor)
                     confidence = torch.exp(log_prob).item()
-                inference_time = (time.perf_counter() - t_compute_start) * 1000
+                inf_ms = (time.perf_counter() - t_start) * 1000
 
                 next_state, reward, done, info = env.step(action.item())
 
-                # Handle internal warnings from env without stopping the whole loop
-                if "warning" in info:
-                    continue
+                if "warning" in info: continue
 
                 states.append(torch.from_numpy(state).permute(2, 0, 1).cpu())
                 actions.append(action)
@@ -181,42 +184,27 @@ def train():
 
                 state = next_state
                 dash.total_frames += 1
-                drops = info.get("drops")
-                dash.log_step(inference_time, confidence, drops)
+                dash.log_step(inf_ms, confidence, info.get("drops"))
 
                 if done:
                     dash.session_deaths += 1
                     state = env.reset()
 
         if not shutdown_flag:
-            dash.status_message = "⏸ Updating Weights..."
+            dash.status_message = "⏸️ Updating Weights..."
             dash.render()
-
             safe_pause()
-            env.engine.stop_stream()
-            time.sleep(0.5)
 
             loss, entropy = agent.update(states, actions, log_probs, rewards, dones, values)
+            dash.log_update(loss, entropy)
 
-            states.clear();
-            actions.clear();
-            log_probs.clear()
-            rewards.clear();
-            dones.clear();
-            values.clear()
+            states.clear(); actions.clear(); log_probs.clear()
+            rewards.clear(); dones.clear(); values.clear()
 
             if dash.update_count % SAVE_INTERVAL == 0:
-                save_checkpoint(model, agent, dash.total_frames,
-                                os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_Step_{dash.total_frames // 1000}k.pt"))
+                dash.status_message = "💾 SAVING CHECKPOINT..."
+                save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_S{dash.total_frames//1000}k.pt"))
 
-            dash.status_message = "🔄 Reconnecting Vision..."
-            dash.render()
-            env.engine.resume_stream()
-
-            time.sleep(0.5)
-            env.flush_vision()
-
-            dash.log_update(loss, entropy)
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()
             state = safe_resume(env)

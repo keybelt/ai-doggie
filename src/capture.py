@@ -26,14 +26,6 @@ class GDAIVision(NSObject):
 
         return self
 
-    def stop_stream(self):
-        if hasattr(self, 'stream_ref'):
-            self.stream_ref.stopCaptureWithCompletionHandler_(lambda err: None)
-
-    def resume_stream(self):
-        if hasattr(self, 'stream_ref'):
-            self.stream_ref.startCaptureWithCompletionHandler_(lambda err: None)
-
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
         try:
