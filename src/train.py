@@ -6,33 +6,47 @@ import signal
 from collections import deque
 from env import GeometryDashEnv
 from model import GDPolicy, PPOAgent
+from pynput.keyboard import Key, Controller
 
-# --- CONFIG ---
+# ... [Config remains same] ...
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "..", "checkpoints")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 RUN_NAME = "Pretrain"
 MAX_TIMESTEPS = 20_000_000
-
-# OPTIMIZATION: Gradient Accumulation
-ROLLOUT_STEPS = 1024  # Keep small to save RAM
-ACCUMULATION_STEPS = 4  # Play 4x batches before updating (Total effective batch = 4096)
-
-SAVE_INTERVAL = 25  # Adjusted: 25 updates * 4 accum = 100 actual cycles
+ROLLOUT_STEPS = 1024
+ACCUMULATION_STEPS = 4
+SAVE_INTERVAL = 25
 LOAD_CHECKPOINT = "Pretrain_exit.pt"
 
+os_keyboard = Controller()
 
-# --- DASHBOARD ---
+def safe_pause():
+    os_keyboard.press(Key.esc)
+    time.sleep(0.05)
+    os_keyboard.release(Key.esc)
+    time.sleep(0.6)
+
+def safe_resume(env):
+    env.flush_vision()
+    os_keyboard.press(Key.space)
+    time.sleep(0.05)
+    os_keyboard.release(Key.space)
+    time.sleep(0.4)
+    return env.reset()
+
+
 class ControlRoom:
     def __init__(self, loaded_from, start_step=0):
         self.start_step_static = start_step
         self.total_frames = start_step
         self.update_count = 0
         self.loaded_from = loaded_from if loaded_from else "Fresh Start"
-
         self.latencies = deque(maxlen=20)
         self.confidences = deque(maxlen=20)
+        self.current_entropy = 0.0
+        self.current_policy_loss = 0.0
         self.session_deaths = 0
         self.status_message = "Active"
 
@@ -40,51 +54,50 @@ class ControlRoom:
         self.latencies.append(inference_ms)
         self.confidences.append(confidence)
 
+    def log_update(self, policy_loss, entropy):
+        self.current_policy_loss = policy_loss
+        self.current_entropy = entropy
+        self.update_count += 1
+
     def render(self):
         avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
         avg_conf = sum(self.confidences) / len(self.confidences) * 100 if self.confidences else 0
-
+        c_reset, c_green, c_yellow, c_red, c_cyan = "\033[0m", "\033[92m", "\033[93m", "\033[91m", "\033[96m"
+        lat_color = c_green if avg_lat < 8.33 else c_red
+        ent_color = c_yellow if self.current_entropy > 0.4 else c_green
+        loss_color = c_red if abs(self.current_policy_loss) > 2.0 else c_cyan
         progress = self.update_count % SAVE_INTERVAL
-        bar_len = 10
-        filled = int((progress / SAVE_INTERVAL) * bar_len)
-        bar = "█" * filled + "░" * (bar_len - filled)
-
-        lat_color = "\033[92m" if avg_lat < 8.0 else "\033[91m"
-        reset = "\033[0m"
+        bar = "█" * int((progress / SAVE_INTERVAL) * 10) + "░" * (10 - int((progress / SAVE_INTERVAL) * 10))
 
         os.system('clear')
-
-        dashboard = f"""
+        print(f"""
 ============================================================
    AI Zoink | {RUN_NAME}
 ============================================================
  [SOURCE]
-  > Loaded From:       {self.loaded_from}
+  > Loaded From:       {c_cyan}{self.loaded_from}{c_reset}
   > Starting Step:     {self.start_step_static:,}
 
- [PERFORMANCE]
-  > Inference Latency: {lat_color}{avg_lat:.2f} ms{reset}
-  > AI Confidence:     {avg_conf:.1f}%
+ [LIVE PERFORMANCE]
+  > Latency (120Hz):   {lat_color}{avg_lat:.2f} ms{c_reset}
+  > AI Confidence:     {c_green}{avg_conf:.1f}%{c_reset}
+  > Session Deaths:    {c_red}{self.session_deaths}{c_reset}
 
- [STATS]
-  > Deaths (Session):  {self.session_deaths}
+ [RL BRAIN METRICS]
+  > Curiosity (Ent):   {ent_color}{self.current_entropy:.4f}{c_reset}
+  > Policy Loss:       {loss_color}{self.current_policy_loss:.4f}{c_reset}
 
  [TRAINING PROGRESS]
-  > Global Steps:      {self.total_frames:,}
-  > Weight Updates:    {self.update_count} (Session)
-  > Accumulation:      {ROLLOUT_STEPS} x {ACCUMULATION_STEPS} = {ROLLOUT_STEPS * ACCUMULATION_STEPS} steps/update
+  > Global Steps:      {c_cyan}{self.total_frames:,}{c_reset}
+  > Weight Updates:    {self.update_count}
   > Next Checkpoint:   [{bar}] {progress}/{SAVE_INTERVAL}
 
  [STATUS]
-  > {self.status_message}
-
+  > {c_yellow}{self.status_message}{c_reset}
 ============================================================
-"""
-        sys.stdout.write(dashboard)
-        sys.stdout.flush()
+""")
 
 
-# --- HANDLERS ---
 shutdown_flag = False
 
 
@@ -97,12 +110,9 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def save_checkpoint(model, agent, step_count, filename):
-    payload = {
-        'model_state': model.state_dict(),
-        'optimizer_state': agent.optimizer.state_dict(),
-        'global_step': step_count
-    }
-    torch.save(payload, filename)
+    torch.save(
+        {'model_state': model.state_dict(), 'optimizer_state': agent.optimizer.state_dict(), 'global_step': step_count},
+        filename)
 
 
 def train():
@@ -115,24 +125,17 @@ def train():
     model = GDPolicy().to(device)
     agent = PPOAgent(model)
 
+    # Load Logic
     start_step = 0
     loaded_name = None
-
     if LOAD_CHECKPOINT:
-        clean_name = os.path.basename(LOAD_CHECKPOINT)
-        path = os.path.join(CHECKPOINT_DIR, clean_name)
+        path = os.path.join(CHECKPOINT_DIR, LOAD_CHECKPOINT)
         if os.path.exists(path):
-            print(f"Loading: {path}")
             checkpoint = torch.load(path, map_location=device)
-            if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
-                print("✅ Detected Bundle")
-                model.load_state_dict(checkpoint['model_state'])
-                agent.optimizer.load_state_dict(checkpoint['optimizer_state'])
-                start_step = checkpoint['global_step']
-            else:
-                model.load_state_dict(checkpoint)
-            loaded_name = clean_name
-            time.sleep(1)
+            model.load_state_dict(checkpoint['model_state'])
+            agent.optimizer.load_state_dict(checkpoint['optimizer_state'])
+            start_step = checkpoint['global_step']
+            loaded_name = LOAD_CHECKPOINT
 
     dash = ControlRoom(loaded_name, start_step)
     state = env.reset()
@@ -141,31 +144,30 @@ def train():
     while dash.total_frames < MAX_TIMESTEPS:
         if shutdown_flag: break
 
-        # --- GRADIENT ACCUMULATION LOOP ---
-        # We play X times, accumulate gradients, then update ONCE.
-
-        agent.optimizer.zero_grad()  # Clear gradients before starting accumulation
-
         for accum_step in range(ACCUMULATION_STEPS):
             if shutdown_flag: break
+            dash.status_message = f"Collecting Experience ({accum_step + 1}/{ACCUMULATION_STEPS})..."
 
-            dash.status_message = f"Playing (Batch {accum_step + 1}/{ACCUMULATION_STEPS})..."
-
-            # 1. Collect Data (Play Phase)
             for i in range(ROLLOUT_STEPS):
                 if shutdown_flag: break
 
+                # Ensure the dashboard renders regularly to prevent freezing appearance
+                if i % 50 == 0: dash.render()
+
                 state_tensor = torch.from_numpy(state).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
 
-                t0 = time.perf_counter()
                 with torch.no_grad():
                     action, log_prob, value = model.get_action(state_tensor)
                     confidence = torch.exp(log_prob).item()
-                inf_ms = (time.perf_counter() - t0) * 1000
 
-                next_state, reward, done, _ = env.step(action.item())
+                t_start = time.perf_counter()
+                next_state, reward, done, info = env.step(action.item())
+                inf_ms = (time.perf_counter() - t_start) * 1000
 
-                # Store data
+                # Handle internal warnings from env without stopping the whole loop
+                if "warning" in info:
+                    continue
+
                 states.append(torch.from_numpy(state).permute(2, 0, 1).cpu())
                 actions.append(action)
                 log_probs.append(log_prob)
@@ -181,34 +183,14 @@ def train():
                     dash.session_deaths += 1
                     state = env.reset()
 
-                if i % 60 == 0:
-                    dash.render()
-
-            # 2. Compute Gradients (But don't step optimizer yet!)
-            if not shutdown_flag:
-                dash.status_message = f"Calculating Gradients ({accum_step + 1}/{ACCUMULATION_STEPS})..."
-                dash.render()
-
-                # Note: We need to modify PPOAgent.update slightly to NOT zero_grad automatically
-                # For simplicity, we just call update().
-                # Ideally, you'd split PPO into 'calc_loss' and 'step', but standard PPO update
-                # runs multiple epochs anyway.
-
-                # SIMPLIFIED ACCUMULATION STRATEGY FOR PPO:
-                # Since PPO is on-policy and runs epochs internally, "Accumulation" usually just means
-                # "Collect a bigger batch". We have effectively done that by looping here.
-                # However, we need to KEEP the data in the lists until the end of the accum loop.
-                pass
-
-                # --- UPDATE PHASE (Once per X batches) ---
         if not shutdown_flag:
-            dash.status_message = "🔄 Updating Weights (Big Batch)..."
+            dash.status_message = "⏸ Updating Weights..."
             dash.render()
+            safe_pause()
 
-            # Now we send the MASSIVE combined lists to the agent
-            agent.update(states, actions, log_probs, rewards, dones, values)
+            loss, entropy = agent.update(states, actions, log_probs, rewards, dones, values)
+            dash.log_update(loss, entropy)
 
-            # Clear buffers
             states.clear();
             actions.clear();
             log_probs.clear()
@@ -216,20 +198,15 @@ def train():
             dones.clear();
             values.clear()
 
-            dash.update_count += 1
-
             if dash.update_count % SAVE_INTERVAL == 0:
-                step_str = f"{dash.total_frames // 1000}k"
-                filename = os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_Step_{step_str}.pt")
-                dash.status_message = f"💾 Saving Bundle: {step_str}..."
-                dash.render()
-                save_checkpoint(model, agent, dash.total_frames, filename)
+                save_checkpoint(model, agent, dash.total_frames,
+                                os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_Step_{dash.total_frames // 1000}k.pt"))
 
+            dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()
+            state = safe_resume(env)
 
-    print("\nSaving Exit Checkpoint...")
-    filename = os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt")
-    save_checkpoint(model, agent, dash.total_frames, filename)
+    save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
     sys.exit()
 
 
