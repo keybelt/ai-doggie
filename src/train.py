@@ -3,6 +3,7 @@ import time
 import sys
 import os
 import signal
+import gc  # <--- [CRITICAL] Added for performance control
 from collections import deque
 from env import GeometryDashEnv
 from model import GDPolicy, PPOAgent
@@ -22,6 +23,7 @@ LOAD_CHECKPOINT = None
 
 os_keyboard = Controller()
 
+
 def safe_pause():
     os_keyboard.press(Key.esc)
     time.sleep(0.05)
@@ -31,14 +33,13 @@ def safe_pause():
 
 def safe_resume(env):
     env.flush_vision()
-    # Press space to unpause (assuming Space unpauses in your config)
     os_keyboard.press(Key.space)
     time.sleep(0.05)
     os_keyboard.release(Key.space)
     time.sleep(0.02)
 
-    # CHANGED: Use resume_session() instead of reset()
-    # This prevents the "Black Frame" blindness after updates
+    # [LOGIC] Unpause the engine right before we ask for a frame
+    env.engine.paused = False
     return env.resume_session()
 
 
@@ -74,17 +75,19 @@ class ControlRoom:
         conf_color = c_green if avg_conf > 85 else c_yellow if avg_conf > 65 else c_red
 
         avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
-        lat_color = c_green if avg_lat < 6.0 else c_yellow if avg_lat < 8.0 else c_red
+        lat_color = c_green if avg_lat < 5.0 else c_yellow if avg_lat < 8.0 else c_red
 
-        total_generated = (self.total_drops + self.total_frames)
-        drop_pct = (self.total_drops / total_generated * 100) if total_generated > 0 else 0
-        drop_color = c_green if drop_pct == 0 else (c_yellow if drop_pct < 0.05 else c_red)
+        # Logic: We divide by total_frames (gameplay time), ignoring the massive paused drops
+        drop_pct = (self.total_drops / (self.total_frames + 1e-7) * 100)
+        drop_color = c_green if drop_pct == 0 else (c_yellow if drop_pct < 0.1 else c_red)
 
         ent_color = c_green if self.current_entropy > 0.4 else c_yellow if self.current_entropy > 0.15 else c_red
         ent_label = "EXPLORING" if self.current_entropy > 0.4 else "LEARNING" if self.current_entropy > 0.15 else "STUCK"
 
-        loss_color = c_green if abs(self.current_policy_loss) < 0.02 else c_yellow if abs(self.current_policy_loss) < 0.05 else c_red
-        loss_label = "HEALTHY" if abs(self.current_policy_loss) < 0.02 else "WARNING" if abs(self.current_policy_loss) < 0.05 else "CRITICAL"
+        loss_color = c_green if abs(self.current_policy_loss) < 0.02 else c_yellow if abs(
+            self.current_policy_loss) < 0.05 else c_red
+        loss_label = "HEALTHY" if abs(self.current_policy_loss) < 0.02 else "WARNING" if abs(
+            self.current_policy_loss) < 0.05 else "CRITICAL"
 
         os.system('clear')
         print(f"""
@@ -134,6 +137,7 @@ def save_checkpoint(model, agent, step_count, filename):
         'global_step': step_count
     }, filename)
 
+
 def train():
     global shutdown_flag
     print("⚠️  FOCUS GEOMETRY DASH NOW...")
@@ -141,7 +145,12 @@ def train():
 
     env = GeometryDashEnv()
     device = torch.device("mps")
+
+    # [CONFIG CHECK]
+    # Use the Direct-Fire or Zoink-XS model we defined earlier.
     model = GDPolicy().to(device)
+
+    # [CONFIG CHECK]
     agent = PPOAgent(model)
 
     start_step = 0
@@ -156,7 +165,10 @@ def train():
             loaded_name = LOAD_CHECKPOINT
 
     dash = ControlRoom(loaded_name, start_step)
+    env.engine.drop_count = 0
+    env.engine.paused = False
     state = env.reset()
+
     states, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
 
     while dash.total_frames < MAX_TIMESTEPS:
@@ -164,13 +176,18 @@ def train():
 
         for accum_step in range(ACCUMULATION_STEPS):
             if shutdown_flag: break
+
+            gc.disable()  # Anti-Stutter
+
             dash.status_message = f"Collecting Experience ({accum_step + 1}/{ACCUMULATION_STEPS})..."
 
             for i in range(ROLLOUT_STEPS):
                 if shutdown_flag: break
                 if i % 50 == 0: dash.render()
 
-                state_tensor = torch.from_numpy(state).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
+                state_tensor = torch.from_numpy(state).to(device)
+                state_tensor = state_tensor.float().div(255.0)
+                state_tensor = state_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
 
                 t_start = time.perf_counter()
                 with torch.no_grad():
@@ -179,7 +196,6 @@ def train():
                 inf_ms = (time.perf_counter() - t_start) * 1000
 
                 next_state, reward, done, info = env.step(action.item())
-
                 if "warning" in info: continue
 
                 states.append(state)
@@ -191,40 +207,36 @@ def train():
 
                 state = next_state
                 dash.total_frames += 1
-                dash.log_step(inf_ms, confidence, info.get("drops"))
+
+                dash.log_step(inf_ms, confidence, info.get("drops", 0))
 
                 if done:
                     dash.session_deaths += 1
                     state = env.reset()
 
+            gc.enable()
+
         if not shutdown_flag:
             dash.status_message = "⏸️ Updating Weights..."
             dash.render()
+            env.engine.paused = True
+            gc.collect()
             safe_pause()
 
-            # 1. Snapshot drop count BEFORE update
-            drops_before_update = env.engine.drop_count
-
-            # 2. Perform the heavy update (blocking the queue consumer)
             loss, entropy = agent.update(states, actions, log_probs, rewards, dones, values)
 
-            # 3. Snapshot drop count AFTER update
-            drops_after_update = env.engine.drop_count
-
-            # 4. Calculate "Maintenance Drops" that shouldn't count towards performance
-            ignored_drops = drops_after_update - drops_before_update
-
-            # 5. Subtract these from the dashboard's total so the metric stays clean
-            dash.total_drops -= ignored_drops
-
             dash.log_update(loss, entropy)
-
-            states.clear(); actions.clear(); log_probs.clear()
-            rewards.clear(); dones.clear(); values.clear()
+            states.clear();
+            actions.clear();
+            log_probs.clear()
+            rewards.clear();
+            dones.clear();
+            values.clear()
 
             if dash.update_count % SAVE_INTERVAL == 0:
                 dash.status_message = "💾 SAVING CHECKPOINT..."
-                save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_S{dash.total_frames//1000}k.pt"))
+                save_checkpoint(model, agent, dash.total_frames,
+                                os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_S{dash.total_frames // 1000}k.pt"))
 
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()

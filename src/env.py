@@ -61,6 +61,8 @@ class GeometryDashEnv:
         self.scaler = RewardScaler()
 
         print("[Env] Connecting to Vision Engine...")
+        self.engine.paused = False
+
         try:
             self.engine.ready_queue.get(timeout=10.0)
             print("[Env] Vision Connected!")
@@ -68,10 +70,12 @@ class GeometryDashEnv:
             print("\n[CRITICAL ERROR] Vision Engine timed out!")
             sys.exit(1)
 
+        self.engine.paused = True
         self.stack_size = 4
+        self.flush_vision()
         self.attempt_roi = (56, 3, 53, 13)
-        self.lower_spectrum = np.array([70, 50, 50])
-        self.upper_spectrum = np.array([90, 255, 255])
+        self.lower_spectrum = np.array([70, 100, 100])
+        self.upper_spectrum = np.array([80, 255, 255])
 
         self.frame_stack = collections.deque(maxlen=self.stack_size)
         for _ in range(self.stack_size):

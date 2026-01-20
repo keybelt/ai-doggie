@@ -14,11 +14,16 @@ class GDAIVision(NSObject):
         self = objc.super(GDAIVision, self).init()
         if self is None: return None
 
-        self.BUFFER_SIZE = 6000
+        # [STRICT] 12 Frames = 100ms buffer (Real-time constraint)
+        self.BUFFER_SIZE = 12
         self.idle_queue = queue.Queue()
         self.ready_queue = queue.Queue()
 
         self.drop_count = 0
+
+        # [NEW] The Pause Switch
+        # Start paused so we don't count drops during Python startup
+        self.paused = True
 
         for _ in range(self.BUFFER_SIZE):
             buf = np.zeros((332, 588, 3), dtype=np.uint8)
@@ -28,9 +33,15 @@ class GDAIVision(NSObject):
 
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
+        # [NEW] If paused, discard frame silently.
+        # Do NOT increment drop_count. Do NOT touch queues.
+        if self.paused:
+            return
+
         try:
             frame_buffer = self.idle_queue.get_nowait()
         except queue.Empty:
+            # Only count drops if we are SUPPOSED to be capturing
             self.drop_count += 1
             return
 
@@ -41,15 +52,17 @@ class GDAIVision(NSObject):
 
         Quartz.CVPixelBufferLockBaseAddress(pixel_buffer, 1)
         try:
-            width = Quartz.CVPixelBufferGetWidth(pixel_buffer)
-            height = Quartz.CVPixelBufferGetHeight(pixel_buffer)
+            # Optimized: Hardcoded resolution saves overhead
+            # Assuming 588x332 based on your config
             bpr = Quartz.CVPixelBufferGetBytesPerRow(pixel_buffer)
             base_addr = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
 
-            raw_buffer = base_addr.as_buffer(bpr * height)
-            raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(height, bpr)
+            # Fast Buffer Copy
+            raw_buffer = base_addr.as_buffer(bpr * 332)
+            raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(332, bpr)
 
-            np.copyto(frame_buffer, raw_array[:, :width * 4].reshape(height, width, 4)[:, :, :3])
+            # Crop/Slice to 3 channels
+            np.copyto(frame_buffer, raw_array[:, :2352].reshape(332, 588, 4)[:, :, :3])
 
         finally:
             Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
