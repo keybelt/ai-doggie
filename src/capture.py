@@ -14,8 +14,7 @@ class GDAIVision(NSObject):
         self = objc.super(GDAIVision, self).init()
         if self is None: return None
 
-        # [STRICT] 12 Frames = 100ms buffer (Real-time constraint)
-        self.BUFFER_SIZE = 12
+        self.BUFFER_SIZE = 6
         self.idle_queue = queue.Queue()
         self.ready_queue = queue.Queue()
 
