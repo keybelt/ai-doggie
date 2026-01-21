@@ -34,7 +34,7 @@ class GDPolicy(nn.Module):
         # Let's stick to the verified 21x37 grid by using Stride 2 once more.
 
         # Correction: Layer 3 needs to be Stride 2 to hit 21x37.
-        self.conv4 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        self.conv4 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn4 = nn.BatchNorm2d(64)
 
         # Layer 4: 64 -> 64 (Stride 1 - Processing)
@@ -81,7 +81,7 @@ class GDPolicy(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, model, lr=3e-4, gamma=0.995, eps_clip=0.2, batch_size=256):
+    def __init__(self, model, lr=2.5e-4, gamma=0.995, eps_clip=0.2, batch_size=2048):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
@@ -155,7 +155,7 @@ class PPOAgent:
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = self.mse_loss(new_values.squeeze(), batch_returns)
-                loss = actor_loss + 0.5 * critic_loss - 0.05 * entropy
+                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
