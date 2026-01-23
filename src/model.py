@@ -8,61 +8,128 @@ import time
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
+class SEBlock(nn.Module):
+    """ Channel Attention: 'What is this?' """
+
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class SpatialAttention(nn.Module):
+    """ Spatial Attention: 'Where is it?' (Hitbox Precision) """
+
+    def __init__(self):
+        super().__init__()
+        # Compresses to 2 channels (Max pool + Avg pool) -> 1 channel mask
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # 1. Avg Pool across channels
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        # 2. Max Pool across channels
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        # 3. Concatenate and Convolve
+        scale = torch.cat([avg_out, max_out], dim=1)
+        scale = self.sigmoid(self.conv(scale))
+        # 4. Apply Mask
+        return x * scale
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+        # [ATTENTION MODULES]
+        self.se = SEBlock(channels)  # Focus on vital channels
+        self.sa = SpatialAttention()  # Focus on vital pixels
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        # Apply Attention
+        out = self.se(out)
+        out = self.sa(out)
+
+        out += residual
+        return F.relu(out)
+
+
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # [STEM] 16 Channels (Standard)
-        self.conv1 = nn.Conv2d(12, 16, kernel_size=5, stride=2, padding=2, bias=False)
-        self.bn1 = nn.BatchNorm2d(16)
+        # [STEM]
+        self.conv1 = nn.Conv2d(12, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
 
-        # [BODY] "Hybrid" Configuration
-        # Progression: 16 -> 24 -> 32 -> 64
-        # We cap at 64. This is the sweet spot for 120Hz on M4 Pro.
+        # [BLOCK 1]
+        self.res1 = ResidualBlock(32)
 
-        # Layer 1: 16 -> 24 (Stride 2)
-        self.conv2 = nn.Conv2d(16, 24, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(24)
+        # [DOWNSAMPLE 1]
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(64)
 
-        # Layer 2: 24 -> 32 (Stride 2)
-        self.conv3 = nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(32)
+        # [BLOCK 2]
+        self.res2 = ResidualBlock(64)
 
-        # Layer 3: 32 -> 64 (Stride 1 - High Res Logic)
-        # We use Stride 1 here immediately to get a higher resolution semantic map earlier.
-        # This results in a grid of 42x74 (High Res) or 21x37 (Low Res).
-        # Let's stick to the verified 21x37 grid by using Stride 2 once more.
+        # [DOWNSAMPLE 2]
+        # Resolution: 41p high (Perfect for 22px gaps)
+        self.conv3 = nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(96)
 
-        # Correction: Layer 3 needs to be Stride 2 to hit 21x37.
-        self.conv4 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(64)
+        # [BLOCK 3] Deep Reasoning
+        self.res3a = ResidualBlock(96)
+        self.res3b = ResidualBlock(96)
 
-        # Layer 4: 64 -> 64 (Stride 1 - Processing)
-        self.conv5 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn5 = nn.BatchNorm2d(64)
-
-        # [PROJECTION]
-        # 64 -> 16 Channels.
-        self.projection = nn.Conv2d(64, 16, kernel_size=1)
+        # [PROJECTION] 96 -> 16 channels
+        self.projection = nn.Conv2d(96, 16, kernel_size=1)
 
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
-            # Dimensions: [1, 16, 21, 37] -> 12,432 features.
 
-        # [HEAD]
-        # 256 Neurons. Fast and sufficient.
-        self.fc = nn.Linear(self.flat_size, 256)
-        self.actor = nn.Linear(256, 2)
-        self.critic = nn.Linear(256, 1)
+        # [HEADS]
+        self.fc = nn.Linear(self.flat_size, 512)
+        self.actor = nn.Linear(512, 2)
+        self.critic = nn.Linear(512, 1)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('relu'))
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
 
     def forward_features(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
+        x = self.res1(x)
         x = F.relu(self.bn2(self.conv2(x)))
+        x = self.res2(x)
         x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = F.relu(self.bn5(self.conv5(x)))  # Added the processing layer
+        x = self.res3a(x)
+        x = self.res3b(x)
         x = F.relu(self.projection(x))
         return x
 
@@ -81,7 +148,7 @@ class GDPolicy(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, model, lr=2.5e-4, gamma=0.995, eps_clip=0.2, batch_size=2048):
+    def __init__(self, model, lr=2.5e-4, gamma=0.995, eps_clip=0.2, batch_size=256):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
@@ -91,27 +158,31 @@ class PPOAgent:
         self.epochs = 4
 
     def update(self, states, actions, log_probs, rewards, dones, values):
-        # 1. Calculate Returns (CPU is fine for this size)
+        # [CRITICAL MEMORY FIX]
+        # Clean up before starting
+        torch.mps.empty_cache()
+        import gc
+        gc.collect()
+
         returns = []
         discounted_sum = 0
-        for reward, is_done in zip(reversed(rewards), reversed(dones)):
+        rewards_list = rewards.tolist()
+        dones_list = dones.tolist()
+
+        for reward, is_done in zip(reversed(rewards_list), reversed(dones_list)):
             if is_done: discounted_sum = 0
             discounted_sum = reward + (self.gamma * discounted_sum)
             returns.insert(0, discounted_sum)
 
-        # Move metadata to GPU
         returns = torch.tensor(returns, dtype=torch.float32).to(device)
         returns = (returns - returns.mean()) / (returns.std() + 1e-7)
 
-        full_actions = torch.stack(actions).to(device).squeeze()
-        full_log_probs = torch.stack(log_probs).to(device).squeeze()
+        # [FIX] Do NOT use np.stack here. 'states' is ALREADY a Tensor from Buffer.
+        # This was causing your Memory Pressure Spike.
+        full_states = states
 
-        # [OPTIMIZATION START] ------------------------
-        # Convert List of Arrays -> Single Tensor (CPU, uint8) ONCE.
-        # This takes ~1-2 seconds but saves ~40 seconds of loop overhead.
-        # Memory: ~4.7 GB (Safe for M4 Pro)
-        full_states = torch.from_numpy(np.stack(states))
-        # [OPTIMIZATION END] --------------------------
+        full_actions = actions.to(device)
+        full_log_probs = log_probs.to(device)
 
         dataset_size = len(states)
         indices = np.arange(dataset_size)
@@ -127,20 +198,15 @@ class PPOAgent:
                 end = start + self.batch_size
                 batch_idx = indices[start:end]
 
-                # [FAST SLICING]
-                # 1. Slice the pre-allocated CPU tensor (Instant, View only)
-                batch_states = full_states[batch_idx]
-
-                # 2. Move 256 frames to GPU -> Float -> Permute -> Contiguous
-                # This pipeline is optimal for MPS bandwidth.
-                batch_states = batch_states.to(device).float().div(255.0)
+                # [FAST GPU TRANSFER]
+                # Slice CPU tensor -> Move to GPU -> Normalize
+                batch_states = full_states[batch_idx].to(device).float().div(255.0)
                 batch_states = batch_states.permute(0, 3, 1, 2).contiguous()
 
                 batch_actions = full_actions[batch_idx]
                 batch_old_log_probs = full_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
 
-                # Forward / Backward
                 logits, new_values = self.model(batch_states)
 
                 probs = F.softmax(logits, dim=-1)
@@ -160,22 +226,18 @@ class PPOAgent:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
 
-                # Cleanup immediate garbage
-                del batch_states
-
-                # Tiny sleep for capture thread
-                time.sleep(0.001)
+                # [MEMORY] Aggressive cleanup
+                del batch_states, logits, new_values, dist, loss
 
                 total_policy_loss += actor_loss.item()
                 total_entropy += entropy.item()
                 update_count += 1
 
-        # [CLEANUP]
-        # Delete the massive 4.7GB tensor immediately to free RAM for gameplay
-        del full_states
-        import gc
-        gc.collect()  # Force Python to kill the objects
-        torch.mps.empty_cache()  # Force MPS to release VRAM
+        # [FINAL CLEANUP]
+        del returns
+        gc.collect()
+        torch.mps.empty_cache()
 
         return total_policy_loss / update_count, total_entropy / update_count

@@ -35,7 +35,6 @@ class GeometryDashEnv:
     def __init__(self):
         self.engine = start_capture()
         self.controller = KeyboardController()
-        self.scaler = RewardScaler()
 
         print("[Env] Connecting to Vision Engine...")
         self.engine.paused = False
@@ -49,6 +48,10 @@ class GeometryDashEnv:
 
         self.engine.paused = True
         self.stack_size = 4
+
+        # [METRIC] Track skipped frames locally
+        self.skipped_count = 0
+
         self.flush_vision()
         self.attempt_roi = (56, 3, 53, 13)
         self.lower_spectrum = np.array([70, 100, 100])
@@ -69,13 +72,21 @@ class GeometryDashEnv:
         return self.get_state()
 
     def flush_vision(self):
-        q_size = self.engine.ready_queue.qsize()
-        if q_size > self.stack_size:
-            for _ in range(q_size - self.stack_size):
-                try:
-                    self.engine.ready_queue.get_nowait()
-                except:
-                    break
+        """
+        [CRITICAL FIX] Recycles frames to prevent memory starvation in capture engine.
+        """
+        # Keep 1 frame so we don't block
+        while self.engine.ready_queue.qsize() > 1:
+            try:
+                frame, _ = self.engine.ready_queue.get_nowait()
+
+                # [FIX] Recycle buffer!
+                if hasattr(self.engine, 'idle_queue'):
+                    self.engine.idle_queue.put(frame)
+
+                self.skipped_count += 1
+            except:
+                break
 
     def get_state(self):
         return np.concatenate(list(self.frame_stack), axis=2)
@@ -84,6 +95,7 @@ class GeometryDashEnv:
         self.controller.act(action)
         self.steps_since_reset += 1
 
+        # [LAG CHECK] If queue is piling up, flush it to stay "Real-Time"
         if self.engine.ready_queue.qsize() > 2:
             self.flush_vision()
 
@@ -96,6 +108,7 @@ class GeometryDashEnv:
                 continue
 
         if raw_frame is None:
+            # Treat read failure as a missed frame
             return self.get_state(), 0.0, False, {"warning": "frame_skip"}
 
         current_frame = raw_frame.copy()
@@ -120,38 +133,22 @@ class GeometryDashEnv:
             reward = -5.0
             done = True
         else:
-            # Note: Constant rewards usually stabilize training better than linear ramping.
-            # Consider changing to fixed 0.1, but your logic is fine with the scaler.
             reward = 0.05
             done = False
 
-            # [NEW] Apply Scaling
-            # We clamp it to [-10, 10] just to prevent crazy outliers from exploding the gradient
-        scaled_reward = self.scaler.normalize(reward, done)
-        scaled_reward = np.clip(scaled_reward, -10.0, 10.0)
+        # [METRIC MERGE]
+        total_missed = self.engine.drop_count + self.skipped_count
 
-        return self.get_state(), scaled_reward, done, {"drops": self.engine.drop_count}
+        return self.get_state(), reward, done, {"missed": total_missed}
 
     def resume_session(self):
-        """
-        Resumes the environment without wiping the frame stack.
-        Used after unpausing to maintain temporal continuity for the model.
-        """
-        # 1. Clear any old frames buffered during the pause/training loop
         self.flush_vision()
-
-        # 2. Re-acquire the latest state (wait for next frame)
-        # We perform a dummy step of 'no action' to sync with the engine
-        # but we do NOT clear self.frame_stack
-
-        # Wait for at least one fresh frame to arrive after flush
         start_wait = time.perf_counter()
         while self.engine.ready_queue.empty():
             if time.perf_counter() - start_wait > 2.0:
                 print("[Env] Warning: Resume timed out waiting for frame.")
                 break
             time.sleep(0.005)
-
         return self.get_state()
 
 
