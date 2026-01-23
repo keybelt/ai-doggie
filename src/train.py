@@ -49,9 +49,10 @@ def safe_resume(env):
     end_drops = env.engine.drop_count
     end_skips = env.skipped_count
 
-    burn_count = (end_drops - start_drops) + (end_skips - start_skips)
+    delta_drops = end_drops - start_drops
+    delta_skips = end_skips - start_skips
 
-    return env.get_state(), burn_count
+    return env.get_state(), delta_drops, delta_skips
 
 
 class ControlRoom:
@@ -233,20 +234,30 @@ def train():
                 if shutdown_flag: break
                 if i % 100 == 0: dash.render()
 
+                t_start = time.perf_counter()
+
                 state_tensor = torch.from_numpy(state).to(device)
                 state_tensor = state_tensor.float().div(255.0)
                 state_tensor = state_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
 
-                t_start = time.perf_counter()
                 with torch.no_grad():
                     action, log_prob, value = model.get_action(state_tensor)
                     confidence = torch.exp(log_prob).item()
+
                 inf_ms = (time.perf_counter() - t_start) * 1000
 
                 next_state, reward, done, info = env.step(action.item())
+
+                # [ADD THIS DEBUG LINE]
+                if i % 100 == 0:
+                    print(
+                        f"[RAW DEBUG] Drops: {env.engine.drop_count} | Skips: {env.skipped_count} | Queue: {env.engine.ready_queue.qsize()}")
+
+                dash.log_step(inf_ms, confidence, current_session_missed)
+                dash.log_step(inf_ms, confidence, current_session_missed)
                 if "warning" in info: continue
 
-                buffer.add(state, action, log_prob, reward, done, value)
+                buffer.add(state, action.item(), log_prob, reward, done, value)
 
                 state = next_state
                 dash.total_frames += 1
@@ -276,15 +287,12 @@ def train():
                 save_checkpoint(model, agent, dash.total_frames,
                                 os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_S{dash.total_frames // 1000}k.pt"))
 
-            dash.status_message = "▶️ Resuming Gameplay..."
-            dash.render()
-            state, burnt_frames = safe_resume(env)
+                dash.status_message = "▶️ Resuming Gameplay..."
+                dash.render()
 
-            initial_drop_offset += env.engine.drop_count - initial_drop_offset
-            initial_skip_offset += env.skipped_count - initial_skip_offset
-
-            initial_drop_offset = env.engine.drop_count
-            initial_skip_offset = env.skipped_count
+                state, d_drops, d_skips = safe_resume(env)  # Helper must return deltas
+                initial_drop_offset += d_drops  # Only add what we purposefully burned
+                initial_skip_offset += d_skips
 
     save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
     sys.exit()

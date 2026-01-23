@@ -28,19 +28,23 @@ class GDAIVision(NSObject):
             buf = np.zeros((332, 588, 3), dtype=np.uint8)
             self.idle_queue.put(buf)
 
+        self.last_capture_time = time.perf_counter()  # Add this
         return self
 
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
-        # [NEW] If paused, discard frame silently.
-        # Do NOT increment drop_count. Do NOT touch queues.
+        now = time.perf_counter()
+        dt = now - self.last_capture_time
+        self.last_capture_time = now
+        #if dt > 0:
+        #    print(f"[DEBUG] CAPTURE FPS: {1 / dt:.2f}")
+
         if self.paused:
             return
 
         try:
             frame_buffer = self.idle_queue.get_nowait()
         except queue.Empty:
-            # Only count drops if we are SUPPOSED to be capturing
             self.drop_count += 1
             return
 

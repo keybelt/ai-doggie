@@ -71,16 +71,25 @@ class GeometryDashEnv:
         return self.get_state()
 
     def flush_vision(self):
+        # If queue is empty, nothing to flush
+        if self.engine.ready_queue.empty():
+            return
+
+        # If queue has 1 item, it's fresh enough? Maybe not.
+        # But if it has >1, we DEFINITELY have skips.
+
+        skipped_in_batch = 0
         while self.engine.ready_queue.qsize() > 1:
             try:
+                # Discard oldest frame
                 frame, _ = self.engine.ready_queue.get_nowait()
-
                 if hasattr(self.engine, 'idle_queue'):
                     self.engine.idle_queue.put(frame)
-
-                self.skipped_count += 1
+                skipped_in_batch += 1
             except:
                 break
+
+        self.skipped_count += skipped_in_batch
 
     def get_state(self):
         return np.concatenate(list(self.frame_stack), axis=2)
@@ -115,10 +124,10 @@ class GeometryDashEnv:
         self.frame_stack.append(current_frame)
 
         if is_dead:
-            reward = -5.0
+            reward = -100.0
             done = True
         else:
-            reward = 0.05
+            reward = 0.1
             done = False
 
         total_missed = self.engine.drop_count + self.skipped_count
@@ -126,11 +135,7 @@ class GeometryDashEnv:
         return self.get_state(), reward, done, {"missed": total_missed}
 
     def resume_session(self):
-        # REMOVED self.flush_vision() - We will handle flushing in train.py
-        # We just want to ensure the pipe is flowing before handing control back.
-
         start_wait = time.perf_counter()
-        # Wait for at least one frame to arrive to confirm connection
         while self.engine.ready_queue.empty():
             if time.perf_counter() - start_wait > 2.0:
                 print("[Env] Warning: Resume timed out waiting for frame.")

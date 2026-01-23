@@ -7,85 +7,67 @@ import numpy as np
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
-class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
+class ImpalaBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
-        )
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+
+        self.res1_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.res1_bn = nn.BatchNorm2d(out_channels)
+        self.res2_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.res2_bn = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        scale = torch.cat([avg_out, max_out], dim=1)
-        scale = self.sigmoid(self.conv(scale))
-        return x * scale
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.se = SEBlock(channels)
-        self.sa = SpatialAttention()
-
-    def forward(self, x):
+        x = F.relu(self.bn(self.conv(x)))
         residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.se(out)
-        out = self.sa(out)
-        out += residual
-        return F.relu(out)
+        x = F.relu(self.res1_bn(self.res1_conv(x)))
+        x = self.res2_bn(self.res2_conv(x))
+        x += residual
+        return F.relu(x)
 
 
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(12, 32, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.res1 = ResidualBlock(32)
 
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.res2 = ResidualBlock(64)
+        # --- LEVEL 1: High Res, Shallow Depth ---
+        # Input: 12ch (4 frames x 3 colors)
+        # We start with 64 channels (Double your previous 32)
+        self.conv1 = nn.Conv2d(12, 64, kernel_size=5, stride=2, padding=2, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.block1 = ImpalaBlock(64, 64)
 
-        self.conv3 = nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(96)
+        # --- LEVEL 2: Mid Res, Mid Depth ---
+        # Stride 2 downsample -> 128 Channels (Double previous 64)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.block2 = ImpalaBlock(128, 128)
 
-        self.res3a = ResidualBlock(96)
-        self.res3b = ResidualBlock(96)
+        # --- LEVEL 3: Low Res, High Depth ---
+        # Stride 2 downsample -> 256 Channels (Double previous 96/128)
+        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(256)
 
-        self.projection = nn.Conv2d(96, 16, kernel_size=1)
+        # Double Blocks here for "Deep Thinking" at the abstract level
+        self.block3a = ImpalaBlock(256, 256)
+        self.block3b = ImpalaBlock(256, 256)
 
+        # --- PROJECTION ---
+        # 1x1 Conv to squash channels before flattening to save RAM
+        self.projection = nn.Conv2d(256, 32, kernel_size=1)
+
+        # Dynamic Flat Size Calc
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
 
+        # Heads
         self.fc = nn.Linear(self.flat_size, 512)
         self.actor = nn.Linear(512, 2)
         self.critic = nn.Linear(512, 1)
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -95,13 +77,20 @@ class GDPolicy(nn.Module):
                 module.bias.data.fill_(0.0)
 
     def forward_features(self, x):
+        # Level 1
         x = F.relu(self.bn1(self.conv1(x)))
-        x = self.res1(x)
+        x = self.block1(x)
+
+        # Level 2
         x = F.relu(self.bn2(self.conv2(x)))
-        x = self.res2(x)
+        x = self.block2(x)
+
+        # Level 3
         x = F.relu(self.bn3(self.conv3(x)))
-        x = self.res3a(x)
-        x = self.res3b(x)
+        x = self.block3a(x)
+        x = self.block3b(x)
+
+        # Project & Flatten
         x = F.relu(self.projection(x))
         return x
 
@@ -120,14 +109,14 @@ class GDPolicy(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, model, lr=2.5e-4, gamma=0.995, eps_clip=0.2, batch_size=128):
+    def __init__(self, model, lr=2.0e-4, gamma=0.99, eps_clip=0.2, batch_size=128):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.mse_loss = nn.MSELoss()
         self.batch_size = batch_size
-        self.epochs = 3
+        self.epochs = 5
 
     def update(self, states, actions, log_probs, rewards, dones, values):
         torch.mps.empty_cache()
