@@ -7,97 +7,69 @@ import numpy as np
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
-class ImpalaBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-
-        self.res1_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.res1_bn = nn.BatchNorm2d(out_channels)
-        self.res2_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.res2_bn = nn.BatchNorm2d(out_channels)
-
-    def forward(self, x):
-        x = F.relu(self.bn(self.conv(x)))
-        residual = x
-        x = F.relu(self.res1_bn(self.res1_conv(x)))
-        x = self.res2_bn(self.res2_conv(x))
-        x += residual
-        return F.relu(x)
+def init_layer(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
 
 
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # --- LEVEL 1: High Res, Shallow Depth ---
-        # Input: 12ch (4 frames x 3 colors)
-        # We start with 64 channels (Double your previous 32)
-        self.conv1 = nn.Conv2d(12, 64, kernel_size=5, stride=2, padding=2, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.block1 = ImpalaBlock(64, 64)
+        # Layer 1: Capture fine details (edges, spikes)
+        # Stride 2 reduces 332x588 -> 166x294
+        self.conv1 = nn.Conv2d(12, 24, kernel_size=5, stride=2, padding=2)
+        self.bn1 = nn.BatchNorm2d(24)
 
-        # --- LEVEL 2: Mid Res, Mid Depth ---
-        # Stride 2 downsample -> 128 Channels (Double previous 64)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.block2 = ImpalaBlock(128, 128)
+        # Layer 2: Form shapes (blocks, slopes)
+        # Stride 2 reduces -> 83x147
+        self.conv2 = nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(48)
 
-        # --- LEVEL 3: Low Res, High Depth ---
-        # Stride 2 downsample -> 256 Channels (Double previous 96/128)
-        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(256)
+        # Layer 3: Complex objects (portals, orbs)
+        # Stride 2 reduces -> 42x74
+        self.conv3 = nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
 
-        # Double Blocks here for "Deep Thinking" at the abstract level
-        self.block3a = ImpalaBlock(256, 256)
-        self.block3b = ImpalaBlock(256, 256)
+        # Layer 4: High level spatial reasoning
+        # Stride 2 reduces -> 21x37
+        # NOTE: Total stride is 16. A 22px gap is now ~1.3px in feature space.
+        # This is the limit; do not stride again.
+        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
+        self.bn4 = nn.BatchNorm2d(64)
 
-        # --- PROJECTION ---
-        # 1x1 Conv to squash channels before flattening to save RAM
-        self.projection = nn.Conv2d(256, 32, kernel_size=1)
+        # 1x1 CONV BOTTLENECK (The Speed Trick)
+        # Instead of flattening 64 channels, we squash them to 16.
+        # This cuts the Linear layer parameters by 75% while keeping spatial info.
+        self.bottleneck = nn.Conv2d(64, 16, kernel_size=1, stride=1)
 
-        # Dynamic Flat Size Calc
+        # Calculate flat size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
+            # Expected: 16 channels * 21 * 37 = ~12,432 (vs your old ~99,000)
 
-        # Heads
-        self.fc = nn.Linear(self.flat_size, 512)
-        self.actor = nn.Linear(512, 2)
-        self.critic = nn.Linear(512, 1)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('relu'))
-            if module.bias is not None:
-                module.bias.data.fill_(0.0)
+        # Actor-Critic Heads
+        # We keep 512 hidden units to ensure it has memory capacity
+        # to "overfit" the extreme demon patterns.
+        self.fc = init_layer(nn.Linear(self.flat_size, 512))
+        self.actor = init_layer(nn.Linear(512, 2), std=0.01)
+        self.critic = init_layer(nn.Linear(512, 1), std=1)
 
     def forward_features(self, x):
-        # Level 1
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.block1(x)
-
-        # Level 2
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.block2(x)
-
-        # Level 3
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = self.block3a(x)
-        x = self.block3b(x)
-
-        # Project & Flatten
-        x = F.relu(self.projection(x))
+        x = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        x = F.relu(self.bn2(self.conv2(x)), inplace=True)
+        x = F.relu(self.bn3(self.conv3(x)), inplace=True)
+        x = F.relu(self.bn4(self.conv4(x)), inplace=True)
+        x = F.relu(self.bottleneck(x), inplace=True)
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
         x = x.flatten(1)
-        x = F.relu(self.fc(x))
+        x = F.relu(self.fc(x), inplace=True)
         return self.actor(x), self.critic(x)
 
     def get_action(self, x):

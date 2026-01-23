@@ -31,27 +31,34 @@ def safe_pause():
 
 
 def safe_resume(env):
+    # Snapshot counts BEFORE unpausing
     start_drops = env.engine.drop_count
     start_skips = env.skipped_count
 
     env.engine.paused = False
 
+    # Wait for frame flow to stabilize
     while env.engine.ready_queue.empty():
         time.sleep(0.001)
 
+    # Resume Game Input
     os_keyboard.press(Key.space)
     time.sleep(0.05)
     os_keyboard.release(Key.space)
     time.sleep(0.05)
 
+    # Flush the "garbage" frames generated during the wait
     env.flush_vision()
 
+    # Snapshot counts AFTER flush
     end_drops = env.engine.drop_count
     end_skips = env.skipped_count
 
+    # Calculate exactly how many frames were "burned" during this maintenance
     delta_drops = end_drops - start_drops
     delta_skips = end_skips - start_skips
 
+    # Return the state AND the deltas
     return env.get_state(), delta_drops, delta_skips
 
 
@@ -248,6 +255,10 @@ def train():
 
                 next_state, reward, done, info = env.step(action.item())
 
+                net_drops = env.engine.drop_count - initial_drop_offset
+                net_skips = env.skipped_count - initial_skip_offset
+                current_session_missed = net_drops + net_skips
+
                 # [ADD THIS DEBUG LINE]
                 if i % 100 == 0:
                     print(
@@ -290,8 +301,12 @@ def train():
                 dash.status_message = "▶️ Resuming Gameplay..."
                 dash.render()
 
-                state, d_drops, d_skips = safe_resume(env)  # Helper must return deltas
-                initial_drop_offset += d_drops  # Only add what we purposefully burned
+                # 1. Call the new safe_resume (returns deltas)
+                state, d_drops, d_skips = safe_resume(env)
+
+                # 2. Add ONLY the maintenance frames to the offset.
+                #    Do NOT reset to env.engine.drop_count.
+                initial_drop_offset += d_drops
                 initial_skip_offset += d_skips
 
     save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
