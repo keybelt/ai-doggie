@@ -3,14 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 import numpy as np
-import time
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
 class SEBlock(nn.Module):
-    """ Channel Attention: 'What is this?' """
-
     def __init__(self, channels, reduction=16):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -29,23 +26,16 @@ class SEBlock(nn.Module):
 
 
 class SpatialAttention(nn.Module):
-    """ Spatial Attention: 'Where is it?' (Hitbox Precision) """
-
     def __init__(self):
         super().__init__()
-        # Compresses to 2 channels (Max pool + Avg pool) -> 1 channel mask
         self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # 1. Avg Pool across channels
         avg_out = torch.mean(x, dim=1, keepdim=True)
-        # 2. Max Pool across channels
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        # 3. Concatenate and Convolve
         scale = torch.cat([avg_out, max_out], dim=1)
         scale = self.sigmoid(self.conv(scale))
-        # 4. Apply Mask
         return x * scale
 
 
@@ -56,20 +46,15 @@ class ResidualBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
-
-        # [ATTENTION MODULES]
-        self.se = SEBlock(channels)  # Focus on vital channels
-        self.sa = SpatialAttention()  # Focus on vital pixels
+        self.se = SEBlock(channels)
+        self.sa = SpatialAttention()
 
     def forward(self, x):
         residual = x
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-
-        # Apply Attention
         out = self.se(out)
         out = self.sa(out)
-
         out += residual
         return F.relu(out)
 
@@ -77,31 +62,20 @@ class ResidualBlock(nn.Module):
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-
-        # [STEM]
         self.conv1 = nn.Conv2d(12, 32, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(32)
-
-        # [BLOCK 1]
         self.res1 = ResidualBlock(32)
 
-        # [DOWNSAMPLE 1]
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(64)
-
-        # [BLOCK 2]
         self.res2 = ResidualBlock(64)
 
-        # [DOWNSAMPLE 2]
-        # Resolution: 41p high (Perfect for 22px gaps)
         self.conv3 = nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(96)
 
-        # [BLOCK 3] Deep Reasoning
         self.res3a = ResidualBlock(96)
         self.res3b = ResidualBlock(96)
 
-        # [PROJECTION] 96 -> 16 channels
         self.projection = nn.Conv2d(96, 16, kernel_size=1)
 
         with torch.no_grad():
@@ -109,11 +83,9 @@ class GDPolicy(nn.Module):
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
 
-        # [HEADS]
         self.fc = nn.Linear(self.flat_size, 512)
         self.actor = nn.Linear(512, 2)
         self.critic = nn.Linear(512, 1)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -148,21 +120,17 @@ class GDPolicy(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, model, lr=2.5e-4, gamma=0.995, eps_clip=0.2, batch_size=256):
+    def __init__(self, model, lr=2.5e-4, gamma=0.995, eps_clip=0.2, batch_size=128):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.mse_loss = nn.MSELoss()
         self.batch_size = batch_size
-        self.epochs = 4
+        self.epochs = 3
 
     def update(self, states, actions, log_probs, rewards, dones, values):
-        # [CRITICAL MEMORY FIX]
-        # Clean up before starting
         torch.mps.empty_cache()
-        import gc
-        gc.collect()
 
         returns = []
         discounted_sum = 0
@@ -177,10 +145,7 @@ class PPOAgent:
         returns = torch.tensor(returns, dtype=torch.float32).to(device)
         returns = (returns - returns.mean()) / (returns.std() + 1e-7)
 
-        # [FIX] Do NOT use np.stack here. 'states' is ALREADY a Tensor from Buffer.
-        # This was causing your Memory Pressure Spike.
         full_states = states
-
         full_actions = actions.to(device)
         full_log_probs = log_probs.to(device)
 
@@ -198,9 +163,7 @@ class PPOAgent:
                 end = start + self.batch_size
                 batch_idx = indices[start:end]
 
-                # [FAST GPU TRANSFER]
-                # Slice CPU tensor -> Move to GPU -> Normalize
-                batch_states = full_states[batch_idx].to(device).float().div(255.0)
+                batch_states = full_states[batch_idx].to(device, non_blocking=True).float().div(255.0)
                 batch_states = batch_states.permute(0, 3, 1, 2).contiguous()
 
                 batch_actions = full_actions[batch_idx]
@@ -228,15 +191,12 @@ class PPOAgent:
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
-                # [MEMORY] Aggressive cleanup
-                del batch_states, logits, new_values, dist, loss
-
                 total_policy_loss += actor_loss.item()
                 total_entropy += entropy.item()
                 update_count += 1
 
-        # [FINAL CLEANUP]
-        del returns
+        del full_actions, full_log_probs, returns, batch_states
+        import gc
         gc.collect()
         torch.mps.empty_cache()
 

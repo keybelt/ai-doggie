@@ -14,7 +14,7 @@ class GDAIVision(NSObject):
         self = objc.super(GDAIVision, self).init()
         if self is None: return None
 
-        self.BUFFER_SIZE = 6
+        self.BUFFER_SIZE = 3
         self.idle_queue = queue.Queue()
         self.ready_queue = queue.Queue()
 
@@ -84,7 +84,7 @@ def start_capture():
         config.setHeight_(332)
         config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, 120))
         config.setShowsCursor_(False)
-        config.setQueueDepth_(6)
+        config.setQueueDepth_(3)
         config.setPixelFormat_(1111970369)
 
         stream = SCStream.alloc().initWithFilter_configuration_delegate_(filter_, config, vision)

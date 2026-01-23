@@ -9,7 +9,6 @@ from env import GeometryDashEnv
 from model import GDPolicy, PPOAgent
 from pynput.keyboard import Key, Controller
 
-# Config
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "checkpoints"))
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -17,7 +16,7 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 RUN_NAME = "Pretrain"
 MAX_TIMESTEPS = 20_000_000
 ROLLOUT_STEPS = 1024
-ACCUMULATION_STEPS = 1
+ACCUMULATION_STEPS = 2
 SAVE_INTERVAL = 100
 LOAD_CHECKPOINT = None
 
@@ -32,13 +31,27 @@ def safe_pause():
 
 
 def safe_resume(env):
-    env.flush_vision()
+    start_drops = env.engine.drop_count
+    start_skips = env.skipped_count
+
+    env.engine.paused = False
+
+    while env.engine.ready_queue.empty():
+        time.sleep(0.001)
+
     os_keyboard.press(Key.space)
     time.sleep(0.05)
     os_keyboard.release(Key.space)
-    time.sleep(0.02)
-    env.engine.paused = False
-    return env.resume_session()
+    time.sleep(0.05)
+
+    env.flush_vision()
+
+    end_drops = env.engine.drop_count
+    end_skips = env.skipped_count
+
+    burn_count = (end_drops - start_drops) + (end_skips - start_skips)
+
+    return env.get_state(), burn_count
 
 
 class ControlRoom:
@@ -75,7 +88,6 @@ class ControlRoom:
         avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
         lat_color = c_green if avg_lat < 5.0 else c_yellow if avg_lat < 8.0 else c_red
 
-        # Calculate Missed %
         miss_pct = (self.total_missed / (self.total_frames + 1e-7) * 100)
         miss_color = c_green if miss_pct == 0 else (c_yellow if miss_pct < 0.1 else c_red)
 
@@ -139,7 +151,6 @@ def save_checkpoint(model, agent, step_count, filename):
 class RolloutBuffer:
     def __init__(self, steps, height, width, channels):
         self.steps = steps
-        # Fixed 5GB allocation
         self.states = torch.zeros((steps, height, width, channels), dtype=torch.uint8)
         self.actions = torch.zeros(steps, dtype=torch.long)
         self.log_probs = torch.zeros(steps, dtype=torch.float)
@@ -185,24 +196,19 @@ def train():
             start_step = checkpoint['global_step']
             loaded_name = LOAD_CHECKPOINT
 
-    # [FIX 1] Allocate the massive 3-4GB buffer FIRST.
-    # Doing this later caused the 9-frame lag spike.
     print("[System] Allocating Memory Buffer...")
     buffer = RolloutBuffer(ROLLOUT_STEPS * ACCUMULATION_STEPS, 332, 588, 12)
 
     env.engine.paused = False
     state = env.reset()
 
-    # [FIX 2] Warmup AFTER allocation
     print("WARMING UP VISION ENGINE (60 Frames)...")
     for _ in range(60):
         _ = env.step(0)
         time.sleep(0.001)
 
-    # [FIX 3] Flush one last time to clear the warmup queue
     env.flush_vision()
 
-    # [FIX 4] Capture baseline NOW, exactly when we are ready to play.
     initial_drop_offset = env.engine.drop_count
     initial_skip_offset = env.skipped_count
     print(f"Startup complete. Offsetting {initial_drop_offset} drops, {initial_skip_offset} skips.")
@@ -210,7 +216,6 @@ def train():
     dash = ControlRoom(loaded_name, start_step)
 
     while dash.total_frames < MAX_TIMESTEPS:
-        # Calculate real session misses
         net_drops = env.engine.drop_count - initial_drop_offset
         net_skips = env.skipped_count - initial_skip_offset
         current_session_missed = net_drops + net_skips
@@ -220,7 +225,7 @@ def train():
         for accum_step in range(ACCUMULATION_STEPS):
             if shutdown_flag: break
 
-            gc.disable()  # Stop GC during gameplay
+            gc.disable()
 
             dash.status_message = f"Collecting Experience ({accum_step + 1}/{ACCUMULATION_STEPS})..."
 
@@ -252,7 +257,7 @@ def train():
                     dash.session_deaths += 1
                     state = env.reset()
 
-            gc.enable()  # Re-enable GC for update
+            gc.enable()
 
         if not shutdown_flag:
             dash.status_message = "⏸️ Updating Weights..."
@@ -261,13 +266,11 @@ def train():
             gc.collect()
             safe_pause()
 
-            # [UPDATE]
             b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values = buffer.get()
             loss, entropy = agent.update(b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values)
 
             dash.log_update(loss, entropy)
 
-            # [RESTORED CHECKPOINT LOGIC]
             if dash.update_count % SAVE_INTERVAL == 0:
                 dash.status_message = "💾 SAVING CHECKPOINT..."
                 save_checkpoint(model, agent, dash.total_frames,
@@ -275,9 +278,14 @@ def train():
 
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()
-            state = safe_resume(env)
+            state, burnt_frames = safe_resume(env)
 
-    # Exit save
+            initial_drop_offset += env.engine.drop_count - initial_drop_offset
+            initial_skip_offset += env.skipped_count - initial_skip_offset
+
+            initial_drop_offset = env.engine.drop_count
+            initial_skip_offset = env.skipped_count
+
     save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
     sys.exit()
 

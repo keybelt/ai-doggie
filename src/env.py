@@ -49,7 +49,6 @@ class GeometryDashEnv:
         self.engine.paused = True
         self.stack_size = 4
 
-        # [METRIC] Track skipped frames locally
         self.skipped_count = 0
 
         self.flush_vision()
@@ -72,15 +71,10 @@ class GeometryDashEnv:
         return self.get_state()
 
     def flush_vision(self):
-        """
-        [CRITICAL FIX] Recycles frames to prevent memory starvation in capture engine.
-        """
-        # Keep 1 frame so we don't block
         while self.engine.ready_queue.qsize() > 1:
             try:
                 frame, _ = self.engine.ready_queue.get_nowait()
 
-                # [FIX] Recycle buffer!
                 if hasattr(self.engine, 'idle_queue'):
                     self.engine.idle_queue.put(frame)
 
@@ -95,20 +89,11 @@ class GeometryDashEnv:
         self.controller.act(action)
         self.steps_since_reset += 1
 
-        # [LAG CHECK] If queue is piling up, flush it to stay "Real-Time"
-        if self.engine.ready_queue.qsize() > 2:
-            self.flush_vision()
+        self.flush_vision()
 
-        raw_frame = None
-        for _ in range(3):
-            try:
-                raw_frame, _ = self.engine.ready_queue.get(timeout=0.1)
-                break
-            except:
-                continue
-
-        if raw_frame is None:
-            # Treat read failure as a missed frame
+        try:
+            raw_frame, _ = self.engine.ready_queue.get(timeout=0.1)
+        except:
             return self.get_state(), 0.0, False, {"warning": "frame_skip"}
 
         current_frame = raw_frame.copy()
@@ -136,19 +121,22 @@ class GeometryDashEnv:
             reward = 0.05
             done = False
 
-        # [METRIC MERGE]
         total_missed = self.engine.drop_count + self.skipped_count
 
         return self.get_state(), reward, done, {"missed": total_missed}
 
     def resume_session(self):
-        self.flush_vision()
+        # REMOVED self.flush_vision() - We will handle flushing in train.py
+        # We just want to ensure the pipe is flowing before handing control back.
+
         start_wait = time.perf_counter()
+        # Wait for at least one frame to arrive to confirm connection
         while self.engine.ready_queue.empty():
             if time.perf_counter() - start_wait > 2.0:
                 print("[Env] Warning: Resume timed out waiting for frame.")
                 break
-            time.sleep(0.005)
+            time.sleep(0.001)
+
         return self.get_state()
 
 
