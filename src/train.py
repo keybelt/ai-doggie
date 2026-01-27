@@ -31,35 +31,28 @@ def safe_pause():
 
 
 def safe_resume(env):
-    # Snapshot counts BEFORE unpausing
     start_drops = env.engine.drop_count
     start_skips = env.skipped_count
 
     env.engine.paused = False
 
-    # Wait for frame flow to stabilize
     while env.engine.ready_queue.empty():
         time.sleep(0.001)
 
-    # Resume Game Input
     os_keyboard.press(Key.space)
     time.sleep(0.05)
     os_keyboard.release(Key.space)
     time.sleep(0.05)
 
-    # Flush the "garbage" frames generated during the wait
-    env.flush_vision()
+    state = env.resume_session()
 
-    # Snapshot counts AFTER flush
     end_drops = env.engine.drop_count
     end_skips = env.skipped_count
 
-    # Calculate exactly how many frames were "burned" during this maintenance
     delta_drops = end_drops - start_drops
     delta_skips = end_skips - start_skips
 
-    # Return the state AND the deltas
-    return env.get_state(), delta_drops, delta_skips
+    return state, delta_drops, delta_skips
 
 
 class ControlRoom:
@@ -216,18 +209,14 @@ def train():
         time.sleep(0.001)
 
     env.flush_vision()
-
     initial_drop_offset = env.engine.drop_count
     initial_skip_offset = env.skipped_count
+
     print(f"Startup complete. Offsetting {initial_drop_offset} drops, {initial_skip_offset} skips.")
 
     dash = ControlRoom(loaded_name, start_step)
 
     while dash.total_frames < MAX_TIMESTEPS:
-        net_drops = env.engine.drop_count - initial_drop_offset
-        net_skips = env.skipped_count - initial_skip_offset
-        current_session_missed = net_drops + net_skips
-
         if shutdown_flag: break
 
         for accum_step in range(ACCUMULATION_STEPS):
@@ -259,21 +248,18 @@ def train():
                 net_skips = env.skipped_count - initial_skip_offset
                 current_session_missed = net_drops + net_skips
 
-                # [ADD THIS DEBUG LINE]
                 if i % 100 == 0:
-                    print(
-                        f"[RAW DEBUG] Drops: {env.engine.drop_count} | Skips: {env.skipped_count} | Queue: {env.engine.ready_queue.qsize()}")
+                    print(f"[RAW DEBUG] Drops: {env.engine.drop_count} | Skips: {env.skipped_count} | Queue: {env.engine.ready_queue.qsize()}")
 
                 dash.log_step(inf_ms, confidence, current_session_missed)
-                dash.log_step(inf_ms, confidence, current_session_missed)
-                if "warning" in info: continue
+                if "warning" in info:
+                    state = next_state
+                    continue
 
                 buffer.add(state, action.item(), log_prob, reward, done, value)
 
                 state = next_state
                 dash.total_frames += 1
-
-                dash.log_step(inf_ms, confidence, current_session_missed)
 
                 if done:
                     dash.session_deaths += 1
@@ -298,16 +284,13 @@ def train():
                 save_checkpoint(model, agent, dash.total_frames,
                                 os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_S{dash.total_frames // 1000}k.pt"))
 
-                dash.status_message = "▶️ Resuming Gameplay..."
-                dash.render()
+            dash.status_message = "▶️ Resuming Gameplay..."
+            dash.render()
 
-                # 1. Call the new safe_resume (returns deltas)
-                state, d_drops, d_skips = safe_resume(env)
+            state, d_drops, d_skips = safe_resume(env)
 
-                # 2. Add ONLY the maintenance frames to the offset.
-                #    Do NOT reset to env.engine.drop_count.
-                initial_drop_offset += d_drops
-                initial_skip_offset += d_skips
+            initial_drop_offset += d_drops
+            initial_skip_offset += d_skips
 
     save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
     sys.exit()

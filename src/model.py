@@ -17,43 +17,25 @@ class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Layer 1: Capture fine details (edges, spikes)
-        # Stride 2 reduces 332x588 -> 166x294
         self.conv1 = nn.Conv2d(12, 24, kernel_size=5, stride=2, padding=2)
         self.bn1 = nn.BatchNorm2d(24)
 
-        # Layer 2: Form shapes (blocks, slopes)
-        # Stride 2 reduces -> 83x147
         self.conv2 = nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1)
         self.bn2 = nn.BatchNorm2d(48)
 
-        # Layer 3: Complex objects (portals, orbs)
-        # Stride 2 reduces -> 42x74
         self.conv3 = nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1)
         self.bn3 = nn.BatchNorm2d(64)
 
-        # Layer 4: High level spatial reasoning
-        # Stride 2 reduces -> 21x37
-        # NOTE: Total stride is 16. A 22px gap is now ~1.3px in feature space.
-        # This is the limit; do not stride again.
-        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
         self.bn4 = nn.BatchNorm2d(64)
 
-        # 1x1 CONV BOTTLENECK (The Speed Trick)
-        # Instead of flattening 64 channels, we squash them to 16.
-        # This cuts the Linear layer parameters by 75% while keeping spatial info.
         self.bottleneck = nn.Conv2d(64, 16, kernel_size=1, stride=1)
 
-        # Calculate flat size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
-            # Expected: 16 channels * 21 * 37 = ~12,432 (vs your old ~99,000)
 
-        # Actor-Critic Heads
-        # We keep 512 hidden units to ensure it has memory capacity
-        # to "overfit" the extreme demon patterns.
         self.fc = init_layer(nn.Linear(self.flat_size, 512))
         self.actor = init_layer(nn.Linear(512, 2), std=0.01)
         self.critic = init_layer(nn.Linear(512, 1), std=1)

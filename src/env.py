@@ -3,7 +3,6 @@ import collections
 import cv2
 import sys
 import Quartz
-import time
 from AppKit import NSApplication
 from capture import start_capture
 
@@ -46,7 +45,6 @@ class GeometryDashEnv:
             print("\n[CRITICAL ERROR] Vision Engine timed out!")
             sys.exit(1)
 
-        self.engine.paused = True
         self.stack_size = 4
 
         self.skipped_count = 0
@@ -67,21 +65,35 @@ class GeometryDashEnv:
         self.controller.act(0)
         self.last_color_mask = None
         self.steps_since_reset = 0
+
+        self.frame_stack.clear()
+
         self.flush_vision()
+
+        try:
+            raw_frame, _ = self.engine.ready_queue.get(timeout=2.0)
+
+            initial_frame = raw_frame.copy()
+
+            for _ in range(self.stack_size):
+                self.frame_stack.append(initial_frame)
+
+            if hasattr(self.engine, 'idle_queue'):
+                self.engine.idle_queue.put(raw_frame)
+        except:
+            print("[Env] Warning: Reset timed out waiting for fresh frame.")
+            for _ in range(self.stack_size):
+                self.frame_stack.append(np.zeros((332, 588, 3), dtype=np.uint8))
+
         return self.get_state()
 
     def flush_vision(self):
-        # If queue is empty, nothing to flush
         if self.engine.ready_queue.empty():
             return
-
-        # If queue has 1 item, it's fresh enough? Maybe not.
-        # But if it has >1, we DEFINITELY have skips.
 
         skipped_in_batch = 0
         while self.engine.ready_queue.qsize() > 1:
             try:
-                # Discard oldest frame
                 frame, _ = self.engine.ready_queue.get_nowait()
                 if hasattr(self.engine, 'idle_queue'):
                     self.engine.idle_queue.put(frame)
@@ -111,7 +123,7 @@ class GeometryDashEnv:
 
         tx, ty, tw, th = self.attempt_roi
         text_crop = current_frame[ty:ty + th, tx:tx + tw]
-        hsv_crop = cv2.cvtColor(text_crop, cv2.COLOR_BGR2HSV)
+        hsv_crop = cv2.cvtColor(text_crop, cv2.COLOR_RGB2HSV)
         color_mask = cv2.inRange(hsv_crop, self.lower_spectrum, self.upper_spectrum)
 
         is_dead = False
@@ -135,12 +147,14 @@ class GeometryDashEnv:
         return self.get_state(), reward, done, {"missed": total_missed}
 
     def resume_session(self):
-        start_wait = time.perf_counter()
-        while self.engine.ready_queue.empty():
-            if time.perf_counter() - start_wait > 2.0:
-                print("[Env] Warning: Resume timed out waiting for frame.")
-                break
-            time.sleep(0.001)
+        self.flush_vision()
+        try:
+            raw_frame, _ = self.engine.ready_queue.get(timeout=2.0)
+            self.frame_stack.append(raw_frame)
+            if hasattr(self.engine, 'idle_queue'):
+                self.engine.idle_queue.put(raw_frame)
+        except:
+            print("[Env] Warning: Resume timed out waiting for frame.")
 
         return self.get_state()
 

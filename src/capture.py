@@ -20,67 +20,63 @@ class GDAIVision(NSObject):
 
         self.drop_count = 0
 
-        # [NEW] The Pause Switch
-        # Start paused so we don't count drops during Python startup
         self.paused = True
 
         for _ in range(self.BUFFER_SIZE):
             buf = np.zeros((332, 588, 3), dtype=np.uint8)
             self.idle_queue.put(buf)
 
-        self.last_capture_time = time.perf_counter()  # Add this
         return self
 
     @objc.typedSelector(b"v@:@@Q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
-        now = time.perf_counter()
-        dt = now - self.last_capture_time
-        self.last_capture_time = now
-        #if dt > 0:
-        #    print(f"[DEBUG] CAPTURE FPS: {1 / dt:.2f}")
-
         if self.paused:
+            return
+
+        pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
+        if not pixel_buffer:
             return
 
         try:
             frame_buffer = self.idle_queue.get_nowait()
         except queue.Empty:
-            self.drop_count += 1
-            return
-
-        pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
-        if not pixel_buffer:
-            self.idle_queue.put(frame_buffer)
-            return
+            try:
+                frame_buffer, _ = self.ready_queue.get_nowait()
+                self.drop_count += 1
+            except queue.Empty:
+                return
 
         Quartz.CVPixelBufferLockBaseAddress(pixel_buffer, 1)
         try:
-            # Optimized: Hardcoded resolution saves overhead
-            # Assuming 588x332 based on your config
             bpr = Quartz.CVPixelBufferGetBytesPerRow(pixel_buffer)
             base_addr = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
 
-            # Fast Buffer Copy
             raw_buffer = base_addr.as_buffer(bpr * 332)
             raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(332, bpr)
 
-            # Crop/Slice to 3 channels
-            np.copyto(frame_buffer, raw_array[:, :2352].reshape(332, 588, 4)[:, :, :3])
+            np.copyto(frame_buffer, raw_array[:, :2352].reshape(332, 588, 4)[:, :, [2, 1, 0]])
 
         finally:
             Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
 
-        self.ready_queue.put((frame_buffer, time.perf_counter()))
+        pts = CoreMedia.CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        timestamp = CoreMedia.CMTimeGetSeconds(pts)
+        self.ready_queue.put((frame_buffer, timestamp))
 
 
 def start_capture():
     vision = GDAIVision.alloc().init()
 
     def handler(content, error):
-        if error: return
+        if error:
+            print(f"Shareable content error: {error}")
+            return
         target = next((w for w in content.windows() if "geometry dash" in (w.title() or "").lower()), None)
-        if not target: return
+        if not target:
+            print("Geometry Dash window not found!")
+            return
 
+        print(f"Attached to: {target.title()} ID: {target.windowID()}")
         filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
         config = SCStreamConfiguration.alloc().init()
         config.setSourceRect_(Quartz.CGRectMake(0, 28, 1176, 664))
