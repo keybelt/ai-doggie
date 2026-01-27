@@ -15,8 +15,8 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 RUN_NAME = "Pretrain"
 MAX_TIMESTEPS = 20_000_000
-ROLLOUT_STEPS = 1024
-ACCUMULATION_STEPS = 2
+ROLLOUT_STEPS = 2048
+ACCUMULATION_STEPS = 1
 SAVE_INTERVAL = 100
 LOAD_CHECKPOINT = None
 
@@ -84,21 +84,20 @@ class ControlRoom:
         progress = self.update_count % SAVE_INTERVAL
 
         avg_conf = sum(self.confidences) / len(self.confidences) * 100 if self.confidences else 0
-        conf_color = c_green if avg_conf > 85 else c_yellow if avg_conf > 65 else c_red
+        conf_color = c_green if avg_conf > 90 else c_yellow if avg_conf > 75 else c_red
 
         avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
-        lat_color = c_green if avg_lat < 5.0 else c_yellow if avg_lat < 8.0 else c_red
+        lat_color = c_green if avg_lat < 4.0 else c_yellow if avg_lat < 6.0 else c_red
 
         miss_pct = (self.total_missed / (self.total_frames + 1e-7) * 100)
-        miss_color = c_green if miss_pct == 0 else (c_yellow if miss_pct < 0.1 else c_red)
+        miss_color = c_green if miss_pct == 0 else (c_yellow if miss_pct < 0.05 else c_red)
 
-        ent_color = c_green if self.current_entropy > 0.4 else c_yellow if self.current_entropy > 0.15 else c_red
-        ent_label = "EXPLORING" if self.current_entropy > 0.4 else "LEARNING" if self.current_entropy > 0.15 else "STUCK"
+        ent_color = c_green if self.current_entropy > 0.5 else c_yellow if self.current_entropy > 0.1 else c_red
+        ent_label = "EXPLORING" if self.current_entropy > 0.5 else "CONVERGING" if self.current_entropy > 0.1 else "DETERMINISTIC"
 
-        loss_color = c_green if abs(self.current_policy_loss) < 0.02 else c_yellow if abs(
-            self.current_policy_loss) < 0.05 else c_red
-        loss_label = "HEALTHY" if abs(self.current_policy_loss) < 0.02 else "WARNING" if abs(
-            self.current_policy_loss) < 0.05 else "CRITICAL"
+        loss_val = abs(self.current_policy_loss)
+        loss_color = c_green if loss_val < 0.05 else c_yellow if loss_val < 0.15 else c_red
+        loss_label = "STABLE" if loss_val < 0.05 else "VOLATILE" if loss_val < 0.15 else "UNSTABLE"
 
         os.system('clear')
         print(f"""
@@ -201,18 +200,25 @@ def train():
     buffer = RolloutBuffer(ROLLOUT_STEPS * ACCUMULATION_STEPS, 332, 588, 12)
 
     env.engine.paused = False
+
+    print("WARMING UP VISION & MODEL (120 Frames + Compilation)...")
+
+    dummy_state = torch.zeros((1, 12, 332, 588)).to(device)
     state = env.reset()
 
-    print("WARMING UP VISION ENGINE (60 Frames)...")
-    for _ in range(60):
+    for _ in range(120):
         _ = env.step(0)
-        time.sleep(0.001)
+        with torch.no_grad():
+            _ = model.get_action(dummy_state)
 
     env.flush_vision()
-    initial_drop_offset = env.engine.drop_count
-    initial_skip_offset = env.skipped_count
+    env.engine.drop_count = 0
+    env.skipped_count = 0
 
-    print(f"Startup complete. Offsetting {initial_drop_offset} drops, {initial_skip_offset} skips.")
+    ignore_drops = 0
+    ignore_skips = 0
+
+    print("Startup complete. Metrics forcibly reset to 0.")
 
     dash = ControlRoom(loaded_name, start_step)
 
@@ -244,12 +250,13 @@ def train():
 
                 next_state, reward, done, info = env.step(action.item())
 
-                net_drops = env.engine.drop_count - initial_drop_offset
-                net_skips = env.skipped_count - initial_skip_offset
+                net_drops = env.engine.drop_count - ignore_drops
+                net_skips = env.skipped_count - ignore_skips
                 current_session_missed = net_drops + net_skips
 
-                if i % 100 == 0:
-                    print(f"[RAW DEBUG] Drops: {env.engine.drop_count} | Skips: {env.skipped_count} | Queue: {env.engine.ready_queue.qsize()}")
+                #if i % 100 == 0:
+                #    print(
+                #        f"[RAW DEBUG] Drops: {env.engine.drop_count} | Skips: {env.skipped_count} | Queue: {env.engine.ready_queue.qsize()}")
 
                 dash.log_step(inf_ms, confidence, current_session_missed)
                 if "warning" in info:
@@ -286,11 +293,12 @@ def train():
 
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()
+            env.flush_vision()
 
             state, d_drops, d_skips = safe_resume(env)
 
-            initial_drop_offset += d_drops
-            initial_skip_offset += d_skips
+            ignore_drops += d_drops
+            ignore_skips += d_skips
 
     save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
     sys.exit()

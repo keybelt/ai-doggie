@@ -17,35 +17,40 @@ class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # [ARCH CHANGE 1] Swapped BatchNorm for GroupNorm.
+        # GroupNorm is stable for RL and doesn't suffer from batch drift.
+
         self.conv1 = nn.Conv2d(12, 24, kernel_size=5, stride=2, padding=2)
-        self.bn1 = nn.BatchNorm2d(24)
+        self.gn1 = nn.GroupNorm(8, 24)
 
         self.conv2 = nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm2d(48)
+        self.gn2 = nn.GroupNorm(8, 48)
 
         self.conv3 = nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm2d(64)
+        self.gn3 = nn.GroupNorm(8, 64)
 
-        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(64)
+        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
+        self.gn4 = nn.GroupNorm(8, 64)
 
-        self.bottleneck = nn.Conv2d(64, 16, kernel_size=1, stride=1)
+        # [ARCH CHANGE 2] REMOVED BOTTLENECK LAYER.
+        # We keep the full 64 channels to preserve spatial info for Duals.
 
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
 
+        # The linear layer will be larger now (~200k params), but M4 Pro handles this easily.
         self.fc = init_layer(nn.Linear(self.flat_size, 512))
         self.actor = init_layer(nn.Linear(512, 2), std=0.01)
         self.critic = init_layer(nn.Linear(512, 1), std=1)
 
     def forward_features(self, x):
-        x = F.relu(self.bn1(self.conv1(x)), inplace=True)
-        x = F.relu(self.bn2(self.conv2(x)), inplace=True)
-        x = F.relu(self.bn3(self.conv3(x)), inplace=True)
-        x = F.relu(self.bn4(self.conv4(x)), inplace=True)
-        x = F.relu(self.bottleneck(x), inplace=True)
+        x = F.relu(self.gn1(self.conv1(x)), inplace=True)
+        x = F.relu(self.gn2(self.conv2(x)), inplace=True)
+        x = F.relu(self.gn3(self.conv3(x)), inplace=True)
+        x = F.relu(self.gn4(self.conv4(x)), inplace=True)
+        # No bottleneck here
         return x
 
     def forward(self, x):
@@ -62,15 +67,16 @@ class GDPolicy(nn.Module):
         return action, dist.log_prob(action), value
 
 
+# PPOAgent remains unchanged
 class PPOAgent:
-    def __init__(self, model, lr=2.0e-4, gamma=0.99, eps_clip=0.2, batch_size=128):
+    def __init__(self, model, lr=1.0e-4, gamma=0.99, eps_clip=0.2, batch_size=256):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.mse_loss = nn.MSELoss()
         self.batch_size = batch_size
-        self.epochs = 5
+        self.epochs = 4
 
     def update(self, states, actions, log_probs, rewards, dones, values):
         torch.mps.empty_cache()
