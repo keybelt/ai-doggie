@@ -67,16 +67,15 @@ class GDPolicy(nn.Module):
         return action, dist.log_prob(action), value
 
 
-# PPOAgent remains unchanged
 class PPOAgent:
-    def __init__(self, model, lr=1.0e-4, gamma=0.99, eps_clip=0.2, batch_size=256):
+    def __init__(self, model, lr=4.0e-4, gamma=0.995, eps_clip=0.3, batch_size=512):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.mse_loss = nn.MSELoss()
         self.batch_size = batch_size
-        self.epochs = 4
+        self.epochs = 1
 
     def update(self, states, actions, log_probs, rewards, dones, values):
         torch.mps.empty_cache()

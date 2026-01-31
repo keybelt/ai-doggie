@@ -129,7 +129,7 @@ class GeometryDashEnv:
         is_dead = False
         if self.last_color_mask is not None:
             mask_diff = cv2.bitwise_xor(color_mask, self.last_color_mask)
-            if cv2.countNonZero(mask_diff) > 5:
+            if cv2.countNonZero(mask_diff) > 3:
                 is_dead = True
 
         self.last_color_mask = color_mask.copy()
@@ -140,6 +140,9 @@ class GeometryDashEnv:
             done = True
         else:
             reward = 0.1
+            jump_penalty = 0.05
+            if action == 1:
+                reward -= jump_penalty
             done = False
 
         total_missed = self.engine.drop_count + self.skipped_count

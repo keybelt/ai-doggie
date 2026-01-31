@@ -7,7 +7,7 @@ import gc
 from collections import deque
 from env import GeometryDashEnv
 from model import GDPolicy, PPOAgent
-from pynput.keyboard import Key, Controller
+import Quartz
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "checkpoints"))
@@ -18,15 +18,20 @@ MAX_TIMESTEPS = 20_000_000
 ROLLOUT_STEPS = 2048
 ACCUMULATION_STEPS = 1
 SAVE_INTERVAL = 100
-LOAD_CHECKPOINT = None
+LOAD_CHECKPOINT = "Pretrain_exit.pt"
 
-os_keyboard = Controller()
+
+def send_global_key(keycode):
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    ev_down = Quartz.CGEventCreateKeyboardEvent(src, keycode, True)
+    ev_up = Quartz.CGEventCreateKeyboardEvent(src, keycode, False)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_down)
+    time.sleep(0.05)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_up)
 
 
 def safe_pause():
-    os_keyboard.press(Key.esc)
-    time.sleep(0.05)
-    os_keyboard.release(Key.esc)
+    send_global_key(53)
     time.sleep(0.02)
 
 
@@ -36,13 +41,14 @@ def safe_resume(env):
 
     env.engine.paused = False
 
+    wait_start = time.time()
     while env.engine.ready_queue.empty():
+        if time.time() - wait_start > 2.0:
+            print("[WARN] Resume timed out waiting for queue")
+            break
         time.sleep(0.001)
 
-    os_keyboard.press(Key.space)
-    time.sleep(0.05)
-    os_keyboard.release(Key.space)
-    time.sleep(0.05)
+    send_global_key(49)
 
     state = env.resume_session()
 
@@ -89,7 +95,8 @@ class ControlRoom:
         avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
         lat_color = c_green if avg_lat < 4.0 else c_yellow if avg_lat < 6.0 else c_red
 
-        miss_pct = (self.total_missed / (self.total_frames + 1e-7) * 100)
+        session_frames = self.total_frames - self.start_step_static
+        miss_pct = (self.total_missed / (session_frames + 1e-7) * 100)
         miss_color = c_green if miss_pct == 0 else (c_yellow if miss_pct < 0.05 else c_red)
 
         ent_color = c_green if self.current_entropy > 0.5 else c_yellow if self.current_entropy > 0.1 else c_red
@@ -99,10 +106,10 @@ class ControlRoom:
         loss_color = c_green if loss_val < 0.05 else c_yellow if loss_val < 0.15 else c_red
         loss_label = "STABLE" if loss_val < 0.05 else "VOLATILE" if loss_val < 0.15 else "UNSTABLE"
 
-        os.system('clear')
+        print(f"""\033[H\033[J""")
         print(f"""
 ============================================================
-   AI Zoink | {RUN_NAME}
+   AI Doggie | {RUN_NAME}
 ============================================================
  [SOURCE]
   > Loaded From:       {self.loaded_from}
@@ -289,7 +296,7 @@ def train():
             if dash.update_count % SAVE_INTERVAL == 0:
                 dash.status_message = "💾 SAVING CHECKPOINT..."
                 save_checkpoint(model, agent, dash.total_frames,
-                                os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_S{dash.total_frames // 1000}k.pt"))
+                                os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_{dash.total_frames // 1000}k.pt"))
 
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()
