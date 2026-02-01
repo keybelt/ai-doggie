@@ -16,82 +16,78 @@ def init_layer(layer, std=np.sqrt(2), bias_const=0.0):
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-
-        # [ARCH CHANGE 1] Swapped BatchNorm for GroupNorm.
-        # GroupNorm is stable for RL and doesn't suffer from batch drift.
-
-        self.conv1 = nn.Conv2d(12, 24, kernel_size=5, stride=2, padding=2)
-        self.gn1 = nn.GroupNorm(8, 24)
-
-        self.conv2 = nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1)
-        self.gn2 = nn.GroupNorm(8, 48)
-
-        self.conv3 = nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1)
-        self.gn3 = nn.GroupNorm(8, 64)
-
-        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
-        self.gn4 = nn.GroupNorm(8, 64)
-
-        # [ARCH CHANGE 2] REMOVED BOTTLENECK LAYER.
-        # We keep the full 64 channels to preserve spatial info for Duals.
+        self.conv1 = nn.Conv2d(12, 24, kernel_size=5, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(24, 48, kernel_size=4, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(48, 32, kernel_size=3, stride=2, padding=1)
 
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
 
-        # The linear layer will be larger now (~200k params), but M4 Pro handles this easily.
-        self.fc = init_layer(nn.Linear(self.flat_size, 512))
+        self.fc1 = init_layer(nn.Linear(self.flat_size, 1024))
+        self.fc2 = init_layer(nn.Linear(1024, 512))
         self.actor = init_layer(nn.Linear(512, 2), std=0.01)
         self.critic = init_layer(nn.Linear(512, 1), std=1)
 
     def forward_features(self, x):
-        x = F.relu(self.gn1(self.conv1(x)), inplace=True)
-        x = F.relu(self.gn2(self.conv2(x)), inplace=True)
-        x = F.relu(self.gn3(self.conv3(x)), inplace=True)
-        x = F.relu(self.gn4(self.conv4(x)), inplace=True)
-        # No bottleneck here
+        x = F.relu(self.conv1(x), inplace=True)
+        x = F.relu(self.conv2(x), inplace=True)
+        x = F.relu(self.conv3(x), inplace=True)
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
         x = x.flatten(1)
-        x = F.relu(self.fc(x), inplace=True)
+        x = F.relu(self.fc1(x), inplace=True)
+        x = F.relu(self.fc2(x), inplace=True)
+
         return self.actor(x), self.critic(x)
 
     def get_action(self, x):
         logits, value = self(x)
-        probs = F.softmax(logits, dim=-1)
-        dist = Categorical(probs)
+        dist = Categorical(logits=logits)
         action = dist.sample()
         return action, dist.log_prob(action), value
 
 
 class PPOAgent:
-    def __init__(self, model, lr=4.0e-4, gamma=0.995, eps_clip=0.3, batch_size=512):
+    def __init__(self, model, lr=3e-4, gamma=0.995, eps_clip=0.15, batch_size=512):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.mse_loss = nn.MSELoss()
         self.batch_size = batch_size
-        self.epochs = 1
+        self.epochs = 4
 
-    def update(self, states, actions, log_probs, rewards, dones, values):
+    def update(self, states, actions, log_probs, rewards, dones, values, last_value):
         torch.mps.empty_cache()
 
-        returns = []
-        discounted_sum = 0
-        rewards_list = rewards.tolist()
-        dones_list = dones.tolist()
+        gae_lambda = 0.95
 
-        for reward, is_done in zip(reversed(rewards_list), reversed(dones_list)):
-            if is_done: discounted_sum = 0
-            discounted_sum = reward + (self.gamma * discounted_sum)
-            returns.insert(0, discounted_sum)
+        rewards = rewards.to(device)
+        dones = dones.to(device)
+        values = values.to(device)
 
-        returns = torch.tensor(returns, dtype=torch.float32).to(device)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-7)
+        advantages = []
+        last_advantage = 0
+
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_non_terminal = 1.0 - dones[t].float()
+                next_value = last_value
+            else:
+                next_non_terminal = 1.0 - dones[t].float()
+                next_value = values[t + 1]
+
+            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
+            last_advantage = delta + self.gamma * gae_lambda * next_non_terminal * last_advantage
+            advantages.insert(0, last_advantage)
+
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+        returns = advantages + values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
 
         full_states = states
         full_actions = actions.to(device)
@@ -117,21 +113,22 @@ class PPOAgent:
                 batch_actions = full_actions[batch_idx]
                 batch_old_log_probs = full_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
+                batch_advantages = advantages[batch_idx]
 
                 logits, new_values = self.model(batch_states)
 
-                probs = F.softmax(logits, dim=-1)
-                dist = Categorical(probs)
+                dist = Categorical(logits=logits)
                 new_log_probs = dist.log_prob(batch_actions)
                 entropy = dist.entropy().mean()
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                advantage = (batch_returns - new_values.squeeze()).detach()
-                surr1 = ratio * advantage
-                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
+
+                surr1 = ratio * batch_advantages
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = self.mse_loss(new_values.squeeze(), batch_returns)
+
                 loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -144,8 +141,5 @@ class PPOAgent:
                 update_count += 1
 
         del full_actions, full_log_probs, returns, batch_states
-        import gc
-        gc.collect()
-        torch.mps.empty_cache()
 
         return total_policy_loss / update_count, total_entropy / update_count

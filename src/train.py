@@ -18,7 +18,7 @@ MAX_TIMESTEPS = 20_000_000
 ROLLOUT_STEPS = 2048
 ACCUMULATION_STEPS = 1
 SAVE_INTERVAL = 100
-LOAD_CHECKPOINT = "Pretrain_exit.pt"
+LOAD_CHECKPOINT = "Pretrain_exit.pt" or None
 
 
 def send_global_key(keycode):
@@ -26,24 +26,22 @@ def send_global_key(keycode):
     ev_down = Quartz.CGEventCreateKeyboardEvent(src, keycode, True)
     ev_up = Quartz.CGEventCreateKeyboardEvent(src, keycode, False)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_down)
-    time.sleep(0.05)
+    time.sleep(0.01)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_up)
 
 
 def safe_pause():
     send_global_key(53)
-    time.sleep(0.02)
+    time.sleep(0.01)
 
 
 def safe_resume(env):
     start_drops = env.engine.drop_count
-    start_skips = env.skipped_count
-
     env.engine.paused = False
 
     wait_start = time.time()
     while env.engine.ready_queue.empty():
-        if time.time() - wait_start > 2.0:
+        if time.time() - wait_start > 4.0:
             print("[WARN] Resume timed out waiting for queue")
             break
         time.sleep(0.001)
@@ -53,12 +51,9 @@ def safe_resume(env):
     state = env.resume_session()
 
     end_drops = env.engine.drop_count
-    end_skips = env.skipped_count
-
     delta_drops = end_drops - start_drops
-    delta_skips = end_skips - start_skips
 
-    return state, delta_drops, delta_skips
+    return state, delta_drops, 0
 
 
 class ControlRoom:
@@ -90,21 +85,21 @@ class ControlRoom:
         progress = self.update_count % SAVE_INTERVAL
 
         avg_conf = sum(self.confidences) / len(self.confidences) * 100 if self.confidences else 0
-        conf_color = c_green if avg_conf > 90 else c_yellow if avg_conf > 75 else c_red
+        conf_color = c_green if avg_conf > 85 else c_yellow if avg_conf > 60 else c_red
 
         avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
-        lat_color = c_green if avg_lat < 4.0 else c_yellow if avg_lat < 6.0 else c_red
+        lat_color = c_green if avg_lat < 5.0 else c_yellow if avg_lat < 6.0 else c_red
 
         session_frames = self.total_frames - self.start_step_static
         miss_pct = (self.total_missed / (session_frames + 1e-7) * 100)
-        miss_color = c_green if miss_pct == 0 else (c_yellow if miss_pct < 0.05 else c_red)
+        miss_color = c_green if miss_pct <= 0.5 else (c_yellow if miss_pct <= 1.0 else c_red)
 
-        ent_color = c_green if self.current_entropy > 0.5 else c_yellow if self.current_entropy > 0.1 else c_red
-        ent_label = "EXPLORING" if self.current_entropy > 0.5 else "CONVERGING" if self.current_entropy > 0.1 else "DETERMINISTIC"
+        ent_color = c_green if 0.05 < self.current_entropy < 0.5 else c_yellow
+        ent_label = "CHAOTIC" if self.current_entropy > 0.5 else "HEALTHY" if self.current_entropy > 0.05 else "DETERMINISTIC"
 
         loss_val = abs(self.current_policy_loss)
-        loss_color = c_green if loss_val < 0.05 else c_yellow if loss_val < 0.15 else c_red
-        loss_label = "STABLE" if loss_val < 0.05 else "VOLATILE" if loss_val < 0.15 else "UNSTABLE"
+        loss_color = c_green if loss_val < 0.02 else c_yellow if loss_val < 0.10 else c_red
+        loss_label = "STABLE" if loss_val < 0.02 else "LEARNING" if loss_val < 0.10 else "UNSTABLE"
 
         print(f"""\033[H\033[J""")
         print(f"""
@@ -220,7 +215,7 @@ def train():
 
     env.flush_vision()
     env.engine.drop_count = 0
-    env.skipped_count = 0
+    env.cumulative_lag_skips = 0
 
     ignore_drops = 0
     ignore_skips = 0
@@ -255,41 +250,53 @@ def train():
 
                 inf_ms = (time.perf_counter() - t_start) * 1000
 
-                next_state, reward, done, info = env.step(action.item())
+                cpu_action = action.item()
+                cpu_log_prob = log_prob.cpu()
+                cpu_value = value.item()
 
-                net_drops = env.engine.drop_count - ignore_drops
-                net_skips = env.skipped_count - ignore_skips
-                current_session_missed = net_drops + net_skips
+                next_state, reward, done, info = env.step(cpu_action)
 
-                #if i % 100 == 0:
-                #    print(
-                #        f"[RAW DEBUG] Drops: {env.engine.drop_count} | Skips: {env.skipped_count} | Queue: {env.engine.ready_queue.qsize()}")
+                session_start_misses = ignore_drops + ignore_skips
+                current_session_missed = info["missed"] - session_start_misses
 
-                dash.log_step(inf_ms, confidence, current_session_missed)
+                if not done:
+                    dash.log_step(inf_ms, confidence, current_session_missed)
+
                 if "warning" in info:
                     state = next_state
                     continue
 
-                buffer.add(state, action.item(), log_prob, reward, done, value)
+                buffer.add(state, cpu_action, cpu_log_prob, reward, done, cpu_value)
 
                 state = next_state
                 dash.total_frames += 1
 
                 if done:
                     dash.session_deaths += 1
+
+                    pre_reset_drops = env.engine.drop_count
                     state = env.reset()
+                    post_reset_drops = env.engine.drop_count
+
+                    ignore_drops += (post_reset_drops - pre_reset_drops)
 
             gc.enable()
 
         if not shutdown_flag:
+            drops_before_pause = env.engine.drop_count
+
             dash.status_message = "⏸️ Updating Weights..."
             dash.render()
             env.engine.paused = True
-            gc.collect()
             safe_pause()
 
+            state_tensor = torch.from_numpy(state).to(device).float().div(255.0)
+            state_tensor = state_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
+            with torch.no_grad():
+                _, _, last_value = model.get_action(state_tensor)
+
             b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values = buffer.get()
-            loss, entropy = agent.update(b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values)
+            loss, entropy = agent.update(b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values, last_value)
 
             dash.log_update(loss, entropy)
 
@@ -300,12 +307,16 @@ def train():
 
             dash.status_message = "▶️ Resuming Gameplay..."
             dash.render()
+
             env.flush_vision()
 
-            state, d_drops, d_skips = safe_resume(env)
+            state, _, _ = safe_resume(env)
 
-            ignore_drops += d_drops
-            ignore_skips += d_skips
+            drops_after_resume = env.engine.drop_count
+
+            ignore_drops += (drops_after_resume - drops_before_pause)
+
+            env.flush_vision()
 
     save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
     sys.exit()

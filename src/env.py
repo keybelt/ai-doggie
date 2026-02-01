@@ -47,7 +47,7 @@ class GeometryDashEnv:
 
         self.stack_size = 4
 
-        self.skipped_count = 0
+        self.cumulative_lag_skips = 0
 
         self.flush_vision()
         self.attempt_roi = (56, 3, 53, 13)
@@ -60,6 +60,7 @@ class GeometryDashEnv:
 
         self.last_color_mask = None
         self.steps_since_reset = 0
+        self.state_buffer = np.zeros((332, 588, 12), dtype=np.uint8)
 
     def reset(self):
         self.controller.act(0)
@@ -68,12 +69,12 @@ class GeometryDashEnv:
 
         self.frame_stack.clear()
 
-        self.flush_vision()
+        _ = self.flush_vision()
 
         try:
             raw_frame, _ = self.engine.ready_queue.get(timeout=2.0)
 
-            initial_frame = raw_frame.copy()
+            initial_frame = raw_frame[:, :, :3].copy()
 
             for _ in range(self.stack_size):
                 self.frame_stack.append(initial_frame)
@@ -89,7 +90,7 @@ class GeometryDashEnv:
 
     def flush_vision(self):
         if self.engine.ready_queue.empty():
-            return
+            return 0
 
         skipped_in_batch = 0
         while self.engine.ready_queue.qsize() > 1:
@@ -101,29 +102,34 @@ class GeometryDashEnv:
             except:
                 break
 
-        self.skipped_count += skipped_in_batch
+        return skipped_in_batch
 
     def get_state(self):
-        return np.concatenate(list(self.frame_stack), axis=2)
+        for i, frame in enumerate(self.frame_stack):
+            self.state_buffer[:, :, i * 3:(i + 1) * 3] = frame
+        return self.state_buffer.copy()
 
     def step(self, action):
         self.controller.act(action)
         self.steps_since_reset += 1
 
-        self.flush_vision()
+        lag_skips = self.flush_vision()
+        self.cumulative_lag_skips += lag_skips
 
         try:
             raw_frame, _ = self.engine.ready_queue.get(timeout=0.1)
         except:
             return self.get_state(), 0.0, False, {"warning": "frame_skip"}
 
-        current_frame = raw_frame.copy()
+        current_frame = raw_frame[:, :, :3].copy()
+
         if hasattr(self.engine, 'idle_queue'):
             self.engine.idle_queue.put(raw_frame)
 
         tx, ty, tw, th = self.attempt_roi
         text_crop = current_frame[ty:ty + th, tx:tx + tw]
-        hsv_crop = cv2.cvtColor(text_crop, cv2.COLOR_RGB2HSV)
+
+        hsv_crop = cv2.cvtColor(text_crop, cv2.COLOR_BGR2HSV)
         color_mask = cv2.inRange(hsv_crop, self.lower_spectrum, self.upper_spectrum)
 
         is_dead = False
@@ -136,24 +142,22 @@ class GeometryDashEnv:
         self.frame_stack.append(current_frame)
 
         if is_dead:
-            reward = -100.0
+            reward = -50.0
             done = True
         else:
-            reward = 0.1
-            jump_penalty = 0.05
-            if action == 1:
-                reward -= jump_penalty
+            reward = 0.3
             done = False
 
-        total_missed = self.engine.drop_count + self.skipped_count
+        perf_misses = self.engine.drop_count + self.cumulative_lag_skips
 
-        return self.get_state(), reward, done, {"missed": total_missed}
+        return self.get_state(), reward, done, {"missed": perf_misses}
 
     def resume_session(self):
-        self.flush_vision()
+        _ = self.flush_vision()
         try:
             raw_frame, _ = self.engine.ready_queue.get(timeout=2.0)
-            self.frame_stack.append(raw_frame)
+            self.frame_stack.append(raw_frame[:, :, :3].copy())
+
             if hasattr(self.engine, 'idle_queue'):
                 self.engine.idle_queue.put(raw_frame)
         except:

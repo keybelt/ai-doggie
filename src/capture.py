@@ -1,6 +1,5 @@
 import objc
 import numpy as np
-import time
 import Quartz
 import CoreMedia
 import queue
@@ -23,7 +22,7 @@ class GDAIVision(NSObject):
         self.paused = True
 
         for _ in range(self.BUFFER_SIZE):
-            buf = np.zeros((332, 588, 3), dtype=np.uint8)
+            buf = np.zeros((332, 588, 4), dtype=np.uint8)
             self.idle_queue.put(buf)
 
         return self
@@ -54,7 +53,7 @@ class GDAIVision(NSObject):
             raw_buffer = base_addr.as_buffer(bpr * 332)
             raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(332, bpr)
 
-            np.copyto(frame_buffer, raw_array[:, :2352].reshape(332, 588, 4)[:, :, [2, 1, 0]])
+            np.copyto(frame_buffer, raw_array[:, :2352].reshape(332, 588, 4))
 
         finally:
             Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
