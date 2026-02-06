@@ -8,17 +8,40 @@ from collections import deque
 from env import GeometryDashEnv
 from model import GDPolicy, PPOAgent
 import Quartz
+from pynput import keyboard
+from torch.distributions import Categorical
+
+
+model_paused = False
+override_action = None
+
+def on_press(key):
+    global override_action, model_paused
+    if key == keyboard.Key.shift_r:
+        override_action = 1
+    elif key == keyboard.Key.caps_lock:
+        model_paused = not model_paused
+        print(f"\n[HITL] AI Control: {'OFF (Passive)' if model_paused else 'ON (Active)'}")
+
+def on_release(key):
+    global override_action
+    if key == keyboard.Key.shift_r:
+        override_action = None
+
+listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+listener.start()
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "checkpoints"))
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-RUN_NAME = "Pretrain"
+RUN_NAME = "Pretrain_Retray"
 MAX_TIMESTEPS = 20_000_000
 ROLLOUT_STEPS = 2048
 ACCUMULATION_STEPS = 1
 SAVE_INTERVAL = 100
-LOAD_CHECKPOINT = "Pretrain_exit.pt" or None
+LOAD_CHECKPOINT = "Pretrain_Stereo_Madness_exit.pt"
 
 
 def send_global_key(keycode):
@@ -62,8 +85,8 @@ class ControlRoom:
         self.total_frames = start_step
         self.update_count = 0
         self.loaded_from = loaded_from if loaded_from else "Fresh Start"
-        self.latencies = deque(maxlen=20)
-        self.confidences = deque(maxlen=20)
+        self.latencies = deque(maxlen=1000)
+        self.confidences = deque(maxlen=1000)
         self.total_missed = 0
         self.current_entropy = 0.0
         self.current_policy_loss = 0.0
@@ -160,8 +183,9 @@ class RolloutBuffer:
         self.dones = torch.zeros(steps, dtype=torch.bool)
         self.values = torch.zeros(steps, dtype=torch.float)
         self.ptr = 0
+        self.is_human = torch.zeros(steps, dtype=torch.bool)
 
-    def add(self, state, action, log_prob, reward, done, value):
+    def add(self, state, action, log_prob, reward, done, value, human_flag):
         if self.ptr < self.steps:
             self.states[self.ptr] = torch.from_numpy(state)
             self.actions[self.ptr] = action
@@ -169,11 +193,12 @@ class RolloutBuffer:
             self.rewards[self.ptr] = reward
             self.dones[self.ptr] = done
             self.values[self.ptr] = value
+            self.is_human[self.ptr] = human_flag
             self.ptr += 1
 
     def get(self):
         self.ptr = 0
-        return self.states, self.actions, self.log_probs, self.rewards, self.dones, self.values
+        return self.states, self.actions, self.log_probs, self.rewards, self.dones, self.values, self.is_human
 
 
 def train():
@@ -185,7 +210,8 @@ def train():
     device = torch.device("mps")
 
     model = GDPolicy().to(device)
-    agent = PPOAgent(model)
+    explore_hyperparameters = [model, 2.5e-4, 0.995, 0.2, 512, 0.05, 5]
+    agent = PPOAgent(*explore_hyperparameters)
 
     start_step = 0
     loaded_name = None
@@ -223,7 +249,7 @@ def train():
     print("Startup complete. Metrics forcibly reset to 0.")
 
     dash = ControlRoom(loaded_name, start_step)
-
+    episode_start_ptr = 0
     while dash.total_frames < MAX_TIMESTEPS:
         if shutdown_flag: break
 
@@ -236,7 +262,7 @@ def train():
 
             for i in range(ROLLOUT_STEPS):
                 if shutdown_flag: break
-                if i % 100 == 0: dash.render()
+                if i % 120 == 0: dash.render()
 
                 t_start = time.perf_counter()
 
@@ -245,7 +271,22 @@ def train():
                 state_tensor = state_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
 
                 with torch.no_grad():
-                    action, log_prob, value = model.get_action(state_tensor)
+                    logits, value = model(state_tensor)
+                    dist = Categorical(logits=logits)
+
+                    if model_paused:
+                        ai_action = torch.tensor([0], device=device)
+                    else:
+                        u = torch.rand_like(logits)
+                        gumbel_noise = -torch.log(-torch.log(u + 1e-6) + 1e-6)
+                        ai_action = torch.argmax(logits + gumbel_noise, dim=-1)
+
+                    if override_action is not None:
+                        action = torch.tensor([override_action], device=device)
+                    else:
+                        action = ai_action
+
+                    log_prob = dist.log_prob(action)
                     confidence = torch.exp(log_prob).item()
 
                 inf_ms = (time.perf_counter() - t_start) * 1000
@@ -254,7 +295,14 @@ def train():
                 cpu_log_prob = log_prob.cpu()
                 cpu_value = value.item()
 
+                skips_pre_step = env.cumulative_lag_skips
+                drops_pre_step = env.engine.drop_count
+
                 next_state, reward, done, info = env.step(cpu_action)
+
+                if "warning" in info:
+                    state = next_state
+                    continue
 
                 session_start_misses = ignore_drops + ignore_skips
                 current_session_missed = info["missed"] - session_start_misses
@@ -262,23 +310,33 @@ def train():
                 if not done:
                     dash.log_step(inf_ms, confidence, current_session_missed)
 
-                if "warning" in info:
-                    state = next_state
-                    continue
-
-                buffer.add(state, cpu_action, cpu_log_prob, reward, done, cpu_value)
+                is_human_step = (override_action is not None) or model_paused
+                buffer.add(state, cpu_action, cpu_log_prob, reward, done, cpu_value, is_human_step)
 
                 state = next_state
                 dash.total_frames += 1
 
                 if done:
+                    if reward < 0:
+                        buffer.is_human[episode_start_ptr: buffer.ptr] = False
+
+                    episode_start_ptr = buffer.ptr
+
+                if done:
                     dash.session_deaths += 1
 
-                    pre_reset_drops = env.engine.drop_count
-                    state = env.reset()
-                    post_reset_drops = env.engine.drop_count
+                    step_drops = env.engine.drop_count - drops_pre_step
 
-                    ignore_drops += (post_reset_drops - pre_reset_drops)
+                    pre_reset_drops = env.engine.drop_count
+                    pre_reset_skips = env.cumulative_lag_skips
+
+                    state = env.reset()
+
+                    post_reset_drops = env.engine.drop_count
+                    post_reset_skips = env.cumulative_lag_skips
+
+                    ignore_drops += (post_reset_drops - pre_reset_drops) + step_drops
+                    ignore_skips += (post_reset_skips - pre_reset_skips) + (pre_reset_skips - skips_pre_step)
 
             gc.enable()
 
@@ -295,8 +353,9 @@ def train():
             with torch.no_grad():
                 _, _, last_value = model.get_action(state_tensor)
 
-            b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values = buffer.get()
-            loss, entropy = agent.update(b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values, last_value)
+            b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values, b_is_human = buffer.get()
+            episode_start_ptr = 0
+            loss, entropy = agent.update(b_states, b_actions, b_log_probs, b_rewards, b_dones, b_values, last_value, b_is_human)
 
             dash.log_update(loss, entropy)
 

@@ -13,21 +13,20 @@ class KeyboardController:
         self.SPACE_KEY = 49
         self.src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
 
+        self.ev_down = Quartz.CGEventCreateKeyboardEvent(self.src, self.SPACE_KEY, True)
+        self.ev_up = Quartz.CGEventCreateKeyboardEvent(self.src, self.SPACE_KEY, False)
+
     def act(self, action):
         if action == 1:
             if not self.is_holding:
-                self._post_event(True)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, self.ev_down)
                 self.is_holding = True
                 return True
         else:
             if self.is_holding:
-                self._post_event(False)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, self.ev_up)
                 self.is_holding = False
         return False
-
-    def _post_event(self, key_down):
-        event = Quartz.CGEventCreateKeyboardEvent(self.src, self.SPACE_KEY, key_down)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
 
 class GeometryDashEnv:
@@ -51,7 +50,7 @@ class GeometryDashEnv:
 
         self.flush_vision()
         self.attempt_roi = (56, 3, 53, 13)
-        self.lower_spectrum = np.array([70, 100, 100])
+        self.lower_spectrum = np.array([75, 200, 240])
         self.upper_spectrum = np.array([80, 255, 255])
 
         self.frame_stack = collections.deque(maxlen=self.stack_size)
@@ -64,27 +63,32 @@ class GeometryDashEnv:
 
     def reset(self):
         self.controller.act(0)
+        self.engine.paused = True
         self.last_color_mask = None
         self.steps_since_reset = 0
 
         self.frame_stack.clear()
 
-        _ = self.flush_vision()
+        lag_skips = self.flush_vision()
+        self.cumulative_lag_skips += lag_skips
 
         try:
+            self.engine.paused = False
             raw_frame, _ = self.engine.ready_queue.get(timeout=2.0)
-
             initial_frame = raw_frame[:, :, :3].copy()
 
             for _ in range(self.stack_size):
                 self.frame_stack.append(initial_frame)
 
             if hasattr(self.engine, 'idle_queue'):
-                self.engine.idle_queue.put(raw_frame)
+                self.engine.idle_queue.put_nowait(raw_frame)
         except:
             print("[Env] Warning: Reset timed out waiting for fresh frame.")
             for _ in range(self.stack_size):
                 self.frame_stack.append(np.zeros((332, 588, 3), dtype=np.uint8))
+
+        post_wait_skips = self.flush_vision()
+        self.cumulative_lag_skips += post_wait_skips
 
         return self.get_state()
 
@@ -110,7 +114,7 @@ class GeometryDashEnv:
         return self.state_buffer.copy()
 
     def step(self, action):
-        self.controller.act(action)
+        did_initiate_press = self.controller.act(action)
         self.steps_since_reset += 1
 
         lag_skips = self.flush_vision()
@@ -124,7 +128,7 @@ class GeometryDashEnv:
         current_frame = raw_frame[:, :, :3].copy()
 
         if hasattr(self.engine, 'idle_queue'):
-            self.engine.idle_queue.put(raw_frame)
+            self.engine.idle_queue.put_nowait(raw_frame)
 
         tx, ty, tw, th = self.attempt_roi
         text_crop = current_frame[ty:ty + th, tx:tx + tw]
@@ -135,7 +139,7 @@ class GeometryDashEnv:
         is_dead = False
         if self.last_color_mask is not None:
             mask_diff = cv2.bitwise_xor(color_mask, self.last_color_mask)
-            if cv2.countNonZero(mask_diff) > 3:
+            if cv2.countNonZero(mask_diff) > 4:
                 is_dead = True
 
         self.last_color_mask = color_mask.copy()
@@ -146,6 +150,8 @@ class GeometryDashEnv:
             done = True
         else:
             reward = 0.3
+            #if did_initiate_press:
+                #reward -= 0.1
             done = False
 
         perf_misses = self.engine.drop_count + self.cumulative_lag_skips
@@ -159,7 +165,7 @@ class GeometryDashEnv:
             self.frame_stack.append(raw_frame[:, :, :3].copy())
 
             if hasattr(self.engine, 'idle_queue'):
-                self.engine.idle_queue.put(raw_frame)
+                self.engine.idle_queue.put_nowait(raw_frame)
         except:
             print("[Env] Warning: Resume timed out waiting for frame.")
 
