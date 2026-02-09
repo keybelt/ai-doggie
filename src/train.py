@@ -36,12 +36,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "checkpoints"))
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-RUN_NAME = "Pretrain_Retray"
+RUN_NAME = "Pretrain_Sonar"
 MAX_TIMESTEPS = 20_000_000
 ROLLOUT_STEPS = 2048
-ACCUMULATION_STEPS = 1
-SAVE_INTERVAL = 100
-LOAD_CHECKPOINT = "Pretrain_Stereo_Madness_exit.pt"
+ACCUMULATION_STEPS = 4
+SAVE_INTERVAL = 25
+LOAD_CHECKPOINT = "Pretrain_Sonar_exit.pt"
 
 
 def send_global_key(keycode):
@@ -210,7 +210,8 @@ def train():
     device = torch.device("mps")
 
     model = GDPolicy().to(device)
-    explore_hyperparameters = [model, 2.5e-4, 0.995, 0.2, 512, 0.05, 5]
+    # (model, lr, gamma, eps_clip, batch_size, ent_coef, epoch)
+    explore_hyperparameters = [model, 3.0e-4, 0.995, 0.2, 1024, 0.01, 5]
     agent = PPOAgent(*explore_hyperparameters)
 
     start_step = 0
@@ -316,11 +317,11 @@ def train():
                 state = next_state
                 dash.total_frames += 1
 
-                if done:
-                    if reward < 0:
-                        buffer.is_human[episode_start_ptr: buffer.ptr] = False
+                #if done:
+                    #if reward < 0:
+                    #    buffer.is_human[episode_start_ptr: buffer.ptr] = False
 
-                    episode_start_ptr = buffer.ptr
+                    #episode_start_ptr = buffer.ptr
 
                 if done:
                     dash.session_deaths += 1

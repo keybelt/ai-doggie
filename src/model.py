@@ -18,33 +18,44 @@ def init_layer(layer, std=np.sqrt(2), bias_const=0.0):
 class GDPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(12, 24, kernel_size=5, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(24, 32, kernel_size=4, stride=2, padding=1)
-        self.conv3 = nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1)
+        self.conv1 = init_layer(nn.Conv2d(12, 32, kernel_size=8, stride=4, padding=0))
+        self.conv2 = init_layer(nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0))
+        self.conv3 = init_layer(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=0))
+        self.conv4 = init_layer(nn.Conv2d(64, 16, kernel_size=1, stride=1, padding=0))
 
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
             self.flat_size = x.numel()
 
-        self.fc1 = init_layer(nn.Linear(self.flat_size, 1024))
-        self.fc2 = init_layer(nn.Linear(1024, 512))
-        self.actor = init_layer(nn.Linear(512, 2), std=0.01)
-        self.critic = init_layer(nn.Linear(512, 1), std=1)
+        self.shared_fc = init_layer(nn.Linear(self.flat_size, 512))
+
+        self.actor_net = nn.Sequential(
+            init_layer(nn.Linear(512, 256)),
+            nn.ReLU(),
+            init_layer(nn.Linear(256, 2), std=0.01)
+        )
+
+        self.critic_net = nn.Sequential(
+            init_layer(nn.Linear(512, 256)),
+            nn.ReLU(),
+            init_layer(nn.Linear(256, 1), std=1.0)
+        )
 
     def forward_features(self, x):
         x = F.relu(self.conv1(x), inplace=True)
         x = F.relu(self.conv2(x), inplace=True)
         x = F.relu(self.conv3(x), inplace=True)
+        x = F.relu(self.conv4(x), inplace=True)
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
         x = x.flatten(1)
-        x = F.relu(self.fc1(x), inplace=True)
-        x = F.relu(self.fc2(x), inplace=True)
 
-        return self.actor(x), self.critic(x)
+        x = F.relu(self.shared_fc(x), inplace=True)
+
+        return self.actor_net(x), self.critic_net(x)
 
     def get_action(self, x):
         logits, value = self(x)
@@ -109,7 +120,6 @@ class PPOAgent:
             np.random.shuffle(indices)
 
             for start in range(0, dataset_size, self.batch_size):
-                time.sleep(0.1)
                 end = start + self.batch_size
                 batch_idx = indices[start:end]
 
@@ -133,8 +143,8 @@ class PPOAgent:
                 ppo_loss = -torch.min(surr1, surr2)
                 bc_loss = F.cross_entropy(logits, batch_actions, reduction='none')
                 mask = batch_is_human[batch_idx].to(device).float()
-                total_loss = ((ppo_loss * (1 - mask)).mean()) + ((bc_loss * mask).mean() * 1.0)
-
+                bc_term = (bc_loss * mask).mean()
+                total_loss = ((ppo_loss * (1 - mask)).mean()) + (bc_term)
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = self.mse_loss(new_values.squeeze(), batch_returns)
 

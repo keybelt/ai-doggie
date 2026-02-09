@@ -49,15 +49,16 @@ class GeometryDashEnv:
         self.cumulative_lag_skips = 0
 
         self.flush_vision()
-        self.attempt_roi = (56, 3, 53, 13)
-        self.lower_spectrum = np.array([75, 200, 240])
-        self.upper_spectrum = np.array([80, 255, 255])
+        self.attempt_roi = (279, 1, 28, 16)
+
+        self.death_template = cv2.imread('0%.png', cv2.IMREAD_GRAYSCALE)
+        if self.death_template is None:
+            raise ValueError("Could not load 0%.png")
 
         self.frame_stack = collections.deque(maxlen=self.stack_size)
         for _ in range(self.stack_size):
             self.frame_stack.append(np.zeros((332, 588, 3), dtype=np.uint8))
 
-        self.last_color_mask = None
         self.steps_since_reset = 0
         self.state_buffer = np.zeros((332, 588, 12), dtype=np.uint8)
 
@@ -133,25 +134,21 @@ class GeometryDashEnv:
         tx, ty, tw, th = self.attempt_roi
         text_crop = current_frame[ty:ty + th, tx:tx + tw]
 
-        hsv_crop = cv2.cvtColor(text_crop, cv2.COLOR_BGR2HSV)
-        color_mask = cv2.inRange(hsv_crop, self.lower_spectrum, self.upper_spectrum)
+        gray_crop = cv2.cvtColor(text_crop, cv2.COLOR_BGR2GRAY)
 
-        is_dead = False
-        if self.last_color_mask is not None:
-            mask_diff = cv2.bitwise_xor(color_mask, self.last_color_mask)
-            if cv2.countNonZero(mask_diff) > 4:
-                is_dead = True
+        res = cv2.matchTemplate(gray_crop, self.death_template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
 
-        self.last_color_mask = color_mask.copy()
+        is_dead = max_val > 0.9
         self.frame_stack.append(current_frame)
 
         if is_dead:
             reward = -50.0
             done = True
         else:
-            reward = 0.3
-            #if did_initiate_press:
-                #reward -= 0.1
+            reward = 0.1
+            if did_initiate_press:
+                reward -= 0.01
             done = False
 
         perf_misses = self.engine.drop_count + self.cumulative_lag_skips
