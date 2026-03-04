@@ -46,29 +46,41 @@ class GeometryDashEnv:
 
         self.stack_size = 4
 
+        self.dilation = 4
+
+        self.raw_buffer_size = (self.stack_size - 1) * self.dilation + 1
+        self.raw_frame_buffer = collections.deque(maxlen=self.raw_buffer_size)
+        for _ in range(self.raw_buffer_size):
+            self.raw_frame_buffer.append(np.zeros((332, 588, 3), dtype=np.uint8))
+
+        self.state_buffer = np.zeros((332, 588, 12), dtype=np.uint8)
+
         self.cumulative_lag_skips = 0
 
         self.flush_vision()
-        self.attempt_roi = (279, 1, 28, 16)
+        self.attempt_roi = (264, 1, 30, 16)
 
         self.death_template = cv2.imread('0%.png', cv2.IMREAD_GRAYSCALE)
         if self.death_template is None:
             raise ValueError("Could not load 0%.png")
 
-        self.frame_stack = collections.deque(maxlen=self.stack_size)
-        for _ in range(self.stack_size):
-            self.frame_stack.append(np.zeros((332, 588, 3), dtype=np.uint8))
-
         self.steps_since_reset = 0
         self.state_buffer = np.zeros((332, 588, 12), dtype=np.uint8)
+        self.last_template_match = False
+        self.min_hold_frames = 1
+        self.current_hold_steps = 0
+        self.last_action = 0
+        self.death_cooldown_duration = 30
+        self.current_death_cooldown = 0
 
     def reset(self):
         self.controller.act(0)
         self.engine.paused = True
         self.last_color_mask = None
         self.steps_since_reset = 0
-
-        self.frame_stack.clear()
+        self.current_hold_steps = 0
+        self.last_action = 0
+        self.current_death_cooldown = 0
 
         lag_skips = self.flush_vision()
         self.cumulative_lag_skips += lag_skips
@@ -78,18 +90,27 @@ class GeometryDashEnv:
             raw_frame, _ = self.engine.ready_queue.get(timeout=2.0)
             initial_frame = raw_frame[:, :, :3].copy()
 
-            for _ in range(self.stack_size):
-                self.frame_stack.append(initial_frame)
+            tx, ty, tw, th = self.attempt_roi
+            init_crop = initial_frame[ty:ty + th, tx:tx + tw]
+            init_gray = cv2.cvtColor(init_crop, cv2.COLOR_BGR2GRAY)
+            res = cv2.matchTemplate(init_gray, self.death_template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(res)
+            self.last_template_match = max_val >= 0.99995
 
             if hasattr(self.engine, 'idle_queue'):
                 self.engine.idle_queue.put_nowait(raw_frame)
         except:
             print("[Env] Warning: Reset timed out waiting for fresh frame.")
-            for _ in range(self.stack_size):
-                self.frame_stack.append(np.zeros((332, 588, 3), dtype=np.uint8))
 
         post_wait_skips = self.flush_vision()
         self.cumulative_lag_skips += post_wait_skips
+
+        self.initial_drop_count = self.engine.drop_count
+
+        self.raw_frame_buffer.clear()
+
+        for _ in range(self.raw_buffer_size):
+            self.raw_frame_buffer.append(initial_frame)
 
         return self.get_state()
 
@@ -110,11 +131,21 @@ class GeometryDashEnv:
         return skipped_in_batch
 
     def get_state(self):
-        for i, frame in enumerate(self.frame_stack):
+        for i in range(self.stack_size):
+            idx = -1 - (i * self.dilation)
+            frame = self.raw_frame_buffer[idx]
+
             self.state_buffer[:, :, i * 3:(i + 1) * 3] = frame
+
         return self.state_buffer.copy()
 
     def step(self, action):
+        if self.current_hold_steps > 0:
+            action = 1
+            self.current_hold_steps -= 1
+        elif action == 1:
+            self.current_hold_steps = self.min_hold_frames - 1
+
         did_initiate_press = self.controller.act(action)
         self.steps_since_reset += 1
 
@@ -128,6 +159,8 @@ class GeometryDashEnv:
 
         current_frame = raw_frame[:, :, :3].copy()
 
+        self.raw_frame_buffer.append(current_frame)
+
         if hasattr(self.engine, 'idle_queue'):
             self.engine.idle_queue.put_nowait(raw_frame)
 
@@ -139,19 +172,30 @@ class GeometryDashEnv:
         res = cv2.matchTemplate(gray_crop, self.death_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
 
-        is_dead = max_val > 0.9
-        self.frame_stack.append(current_frame)
+        matches_template = max_val >= 0.99995
+        is_dead = False
+        if self.current_death_cooldown > 0:
+            self.current_death_cooldown -= 1
+            self.last_template_match = matches_template
+        else:
+            is_dead = matches_template and not self.last_template_match
+            self.last_template_match = matches_template
+
+            if is_dead:
+                self.current_death_cooldown = self.death_cooldown_duration
 
         if is_dead:
-            reward = -50.0
+            reward = -5.0
             done = True
         else:
-            reward = 0.1
-            if did_initiate_press:
-                reward -= 0.01
+            reward = 0.01
+            if action != self.last_action:
+                reward -= 0.1
+            self.last_action = action
             done = False
 
-        perf_misses = self.engine.drop_count + self.cumulative_lag_skips
+        episode_drops = self.engine.drop_count - self.initial_drop_count
+        perf_misses = episode_drops + self.cumulative_lag_skips
 
         return self.get_state(), reward, done, {"missed": perf_misses}
 
@@ -159,7 +203,7 @@ class GeometryDashEnv:
         _ = self.flush_vision()
         try:
             raw_frame, _ = self.engine.ready_queue.get(timeout=2.0)
-            self.frame_stack.append(raw_frame[:, :, :3].copy())
+            self.raw_frame_buffer.append(raw_frame[:, :, :3].copy())
 
             if hasattr(self.engine, 'idle_queue'):
                 self.engine.idle_queue.put_nowait(raw_frame)

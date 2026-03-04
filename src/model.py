@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 import numpy as np
 import sys
-import time
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -26,7 +25,7 @@ class GDPolicy(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 332, 588)
             x = self.forward_features(dummy)
-            self.flat_size = x.numel()
+            self.flat_size = x.numel() + 1
 
         self.shared_fc = init_layer(nn.Linear(self.flat_size, 512))
 
@@ -49,16 +48,18 @@ class GDPolicy(nn.Module):
         x = F.relu(self.conv4(x), inplace=True)
         return x
 
-    def forward(self, x):
+    def forward(self, x, prev_action):
         x = self.forward_features(x)
         x = x.flatten(1)
 
-        x = F.relu(self.shared_fc(x), inplace=True)
+        prev_action = prev_action.view(-1, 1).float()
+        x = torch.cat((x, prev_action), dim=1)
 
+        x = F.relu(self.shared_fc(x), inplace=True)
         return self.actor_net(x), self.critic_net(x)
 
-    def get_action(self, x):
-        logits, value = self(x)
+    def get_action(self, x, prev_action):
+        logits, value = self(x, prev_action)
         dist = Categorical(logits=logits)
         action = dist.sample()
         return action, dist.log_prob(action), value
@@ -75,7 +76,7 @@ class PPOAgent:
         self.epochs = epoch
         self.ent_coef = ent_coef
 
-    def update(self, states, actions, log_probs, rewards, dones, values, last_value, batch_is_human):
+    def update(self, states, actions, prev_actions, log_probs, rewards, dones, values, last_value, batch_is_human):
         gae_lambda = 0.95
 
         rewards = rewards.to(device)
@@ -84,6 +85,7 @@ class PPOAgent:
 
         advantages = []
         last_advantage = 0
+        full_prev_actions = prev_actions.to(device)
 
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
@@ -126,29 +128,35 @@ class PPOAgent:
                 batch_states = states[batch_idx].to(device).float().div(255.0).permute(0, 3, 1, 2).contiguous()
 
                 batch_actions = full_actions[batch_idx]
+                batch_prev_actions = full_prev_actions[batch_idx]
                 batch_old_log_probs = full_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
                 batch_advantages = advantages[batch_idx]
 
-                logits, new_values = self.model(batch_states)
+                logits, new_values = self.model(batch_states, batch_prev_actions)
                 dist = Categorical(logits=logits)
 
                 new_log_probs = dist.log_prob(batch_actions)
                 entropy = dist.entropy().mean()
 
-                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                log_diff = torch.clamp(new_log_probs - batch_old_log_probs, min=-20.0, max=20.0)
+                ratio = torch.exp(log_diff)
 
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
                 ppo_loss = -torch.min(surr1, surr2)
                 bc_loss = F.cross_entropy(logits, batch_actions, reduction='none')
                 mask = batch_is_human[batch_idx].to(device).float()
-                bc_term = (bc_loss * mask).mean()
-                total_loss = ((ppo_loss * (1 - mask)).mean()) + (bc_term)
-                actor_loss = -torch.min(surr1, surr2).mean()
+                bc_term = (bc_loss * mask).sum() / (mask.sum() + 1e-7)
+                ppo_term = (ppo_loss * (1 - mask)).sum() / ((1 - mask).sum() + 1e-7)
+
+                total_loss = ppo_term + (bc_term * 0.1)
+
+                actor_loss = total_loss
+
                 critic_loss = self.mse_loss(new_values.squeeze(), batch_returns)
 
-                loss = total_loss + 0.5 * critic_loss - self.ent_coef * entropy
+                loss = total_loss + 0.1 * critic_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
