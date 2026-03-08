@@ -1,386 +1,171 @@
-import torch
-import time
-import sys
 import os
-import signal
-import gc
-from collections import deque
-from env import GeometryDashEnv
-from model import GDPolicy, PPOAgent
-import Quartz
-from pynput import keyboard
-from pynput.keyboard import KeyCode
-from torch.distributions import Categorical
+import glob
+import sys
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import IterableDataset, DataLoader
+from model import GDBehavioralCloningModel
 
-
-model_paused = False
-override_action = None
-
-def on_press(key):
-    global override_action, model_paused
-    if key == KeyCode.from_char('/'):
-        override_action = 1
-    elif key == keyboard.Key.caps_lock:
-        model_paused = not model_paused
-        print(f"\n[HITL] AI Control: {'OFF (Passive)' if model_paused else 'ON (Active)'}")
-
-def on_release(key):
-    global override_action
-    if key == KeyCode.from_char('/'):
-        override_action = None
-
-listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-listener.start()
-
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "checkpoints"))
+DATASET_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+CHECKPOINT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "checkpoints"))
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-RUN_NAME = "Pretrain"
-MAX_TIMESTEPS = 20_000_000
-ROLLOUT_STEPS = 2048
-ACCUMULATION_STEPS = 4
-SAVE_INTERVAL = 25
-LOAD_CHECKPOINT = "Pretrain_exit.pt"
+EPOCHS = 50
+BATCH_SIZE = 4
+SEQ_LEN = 60
+LEARNING_RATE = 3e-4
+ACTION_DROPOUT_RATE = 0.5
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
-def send_global_key(keycode):
-    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-    ev_down = Quartz.CGEventCreateKeyboardEvent(src, keycode, True)
-    ev_up = Quartz.CGEventCreateKeyboardEvent(src, keycode, False)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_down)
-    time.sleep(0.01)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_up)
+class GDSequenceIterableDataset(IterableDataset):
+    def __init__(self, file_paths, seq_len=60, batch_size=4):
+        self.file_paths = file_paths
+        self.seq_len = seq_len
+        self.batch_size = batch_size
 
+    def __iter__(self):
+        import random
+        random.shuffle(self.file_paths)
+        file_queue = list(self.file_paths)
+        active_streams = [None] * self.batch_size
 
-def safe_pause():
-    send_global_key(53)
-    time.sleep(0.01)
+        while True:
+            batch_frames, batch_actions, batch_resets = [], [], []
+            active_count = 0
 
+            for i in range(self.batch_size):
+                if active_streams[i] is None and file_queue:
+                    active_streams[i] = self._stream_file(file_queue.pop(0))
 
-def safe_resume(env):
-    start_drops = env.engine.drop_count
-    env.engine.paused = False
+                stream = active_streams[i]
 
-    wait_start = time.time()
-    while env.engine.ready_queue.empty():
-        if time.time() - wait_start > 4.0:
-            print("[WARN] Resume timed out waiting for queue")
-            break
-        time.sleep(0.001)
+                if stream is not None:
+                    try:
+                        frames, actions, is_first = next(stream)
+                        batch_frames.append(frames)
+                        batch_actions.append(actions)
+                        batch_resets.append(is_first)
+                        active_count += 1
+                    except StopIteration:
+                        if file_queue:
+                            active_streams[i] = self._stream_file(file_queue.pop(0))
+                            frames, actions, is_first = next(active_streams[i])
+                            batch_frames.append(frames)
+                            batch_actions.append(actions)
+                            batch_resets.append(is_first)
+                            active_count += 1
+                        else:
+                            active_streams[i] = None
 
-    send_global_key(49)
+            if active_count == 0:
+                break
 
-    state = env.resume_session()
+            if active_count < self.batch_size:
+                break
 
-    end_drops = env.engine.drop_count
-    delta_drops = end_drops - start_drops
+            yield np.stack(batch_frames), np.stack(batch_actions), np.array(batch_resets)
 
-    return state, delta_drops, 0
+    def _stream_file(self, path):
+        try:
+            with np.load(path) as data:
+                frames, actions = data['frames'], data['actions']
+                num_chunks = (len(frames) - 1) // self.seq_len
 
-
-class ControlRoom:
-    def __init__(self, loaded_from, start_step=0):
-        self.start_step_static = start_step
-        self.total_frames = start_step
-        self.update_count = 0
-        self.loaded_from = loaded_from if loaded_from else "Fresh Start"
-        self.latencies = deque(maxlen=1000)
-        self.confidences = deque(maxlen=1000)
-        self.drop_window = deque(maxlen=600)
-        self.last_miss_reading = 0
-        self.total_missed = 0
-        self.current_entropy = 0.0
-        self.current_policy_loss = 0.0
-        self.session_deaths = 0
-        self.status_message = "Active"
-
-    def log_step(self, inference_ms, confidence, missed_frames):
-        self.latencies.append(inference_ms)
-        self.confidences.append(confidence)
-
-        delta = missed_frames - self.last_miss_reading
-        if delta < 0: delta = 0
-        self.drop_window.append(delta)
-
-        self.last_miss_reading = missed_frames
-        self.total_missed = missed_frames
-
-    def log_update(self, policy_loss, entropy):
-        self.current_policy_loss = policy_loss
-        self.current_entropy = entropy
-        self.update_count += 1
-
-    def render(self):
-        c_reset, c_green, c_yellow, c_red = "\033[0m", "\033[92m", "\033[93m", "\033[91m"
-        progress = self.update_count % SAVE_INTERVAL
-
-        avg_conf = sum(self.confidences) / len(self.confidences) * 100 if self.confidences else 0
-        conf_color = c_green if avg_conf > 85 else c_yellow if avg_conf > 60 else c_red
-
-        avg_lat = sum(self.latencies) / len(self.latencies) if self.latencies else 0
-        lat_color = c_green if avg_lat < 5.0 else c_yellow if avg_lat < 6.0 else c_red
-
-        recent_drops = sum(self.drop_window)
-        window_size = len(self.drop_window)
-
-        if window_size > 0:
-            miss_pct = (recent_drops / window_size) * 100
-        else:
-            miss_pct = 0.0
-
-        miss_color = c_green if miss_pct <= 0.5 else (c_yellow if miss_pct <= 1.0 else c_red)
-
-        ent_color = c_green if 0.05 < self.current_entropy < 0.5 else c_yellow
-        ent_label = "CHAOTIC" if self.current_entropy > 0.5 else "HEALTHY" if self.current_entropy > 0.05 else "DETERMINISTIC"
-
-        loss_val = abs(self.current_policy_loss)
-        loss_color = c_green if loss_val < 0.02 else c_yellow if loss_val < 0.10 else c_red
-        loss_label = "STABLE" if loss_val < 0.02 else "LEARNING" if loss_val < 0.10 else "UNSTABLE"
-
-        print(f"""\033[H\033[J""")
-        print(f"""
-============================================================
-   AI Doggie | {RUN_NAME}
-============================================================
- [SOURCE]
-  > Loaded From:       {self.loaded_from}
-  > Starting Step:     {self.start_step_static:,}
-
- [LIVE PERFORMANCE]
-  > Inference Latency: {lat_color}{avg_lat:.2f} ms{c_reset}
-  > AI Confidence:     {conf_color}{avg_conf:.1f}%{c_reset}
-  > Rolling Drops:     {recent_drops}/{window_size} ({miss_color}{miss_pct:.2f}%{c_reset})
-  > Session Deaths:    {self.session_deaths}
-
- [RL BRAIN METRICS]
-  > Curiosity (Ent):   {self.current_entropy:.3f} ({ent_color}{ent_label}{c_reset})
-  > Policy Loss:       {self.current_policy_loss:.3f} ({loss_color}{loss_label}{c_reset})
-
- [TRAINING PROGRESS]
-  > Global Steps:      {self.total_frames:,}
-  > Weight Updates:    {self.update_count}
-  > Next Checkpoint:   {progress}/{SAVE_INTERVAL}
-
- [STATUS]
-  > {self.status_message}
-============================================================
-""")
-
-
-shutdown_flag = False
-
-
-def signal_handler(signum, frame):
-    global shutdown_flag
-    shutdown_flag = True
-
-
-signal.signal(signal.SIGINT, signal_handler)
-
-
-def save_checkpoint(model, agent, step_count, filename):
-    torch.save({
-        'model_state': model.state_dict(),
-        'optimizer_state': agent.optimizer.state_dict(),
-        'global_step': step_count
-    }, filename)
-
-
-class RolloutBuffer:
-    def __init__(self, steps, height, width, channels):
-        self.prev_actions = torch.zeros(steps, dtype=torch.long)
-        self.steps = steps
-        self.states = torch.zeros((steps, height, width, channels), dtype=torch.uint8)
-        self.actions = torch.zeros(steps, dtype=torch.long)
-        self.log_probs = torch.zeros(steps, dtype=torch.float)
-        self.rewards = torch.zeros(steps, dtype=torch.float)
-        self.dones = torch.zeros(steps, dtype=torch.bool)
-        self.values = torch.zeros(steps, dtype=torch.float)
-        self.ptr = 0
-        self.is_human = torch.zeros(steps, dtype=torch.bool)
-
-    def add(self, state, action, prev_action, log_prob, reward, done, value, human_flag):
-        if self.ptr < self.steps:
-            self.prev_actions[self.ptr] = prev_action
-            self.states[self.ptr] = torch.from_numpy(state)
-            self.actions[self.ptr] = action
-            self.log_probs[self.ptr] = log_prob
-            self.rewards[self.ptr] = reward
-            self.dones[self.ptr] = done
-            self.values[self.ptr] = value
-            self.is_human[self.ptr] = human_flag
-            self.ptr += 1
-
-    def get(self):
-        self.ptr = 0
-        return self.states, self.actions, self.prev_actions, self.log_probs, self.rewards, self.dones, self.values, self.is_human
+                for chunk_idx in range(num_chunks):
+                    start = chunk_idx * self.seq_len
+                    chunk_f = frames[start : start + self.seq_len]
+                    chunk_a = actions[start : start + self.seq_len + 1]
+                    yield np.transpose(chunk_f, (0, 3, 1, 2)), chunk_a, (chunk_idx == 0)
+        except Exception as e:
+            print(f"[Skip] Error loading {path}: {e}")
 
 
 def train():
-    global shutdown_flag
-    print("⚠️  FOCUS GEOMETRY DASH NOW...")
-    time.sleep(5)
+    file_paths = glob.glob(os.path.join(DATASET_DIR, "*.npz"))
+    if not file_paths:
+        print(f"❌ No .npz files found in {DATASET_DIR}. Run record.py first!")
+        sys.exit(1)
 
-    env = GeometryDashEnv()
-    device = torch.device("mps")
+    print(f"📂 Found {len(file_paths)} golden runs. Initializing Dataset...")
 
-    model = GDPolicy().to(device)
-    # (model, lr, gamma, eps_clip, batch_size, ent_coef, epoch)
-    explore_hyperparameters = [model, 1e-4, 0.996, 0.2, 1024, 0.01, 8]
-    agent = PPOAgent(*explore_hyperparameters)
+    dataset = GDSequenceIterableDataset(file_paths, seq_len=SEQ_LEN, batch_size=BATCH_SIZE)
+    dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
 
-    start_step = 0
-    loaded_name = None
-    if LOAD_CHECKPOINT:
-        path = os.path.join(CHECKPOINT_DIR, LOAD_CHECKPOINT)
-        if os.path.exists(path):
-            checkpoint = torch.load(path, map_location=device)
-            model.load_state_dict(checkpoint['model_state'])
-            agent.optimizer.load_state_dict(checkpoint['optimizer_state'])
-            start_step = checkpoint['global_step']
-            loaded_name = LOAD_CHECKPOINT
+    print("🧠 Initializing Impala ResNet + GRU Model...")
+    model = GDBehavioralCloningModel().to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 
-    print("[System] Allocating Memory Buffer...")
-    buffer = RolloutBuffer(ROLLOUT_STEPS * ACCUMULATION_STEPS, 332, 588, 12)
+    class_weights = torch.tensor([1.0, 5.0], dtype=torch.float32).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    env.engine.paused = False
+    print(f"🚀 Training Started on {DEVICE.type.upper()} Backend")
 
-    print("WARMING UP VISION & MODEL (120 Frames + Compilation)...")
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        epoch_loss = 0.0
+        batch_count = 0
 
-    dummy_state = torch.zeros((1, 12, 332, 588)).to(device)
-    dummy_prev_actions = torch.tensor([0], device=device)
+        hidden_state = None
 
-    state = env.reset()
+        for batch_idx, (b_frames, b_actions, b_is_first) in enumerate(dataloader):
 
-    for _ in range(120):
-        _ = env.step(0)
-        with torch.no_grad():
-            _ = model.get_action(dummy_state, dummy_prev_actions)
+            if hidden_state is not None:
+                b_is_first_tensor = torch.from_numpy(b_is_first).to(DEVICE)
+                keep_mask = (~b_is_first_tensor).to(dtype=torch.float32)
 
-    env.flush_vision()
-    offset_misses = env.engine.drop_count + env.cumulative_lag_skips
+                keep_mask = keep_mask.unsqueeze(0).unsqueeze(-1)
+                hidden_state = hidden_state * keep_mask
 
-    print("Startup complete. Metrics forcibly reset to 0.")
+            b_frames = b_frames.to(DEVICE, dtype=torch.float32).div(255.0)
+            prev_actions = b_actions[:, :-1].to(DEVICE, dtype=torch.long)
+            target_actions = b_actions[:, 1:].to(DEVICE, dtype=torch.long)
 
-    dash = ControlRoom(loaded_name, start_step)
-    current_prev_action = torch.tensor([0], device=device)
-    while dash.total_frames < MAX_TIMESTEPS:
-        if shutdown_flag: break
+            drop_mask = torch.rand(prev_actions.shape, device=DEVICE) < ACTION_DROPOUT_RATE
+            prev_actions = prev_actions.masked_fill(drop_mask, 2)
 
-        for accum_step in range(ACCUMULATION_STEPS):
-            if shutdown_flag: break
+            optimizer.zero_grad(set_to_none=True)
 
-            gc.disable()
+            logits, hidden_state = model(b_frames, prev_actions, hidden_state)
 
-            dash.status_message = f"Collecting Experience ({accum_step + 1}/{ACCUMULATION_STEPS})..."
+            if hidden_state is not None:
+                hidden_state = hidden_state.detach()
 
-            i = 0
-            while i < ROLLOUT_STEPS:
-                if shutdown_flag: break
-                if i % 60 == 0: dash.render()
+            valid_logits = logits.reshape(-1, 2)
+            valid_actions = target_actions.reshape(-1)
 
-                t_start = time.perf_counter()
+            loss = criterion(valid_logits, valid_actions)
 
-                state_tensor = torch.from_numpy(state).to(device)
-                state_tensor = state_tensor.float().div(255.0)
-                state_tensor = state_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
+            loss.backward()
 
-                with torch.no_grad():
-                    logits, value = model(state_tensor, current_prev_action)
-                    dist = Categorical(logits=logits)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-                    if model_paused:
-                        ai_action = torch.tensor([0], device=device)
-                    else:
-                        ai_action = dist.sample()
+            epoch_loss += loss.item()
+            batch_count += 1
 
-                    if override_action is not None:
-                        action = torch.tensor([override_action], device=device)
-                    else:
-                        action = ai_action
+            if batch_idx % 10 == 0:
+                sys.stdout.write(f"\rEpoch [{epoch}/{EPOCHS}] | Batch {batch_idx} | Loss: {loss.item():.4f}")
+                sys.stdout.flush()
 
-                    log_prob = dist.log_prob(action)
-                    confidence = torch.exp(log_prob).item()
+        avg_loss = epoch_loss / max(1, batch_count)
+        print(f"\n✅ Epoch {epoch} Completed | Average Loss: {avg_loss:.4f}")
 
-                inf_ms = (time.perf_counter() - t_start) * 1000
+        if epoch % 5 == 0:
+            ckpt_path = os.path.join(CHECKPOINT_DIR, f"gd_model_epoch_{epoch}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'loss': avg_loss
+            }, ckpt_path)
+            print(f"💾 Checkpoint saved: {ckpt_path}")
 
-                cpu_action = action.item()
-                cpu_log_prob = log_prob.cpu()
-                cpu_value = value.item()
-
-                next_state, reward, done, info = env.step(cpu_action)
-
-                if "warning" in info:
-                    state = next_state
-                    continue
-
-                current_total_misses = env.engine.drop_count + env.cumulative_lag_skips
-                display_misses = current_total_misses - offset_misses
-
-                if not done:
-                    dash.log_step(inf_ms, confidence, display_misses)
-
-                is_human_step = (override_action is not None) or model_paused
-                buffer.add(state, cpu_action, current_prev_action.item(), cpu_log_prob, reward, done, cpu_value, is_human_step)
-                state = next_state
-                current_prev_action = action
-                dash.total_frames += 1
-                i += 1
-
-                if done:
-                    dash.session_deaths += 1
-
-                    misses_at_death = env.engine.drop_count + env.cumulative_lag_skips
-
-                    state = env.reset()
-
-                    current_prev_action = torch.tensor([0], device=device)
-
-                    misses_after_reset = env.engine.drop_count + env.cumulative_lag_skips
-
-                    offset_misses += (misses_after_reset - misses_at_death)
-
-            gc.enable()
-
-        if not shutdown_flag:
-            misses_before_pause = env.engine.drop_count + env.cumulative_lag_skips
-            dash.status_message = "⏸️ Updating Weights..."
-            dash.render()
-            env.engine.paused = True
-            safe_pause()
-
-            state_tensor = torch.from_numpy(state).to(device).float().div(255.0)
-            state_tensor = state_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
-            with torch.no_grad():
-                _, _, last_value = model.get_action(state_tensor, current_prev_action)
-
-            b_states, b_actions, b_prev_actions, b_log_probs, b_rewards, b_dones, b_values, b_is_human = buffer.get()
-            loss, entropy = agent.update(b_states, b_actions, b_prev_actions, b_log_probs, b_rewards, b_dones, b_values, last_value, b_is_human)
-
-            dash.log_update(loss, entropy)
-
-            if dash.update_count % SAVE_INTERVAL == 0:
-                dash.status_message = "💾 SAVING CHECKPOINT..."
-                save_checkpoint(model, agent, dash.total_frames,
-                                os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_{dash.total_frames // 1000}k.pt"))
-
-            dash.status_message = "▶️ Resuming Gameplay..."
-            dash.render()
-
-            env.flush_vision()
-
-            state, _, _ = safe_resume(env)
-
-            misses_after_resume = env.engine.drop_count + env.cumulative_lag_skips
-
-            offset_misses += (misses_after_resume - misses_before_pause)
-
-            env.flush_vision()
-
-    save_checkpoint(model, agent, dash.total_frames, os.path.join(CHECKPOINT_DIR, f"{RUN_NAME}_exit.pt"))
-    sys.exit()
+    final_path = os.path.join(CHECKPOINT_DIR, "gd_model_final.pt")
+    torch.save(model.state_dict(), final_path)
+    print(f"🎉 Training Complete! Final weights saved to {final_path}")
 
 
 if __name__ == "__main__":

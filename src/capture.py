@@ -3,7 +3,7 @@ import numpy as np
 import Quartz
 import CoreMedia
 import queue
-from Foundation import NSObject, NSRunLoop, NSDate
+from Foundation import NSObject
 from ScreenCaptureKit import SCStream, SCStreamConfiguration, SCShareableContent, SCContentFilter
 from libdispatch import dispatch_queue_create
 
@@ -18,8 +18,8 @@ class GDAIVision(NSObject):
         self.ready_queue = queue.Queue()
 
         self.drop_count = 0
-
         self.paused = True
+        self.stream_ref = None
 
         for _ in range(self.BUFFER_SIZE):
             buf = np.zeros((332, 588, 4), dtype=np.uint8)
@@ -27,40 +27,48 @@ class GDAIVision(NSObject):
 
         return self
 
-    @objc.typedSelector(b"v@:@@Q")
+    @objc.typedSelector(b"v@:@@q")
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
         if self.paused:
             return
 
-        pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
-        if not pixel_buffer:
-            return
-
-        try:
-            frame_buffer = self.idle_queue.get_nowait()
-        except queue.Empty:
-            try:
-                frame_buffer, _ = self.ready_queue.get_nowait()
-                self.drop_count += 1
-            except queue.Empty:
+        with objc.autorelease_pool():
+            pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
+            if not pixel_buffer:
                 return
 
-        Quartz.CVPixelBufferLockBaseAddress(pixel_buffer, 1)
-        try:
-            bpr = Quartz.CVPixelBufferGetBytesPerRow(pixel_buffer)
-            base_addr = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
+            try:
+                frame_buffer = self.idle_queue.get_nowait()
+            except queue.Empty:
+                try:
+                    frame_buffer, _ = self.ready_queue.get_nowait()
+                    self.drop_count += 1
+                except queue.Empty:
+                    return
 
-            raw_buffer = base_addr.as_buffer(bpr * 332)
-            raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(332, bpr)
+            Quartz.CVPixelBufferLockBaseAddress(pixel_buffer, 1)
+            try:
+                bpr = Quartz.CVPixelBufferGetBytesPerRow(pixel_buffer)
+                base_addr = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
 
-            np.copyto(frame_buffer, raw_array[:, :2352].reshape(332, 588, 4))
+                raw_buffer = base_addr.as_buffer(bpr * 332)
+                raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(332, bpr)
 
-        finally:
-            Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
+                frame_buffer_view = frame_buffer.view(np.uint8).reshape(332, 2352)
+                np.copyto(frame_buffer_view, raw_array[:, :2352])
 
-        pts = CoreMedia.CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        timestamp = CoreMedia.CMTimeGetSeconds(pts)
-        self.ready_queue.put((frame_buffer, timestamp))
+            finally:
+                Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
+
+            pts = CoreMedia.CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            timestamp = CoreMedia.CMTimeGetSeconds(pts)
+            self.ready_queue.put((frame_buffer, timestamp))
+
+    def stop(self):
+        if self.stream_ref:
+            self.stream_ref.stopCaptureWithCompletionHandler_(lambda err: None)
+            self.stream_ref = None
+            print("[Capture] Stream stopped gracefully.")
 
 
 def start_capture():
@@ -70,14 +78,20 @@ def start_capture():
         if error:
             print(f"Shareable content error: {error}")
             return
-        target = next((w for w in content.windows() if "geometry dash" in (w.title() or "").lower()), None)
+
+        target = next((w for w in content.windows()
+                       if "geometry dash" in (w.title() or "").lower()
+                       and "geometry dash" in (w.owningApplication().applicationName() or "").lower()), None)
+
         if not target:
             print("Geometry Dash window not found!")
             return
 
         print(f"Attached to: {target.title()} ID: {target.windowID()}")
+
         filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
         config = SCStreamConfiguration.alloc().init()
+
         config.setSourceRect_(Quartz.CGRectMake(0, 28, 1176, 664))
         config.setWidth_(588)
         config.setHeight_(332)

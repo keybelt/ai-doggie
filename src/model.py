@@ -1,182 +1,93 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
-import numpy as np
-import sys
-
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
-def init_layer(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
-class GDPolicy(nn.Module):
-    def __init__(self):
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.conv1 = init_layer(nn.Conv2d(12, 32, kernel_size=8, stride=4, padding=0))
-        self.conv2 = init_layer(nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0))
-        self.conv3 = init_layer(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=0))
-        self.conv4 = init_layer(nn.Conv2d(64, 16, kernel_size=1, stride=1, padding=0))
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
 
-        with torch.no_grad():
-            dummy = torch.zeros(1, 12, 332, 588)
-            x = self.forward_features(dummy)
-            self.flat_size = x.numel() + 1
-
-        self.shared_fc = init_layer(nn.Linear(self.flat_size, 512))
-
-        self.actor_net = nn.Sequential(
-            init_layer(nn.Linear(512, 256)),
-            nn.ReLU(),
-            init_layer(nn.Linear(256, 2), std=0.01)
-        )
-
-        self.critic_net = nn.Sequential(
-            init_layer(nn.Linear(512, 256)),
-            nn.ReLU(),
-            init_layer(nn.Linear(256, 1), std=1.0)
-        )
-
-    def forward_features(self, x):
-        x = F.relu(self.conv1(x), inplace=True)
-        x = F.relu(self.conv2(x), inplace=True)
-        x = F.relu(self.conv3(x), inplace=True)
-        x = F.relu(self.conv4(x), inplace=True)
-        return x
-
-    def forward(self, x, prev_action):
-        x = self.forward_features(x)
-        x = x.flatten(1)
-
-        prev_action = prev_action.view(-1, 1).float()
-        x = torch.cat((x, prev_action), dim=1)
-
-        x = F.relu(self.shared_fc(x), inplace=True)
-        return self.actor_net(x), self.critic_net(x)
-
-    def get_action(self, x, prev_action):
-        logits, value = self(x, prev_action)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        return action, dist.log_prob(action), value
+    def forward(self, x):
+        res = x
+        x = F.relu(x)
+        x = self.conv1(x)
+        x = F.relu(x, inplace=True)
+        x = self.conv2(x)
+        return x + res
 
 
-class PPOAgent:
-    def __init__(self, model, lr, gamma, eps_clip, batch_size, ent_coef, epoch):
-        self.model = model
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.mse_loss = nn.MSELoss()
-        self.batch_size = batch_size
-        self.epochs = epoch
-        self.ent_coef = ent_coef
+class ImpalaBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.res1 = ResidualBlock(out_channels)
+        self.res2 = ResidualBlock(out_channels)
 
-    def update(self, states, actions, prev_actions, log_probs, rewards, dones, values, last_value, batch_is_human):
-        gae_lambda = 0.95
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.pool(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        return F.relu(x)
 
-        rewards = rewards.to(device)
-        dones = dones.to(device)
-        values = values.to(device)
 
-        advantages = []
-        last_advantage = 0
-        full_prev_actions = prev_actions.to(device)
+class GDBehavioralCloningModel(nn.Module):
+    def __init__(self, num_actions=2, action_vocab_size=3, hidden_size=256, action_emb_dim=16):
+        super().__init__()
 
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_non_terminal = 1.0 - dones[t].float()
-                next_value = last_value
-            else:
-                next_non_terminal = 1.0 - dones[t].float()
-                next_value = values[t + 1]
+        self.hidden_size = hidden_size
 
-            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
-            last_advantage = delta + self.gamma * gae_lambda * next_non_terminal * last_advantage
-            advantages.insert(0, last_advantage)
+        self.block1 = ImpalaBlock(3, 16)
+        self.block2 = ImpalaBlock(16, 32)
+        self.block3 = ImpalaBlock(32, 64)
+        self.block4 = ImpalaBlock(64, 64)
+        self.block5 = ImpalaBlock(64, 64)
 
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
-        returns = advantages + values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
+        with torch.inference_mode():
+            dummy = torch.zeros(1, 3, 332, 588)
+            x = self.block1(dummy)
+            x = self.block2(x)
+            x = self.block3(x)
+            x = self.block4(x)
+            x = self.block5(x)
+            self.flat_size = x.numel()
 
-        full_actions = actions.to(device)
-        full_log_probs = log_probs.to(device)
+        self.fc = nn.Linear(self.flat_size, hidden_size)
 
-        dataset_size = len(states)
-        indices = np.arange(dataset_size)
+        self.action_emb = nn.Embedding(action_vocab_size, action_emb_dim)
 
-        total_policy_loss = 0
-        total_entropy = 0
-        update_count = 0
+        self.gru = nn.GRU(hidden_size + action_emb_dim, hidden_size, num_layers=1, batch_first=True)
 
-        n_batches = (dataset_size + self.batch_size - 1) // self.batch_size
-        total_steps = self.epochs * n_batches
-        step_curr = 0
-        print("")
+        self.policy_head = nn.Linear(hidden_size, num_actions)
 
-        for epoch_i in range(self.epochs):
-            np.random.shuffle(indices)
+    def forward(self, x, prev_actions, hidden_state=None):
+        batch_size, seq_len, c, h, w = x.size()
 
-            for start in range(0, dataset_size, self.batch_size):
-                end = start + self.batch_size
-                batch_idx = indices[start:end]
+        x = x.reshape(batch_size * seq_len, c, h, w)
 
-                batch_states = states[batch_idx].to(device).float().div(255.0).permute(0, 3, 1, 2).contiguous()
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        x = self.block5(x)
 
-                batch_actions = full_actions[batch_idx]
-                batch_prev_actions = full_prev_actions[batch_idx]
-                batch_old_log_probs = full_log_probs[batch_idx]
-                batch_returns = returns[batch_idx]
-                batch_advantages = advantages[batch_idx]
+        x = x.reshape(batch_size * seq_len, -1)
+        x = F.relu(self.fc(x), inplace=False)
 
-                logits, new_values = self.model(batch_states, batch_prev_actions)
-                dist = Categorical(logits=logits)
+        cnn_features = x.reshape(batch_size, seq_len, self.hidden_size)
 
-                new_log_probs = dist.log_prob(batch_actions)
-                entropy = dist.entropy().mean()
+        action_features = self.action_emb(prev_actions)
 
-                log_diff = torch.clamp(new_log_probs - batch_old_log_probs, min=-20.0, max=20.0)
-                ratio = torch.exp(log_diff)
+        gru_input = torch.cat([cnn_features, action_features], dim=-1)
 
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
-                ppo_loss = -torch.min(surr1, surr2)
-                bc_loss = F.cross_entropy(logits, batch_actions, reduction='none')
-                mask = batch_is_human[batch_idx].to(device).float()
-                bc_term = (bc_loss * mask).sum() / (mask.sum() + 1e-7)
-                ppo_term = (ppo_loss * (1 - mask)).sum() / ((1 - mask).sum() + 1e-7)
+        if hidden_state is None:
+            hidden_state = torch.zeros(1, batch_size, self.hidden_size, device=x.device)
 
-                total_loss = ppo_term + (bc_term * 0.1)
+        out, next_hidden = self.gru(gru_input, hidden_state)
 
-                actor_loss = total_loss
+        logits = self.policy_head(out)
 
-                critic_loss = self.mse_loss(new_values.squeeze(), batch_returns)
-
-                loss = total_loss + 0.1 * critic_loss - self.ent_coef * entropy
-
-                self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                self.optimizer.step()
-                self.optimizer.zero_grad(set_to_none=True)
-
-                total_policy_loss += actor_loss.item()
-                total_entropy += entropy.item()
-                update_count += 1
-
-                step_curr += 1
-                percent = int((step_curr / total_steps) * 100)
-                bar_len = 25
-                filled = int(bar_len * step_curr // total_steps)
-                bar = '█' * filled + '-' * (bar_len - filled)
-
-                sys.stdout.write(f"\r    [Backprop] |{bar}| {percent}% (Epoch {epoch_i + 1}/{self.epochs})")
-                sys.stdout.flush()
-
-        del full_actions, full_log_probs, returns, batch_states
-
-        return total_policy_loss / update_count, total_entropy / update_count
+        return logits, next_hidden
