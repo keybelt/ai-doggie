@@ -1,129 +1,196 @@
-import time
-import os
+"""Contains logic for parsing a .gdr macro, establishing a shared memory bridge between the script and the mod, and records the captured frame and macro gameplay.
+
+Example:
+    Start recording the bloodbath macro:
+    $ python record.py bloodbath.gdr
+"""
+
+import json
 import sys
+import threading
+import time
+from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
+from struct import pack, unpack
+
+import msgpack
 import numpy as np
-from pynput import keyboard
-from pynput.keyboard import KeyCode, Key
-from env import GeometryDashEnv
+from jaxtyping import UInt8
+from pynput.keyboard import Key, Listener
 
-DATASET_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
-os.makedirs(DATASET_DIR, exist_ok=True)
+from game_env import GameEnv
+from type_defs import Frame, ParsedMacro
 
-current_action = 0
-trigger_save = False
-trigger_reset = False
-shutdown_flag = False
+with Path.open("../config.json") as f:
+    _CONFIG = json.load(f)
 
-
-def on_press(key):
-    global current_action, trigger_save, trigger_reset, shutdown_flag
-    if key == KeyCode.from_char('/'):
-        current_action = 1
-    elif key == Key.enter:
-        trigger_save = True
-    elif key == Key.backspace:
-        trigger_reset = True
-    elif key == Key.esc:
-        shutdown_flag = True
+_curr_action_bin = 0
+_is_shutdown = False
+_is_recording = False
 
 
-def on_release(key):
-    global current_action
-    if key == KeyCode.from_char('/'):
-        current_action = 0
+def _on_press(key):
+    """Activate shutdown state upon keypress."""
+    global _is_shutdown, _is_recording  # noqa: PLW0603
+
+    exit_key_name = _CONFIG["keys"]["exitKeyName"]
+    record_key_name = _CONFIG["keys"]["recordKeyName"]
+
+    if key == Key[record_key_name]:
+        time.sleep(0.5)
+        _is_recording = True
+        print("Recording started.")
+    elif key == Key[exit_key_name]:
+        _is_shutdown = True
 
 
-listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-listener.start()
+def _load_macro(filepath: str) -> ParsedMacro:
+    """Unpack .gdr macro files with a modified version of maxnut/gdr-converter's algorithm.
 
+    Returns:
+        actions in format (frame, action).
+    """
+    macro_events: ParsedMacro = []
 
-def save_buffer(frames, actions, count):
-    if count == 0:
-        print("\n[Save] Buffer is empty. Nothing to save.")
-        return
+    # rb = read, bytes.
+    with Path.open(filepath, "rb") as f:
+        macro_data = f.read()
 
-    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(DATASET_DIR, f"run_{timestamp_str}.npz")
+        try:
+            # Unpack with utf8 decoding.
+            parsed_macro = json.loads(macro_data.decode("utf-8-sig"))
 
-    print(f"\n[Save] Formatting {count} frames... This might take a few seconds.")
+            print("Macro parsed with JSON.")
+        except json.JSONDecodeError:
+            # Unpack from bytes.
+            parsed_macro = msgpack.unpackb(macro_data, raw=False)
 
-    np_frames = frames[:count]
-    np_actions = actions[:count]
+            print("Macro parsed with MessagePack.")
 
-    print(f"[Save] Compressing and writing to disk ({np_frames.nbytes / (1024 ** 3):.2f} GB)...")
+    for macro_input in parsed_macro.get("inputs"):
+        frame_idx = macro_input["frame"]
+        mouse_btn: int = macro_input["btn"]
+        is_player2 = macro_input["2p"]
+        is_keydown = macro_input["down"]
 
-    np.savez_compressed(filename, frames=np_frames, actions=np_actions)
-    print(f"[Save] Successfully saved Golden Run: {filename}\n")
-
-
-def record():
-    global trigger_save, trigger_reset, shutdown_flag, current_action
-
-    print("⚠️  FOCUS GEOMETRY DASH NOW...")
-    time.sleep(3)
-
-    env = GeometryDashEnv()
-
-    BUFFER_CAPACITY = 15000
-    frames_buffer = np.empty((BUFFER_CAPACITY, 332, 588, 3), dtype=np.uint8)
-    actions_buffer = np.empty(BUFFER_CAPACITY, dtype=np.int8)
-    frame_count = 0
-
-    session_saves = 0
-    start_time = time.time()
-
-    print("\n--- RECORDING STARTED ---")
-
-    while not shutdown_flag:
-        frame, frame_timestamp, _ = env.step(current_action)
-
-        if frame_timestamp == 0.0:
-            time.sleep(0.001)
+        if mouse_btn != 1 or is_player2:
             continue
 
-        frames_buffer[frame_count] = frame
-        actions_buffer[frame_count] = current_action
-        frame_count += 1
+        macro_events.append((frame_idx, 1 if is_keydown else 0))
 
-        if trigger_reset:
-            frame_count = 0
-            trigger_reset = False
-            env.reset()
-            print("\n[Reset] 🗑️ Buffer cleared! Ready for next attempt.")
-            time.sleep(0.5)
+    macro_events.sort(key=lambda x: x[0])
 
-        if trigger_save or frame_count >= BUFFER_CAPACITY:
-            save_buffer(frames_buffer, actions_buffer, frame_count)
-            frame_count = 0
-            session_saves += 1
-            trigger_save = False
-            env.reset()
-            print("\n[Save] ✅ Ready for next run.")
-            time.sleep(0.5)
+    print(f"Macro parsed with {len(macro_events)} events.")
 
-        if frame_count % 12 == 0:
-            elapsed_sec = time.time() - start_time
+    return macro_events
 
-            ram_gb = frames_buffer.nbytes / (1024 ** 3)
 
-            c_action = "🟩 JUMP" if current_action == 1 else "⬜ IDLE"
+def _shm_bridge(macro_events: ParsedMacro):
+    """Initialize a shared memory block between this script and the c++ mod."""
+    global _curr_action_bin  # noqa: PLW0603
 
-            sys.stdout.write(
-                f"\r[Recording] Frames: {frame_count:05d}/{BUFFER_CAPACITY} | "
-                f"Time: {elapsed_sec:.1f}s | "
-                f"RAM Allocated: {ram_gb:.2f} GB | "
-                f"Input: {c_action} | Saves: {session_saves} "
-            )
-            sys.stdout.flush()
+    shm_name = _CONFIG["shmName"]
 
-    if frame_count > 0:
-        ans = input("\n\nExit triggered. Save the current buffer before quitting? (y/n): ")
-        if ans.lower() == 'y':
-            save_buffer(frames_buffer, actions_buffer, frame_count)
+    shm: SharedMemory = SharedMemory(
+        name=shm_name,
+        create=True,
+        size=16,
+    )
 
-    print("Recording Session Ended.")
-    sys.exit(0)
+    event_idx = 0
+    _curr_action_bin = 0
+
+    while not _is_shutdown:
+        # Extract as integer (i). And use [0] becuase .unpack returns a tuple
+        action_ready_bin = unpack("i", shm.buf[8:12])[0]
+
+        if action_ready_bin == 1:
+            frame_idx = unpack("i", shm.buf[0:4])
+
+            # Only passes if there are macro events left over, and if our current frame matches the macro event's frame.
+            while (
+                event_idx < len(macro_events)
+                and frame_idx == macro_events[event_idx][0]
+            ):
+                _curr_action_bin = macro_events[event_idx][1]
+                event_idx += 1
+
+            # 4:8 - Current action. 12:16 - Python acknowledgement
+            shm.buf[4:8] = pack("i", _curr_action_bin)
+            shm.buf[12:16] = pack("i", 1)
+            shm.buf[8:12] = pack("i", 0)
+        else:
+            time.sleep(0)
+
+    shm.close()
+    shm.unlink()
+
+
+def _record(macro_name: str):
+    """Initialize game environment, shared memory, run frame + action pair recording loop."""
+    buf_max_frames = _CONFIG["bufMaxFrames"]
+    frame_height_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
+    frame_width_px = _CONFIG["capture"]["frameDims"]["pipelineWidthPx"]
+    pipeline_fps = _CONFIG["capture"]["fps"]
+
+    dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
+    dataset_dir: str = Path.resolve(
+        Path / (Path.parent(__file__), "..", dataset_dir_name),
+    )
+
+    macro_events: ParsedMacro = _load_macro(macro_name)
+
+    shm_thread = threading.Thread(target=_shm_bridge, args=macro_events, daemon=True)
+    shm_thread.start()
+
+    game_env: GameEnv = GameEnv()
+
+    listener = Listener(on_press=_on_press)
+    listener.start()
+
+    frames_buf: UInt8[np.ndarray, "frame_buf_max frame_H frame_W frame_C"] = np.empty(
+        buf_max_frames,
+        frame_height_px,
+        frame_width_px,
+        3,
+        dtype=np.uint8,
+    )
+    actions_bin_buf = np.empty(buf_max_frames, dtype=np.uint8)
+
+    frame_idx = 0
+    game_env.clear_frame_queue()
+
+    while not _is_shutdown:
+        frame: Frame
+        frame, is_stale = game_env.get_frame()
+
+        if _is_recording:
+            game_env.clear_frame_queue()
+
+            if is_stale:
+                continue
+
+            frames_buf[frame_idx] = frame
+            actions_bin_buf[frame_idx] = _curr_action_bin
+            frame_idx += 1
+
+            if frame_idx % (120 / pipeline_fps) == 0:
+                print(f"\rRecord frames: {frame_idx}", end="", flush=True)
+
+    save_path = Path / (
+        dataset_dir,
+        f"{macro_name}-{time.strftime('%m%d%H%M')}",
+    )
+    np.savez_compressed(
+        save_path,
+        frames=frames_buf[:frame_idx],
+        actions_bin=actions_bin_buf[:frame_idx],
+    )
+    print(f"Saved recording to {save_path}")
+
+    game_env.capture_engine.stop_capture_stream()
 
 
 if __name__ == "__main__":
-    record()
+    macro_name = sys.argv[1]
+    _record(macro_name)

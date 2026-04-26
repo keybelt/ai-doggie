@@ -1,0 +1,6 @@
+checkpoints
+data
+.venv
+ruff.toml
+src_old
+.ds_store

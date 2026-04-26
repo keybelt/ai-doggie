@@ -1,111 +1,179 @@
-import objc
-import numpy as np
-import Quartz
-import CoreMedia
+"""Contains the entire screen capture mechanism and is the single source of truth for the frame drop metric.
+
+Examples:
+    >>> capture_engine = start_capture()
+
+    Get a frame from the queue:
+    >>> capture_engine.queue_full.get()
+
+    Get the frame drop count:
+    >>> frame_drops = capture_engine.frame_drops
+"""
+
+import json
 import queue
+from pathlib import Path
+from typing import Self, override
+
+import CoreMedia
+import numpy as np
+import objc
+import Quartz
+import ScreenCaptureKit as Sck
 from Foundation import NSObject
-from ScreenCaptureKit import SCStream, SCStreamConfiguration, SCShareableContent, SCContentFilter
 from libdispatch import dispatch_queue_create
 
+from type_defs import Frame, FrameQueue
 
-class GDAIVision(NSObject):
-    def init(self):
-        self = objc.super(GDAIVision, self).init()
-        if self is None: return None
+with Path.open("../config.json") as f:
+    _CONFIG_CAPTURE = json.load(f)["capture"]
 
-        self.BUFFER_SIZE = 3
-        self.idle_queue = queue.Queue()
-        self.ready_queue = queue.Queue()
+_PIPELINE_FRAME_WIDTH_PX = _CONFIG_CAPTURE["frameDims"]["pipelineWidthPx"]
+_PIPELINE_FRAME_HEIGHT_PX = _CONFIG_CAPTURE["frameDims"]["pipelineHeightPx"]
 
-        self.drop_count = 0
-        self.paused = True
-        self.stream_ref = None
+_QUEUE_DEPTH: int = _CONFIG_CAPTURE["queueDepth"]
 
-        for _ in range(self.BUFFER_SIZE):
-            buf = np.zeros((332, 588, 4), dtype=np.uint8)
-            self.idle_queue.put(buf)
+
+class _CaptureEngine(NSObject):
+    """Captures frames from ScreenCaptureKit with a push-based system (delegate). Uses a dual-queue mechanism and tracks frame drops."""
+
+    @override
+    def init(self) -> Self:
+        """Initialize and populate queues, frame drop counter, frame specifications, and capture stream reference."""
+        self = objc.super(_CaptureEngine, self).init()  # noqa: PLW0642
+
+        self.queue_empty: FrameQueue = queue.Queue()
+        self.queue_full: FrameQueue = queue.Queue()
+
+        self.frame_drops = 0
+
+        self.capture_stream = None
+
+        for _ in range(_QUEUE_DEPTH):
+            # 3rd axis represent BGRA channel. Use uint8 because color channels contain 256 distinct values.
+            frame = np.zeros(
+                (_PIPELINE_FRAME_HEIGHT_PX, _PIPELINE_FRAME_WIDTH_PX, 4),
+                dtype=np.uint8,
+            )
+            self.queue_empty.put(frame)
 
         return self
 
+    # Use type encoding (v@:@@q) to tell macOS what to expect.
     @objc.typedSelector(b"v@:@@q")
-    def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, kind):
-        if self.paused:
-            return
-
+    @override
+    def stream_didOutputSampleBuffer_ofType_(self, _stream, sample_buffer, _media_type):
+        """Use a delegate callback to get a frame immediately as macOS produces one."""
+        # Ensure the Obj-C objects get cleaned up properly.
         with objc.autorelease_pool():
-            pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
-            if not pixel_buffer:
-                return
+            # Extract pixels from frame metadata
+            frame_px: CoreMedia.CVImageBuffer = CoreMedia.CMSampleBufferGetImageBuffer(
+                sample_buffer,
+            )
 
             try:
-                frame_buffer = self.idle_queue.get_nowait()
+                frame_buf: Frame = self.queue_empty.get_nowait()
             except queue.Empty:
-                try:
-                    frame_buffer, _ = self.ready_queue.get_nowait()
-                    self.drop_count += 1
-                except queue.Empty:
-                    return
+                frame_buf: Frame = self.queue_full.get_nowait()
+                self.frame_drops += 1
 
-            Quartz.CVPixelBufferLockBaseAddress(pixel_buffer, 1)
+            # Safe access and override prevention.
+            read_only_flag = 1
+            Quartz.CVPixelBufferLockBaseAddress(frame_px, read_only_flag)
+
             try:
-                bpr = Quartz.CVPixelBufferGetBytesPerRow(pixel_buffer)
-                base_addr = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
+                # bytes per row contains the padded row length.
+                bytes_per_row = Quartz.CVPixelBufferGetBytesPerRow(frame_px)
 
-                raw_buffer = base_addr.as_buffer(bpr * 332)
-                raw_array = np.frombuffer(raw_buffer, dtype=np.uint8).reshape(332, bpr)
+                frame_ptr = Quartz.CVPixelBufferGetBaseAddress(frame_px)
 
-                frame_buffer_view = frame_buffer.view(np.uint8).reshape(332, 2352)
-                np.copyto(frame_buffer_view, raw_array[:, :2352])
+                # Convert to a 1d memory buffer of size bytes per row * height for the full frame.
+                frame_bytes: memoryview = frame_ptr.as_buffer(
+                    bytes_per_row * self.target_height,
+                )
 
+                # Convert to a 2d array to represent width and height.
+                frame_arr = np.frombuffer(
+                    frame_bytes,
+                    dtype=np.uint8,
+                ).reshape(self.target_height, bytes_per_row)
+
+                # Make sure the buffer fits the frame (color and width axes are combined).
+                frame_buf_view = frame_buf.view(
+                    np.uint8,
+                ).reshape(self.target_height, self.target_width * 4)
+
+                # Crop out the padding.
+                np.copyto(frame_buf_view, frame_arr[:, : self.target_width * 4])
             finally:
-                Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
+                Quartz.CVPixelBufferUnlockBaseAddress(frame_px, read_only_flag)
 
-            pts = CoreMedia.CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            timestamp = CoreMedia.CMTimeGetSeconds(pts)
-            self.ready_queue.put((frame_buffer, timestamp))
+            self.queue_full.put(frame_buf)
 
-    def stop(self):
-        if self.stream_ref:
-            self.stream_ref.stopCaptureWithCompletionHandler_(lambda err: None)
-            self.stream_ref = None
-            print("[Capture] Stream stopped gracefully.")
+    def stop_capture_stream(self):
+        if self.capture_stream:
+            self.capture_stream.stopCaptureWithCompletionHandler_()
+            self.capture_stream = None
 
 
-def start_capture():
-    vision = GDAIVision.alloc().init()
+def start_capture_engine() -> _CaptureEngine:
+    """Initialize and configure capture window. Set up capture stream and engine and begin capture process."""
+    # Initialize with .alloc().init() because it's an inheritance of NSObject.
+    capture_engine: _CaptureEngine = _CaptureEngine.alloc().init()
 
-    def handler(content, error):
-        if error:
-            print(f"Shareable content error: {error}")
-            return
+    def on_shareable_content(content: Sck.SCShareableContent) -> None:
+        """Asynchronous function that handles the window configurations."""
+        height_src_px = _CONFIG_CAPTURE["frameDims"]["srcHeightPx"]
+        width_src_px = _CONFIG_CAPTURE["frameDims"]["srcHeightPx"]
 
-        target = next((w for w in content.windows()
-                       if "geometry dash" in (w.title() or "").lower()
-                       and "geometry dash" in (w.owningApplication().applicationName() or "").lower()), None)
+        title_bar_crop_px = 28
+        pixel_format_bgra: int = 1111970369
+        capture_fps = _CONFIG_CAPTURE["fps"]
 
-        if not target:
-            print("Geometry Dash window not found!")
-            return
+        window_target = next(
+            w for w in content.windows() if "geometry dash" in (w.title() or "").lower()
+        )
 
-        print(f"Attached to: {target.title()} ID: {target.windowID()}")
+        print("Geometry Dash window found.")
 
-        filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
-        config = SCStreamConfiguration.alloc().init()
+        window_filter = Sck.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
+            window_target,
+        )
 
-        config.setSourceRect_(Quartz.CGRectMake(0, 28, 1176, 664))
-        config.setWidth_(588)
-        config.setHeight_(332)
-        config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, 120))
+        config: Sck.SCStreamConfiguration = Sck.SCStreamConfiguration.alloc().init()
+        config.setSourceRect_(
+            Quartz.CGRectMake(0, title_bar_crop_px, width_src_px, height_src_px),
+        )
+        config.setWidth_(_PIPELINE_FRAME_WIDTH_PX)
+        config.setHeight_(_PIPELINE_FRAME_HEIGHT_PX)
+        config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, capture_fps))
         config.setShowsCursor_(False)
-        config.setQueueDepth_(3)
-        config.setPixelFormat_(1111970369)
+        config.setQueueDepth_(_QUEUE_DEPTH)
+        config.setPixelFormat_(pixel_format_bgra)
 
-        stream = SCStream.alloc().initWithFilter_configuration_delegate_(filter_, config, vision)
-        vision.stream_ref = stream
+        capture_stream = Sck.SCStream.alloc().initWithFilter_configuration_delegate_(
+            window_filter,
+            config,
+            capture_engine,
+        )
+        capture_engine.capture_stream = capture_stream
 
-        q = dispatch_queue_create(b"com.gdai.capture", None)
-        stream.addStreamOutput_type_sampleHandlerQueue_error_(vision, 0, q, None)
-        stream.startCaptureWithCompletionHandler_(lambda err: None)
+        print("Capture stream live.")
 
-    SCShareableContent.getShareableContentWithCompletionHandler_(handler)
-    return vision
+        # Create a background thread so the capture stream doesn't interrupt the main pipeline.
+        dispatch_queue = dispatch_queue_create(b"com.ai-doggie.capture")
+
+        # Tell the capture stream to send frames to the capture engine using type video.
+        capture_stream.addStreamOutput_type_sampleHandlerQueue_error_(
+            capture_engine,
+            0,
+            dispatch_queue,
+            None,
+        )
+        capture_stream.startCaptureWithCompletionHandler_()
+
+    # Find available windows to begin capture.
+    Sck.SCShareableContent.getShareableContentWithCompletionHandler_(
+        on_shareable_content,
+    )
+    return capture_engine

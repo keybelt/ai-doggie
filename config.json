@@ -1,0 +1,58 @@
+{
+    "capture": {
+        "frameDims": {
+            "srcHeightPx": 664,
+            "srcWidthPx": 1176,
+            "pipelineHeightPx": 332,
+            "pipelineWidthPx": 558
+        },
+        "queueDepth": 3,
+        "fps": 120
+    },
+    "model": {
+        "weightShapes": {
+            "conv1": {
+                "inChannels": 3,
+                "outChannels": 16,
+                "kernelSize": 8,
+                "stride": 4
+            },
+            "conv2": {
+                "inChannels": 16,
+                "outChannels": 32,
+                "kernelSize": 4,
+                "stride": 2
+            },
+            "conv3": {
+                "inChannels": 32,
+                "outChannels": 32,
+                "kernelSize": 3,
+                "stride": 1
+            }
+        },
+        "hiddenDim": 64,
+        "vocabSize": 2,
+        "deviceName": "mps"
+    },
+    "fileNames": {
+        "weightDirName": "weights",
+        "weightName": "placeholder.pt",
+        "datasetDirName": "data",
+        "checkpointDirName": "checkpoints"
+    },
+    "training": {
+        "batchSize": 8,
+        "seqLen": 128,
+        "learningRate": 1e-5,
+        "beta1": 0.9,
+        "beta2": 0.99,
+        "weightDecay": 0,
+        "checkpointSaveInterval": 5
+    },
+    "keys": {
+        "exitKeyName": "esc",
+        "recordKeyName": "space"
+    },
+    "shmName": "GDMem",
+    "bufMaxFrames": 50000
+}

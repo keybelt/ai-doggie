@@ -1,116 +1,105 @@
-import os
-import sys
+"""Contains model inference procedure and allows shutdown via pressing the esc key.
+
+Example:
+    $ python infer.py
+"""
+
+import json
 import time
-import torch
+from pathlib import Path
+
 import numpy as np
-from pynput import keyboard
-from pynput.keyboard import Key
-from env import GeometryDashEnv
-from model import GDBehavioralCloningModel
+import torch
+from jaxtyping import Float32
+from pynput.keyboard import Key, Listener
 
-CHECKPOINT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "checkpoints"))
-MODEL_PATH = os.path.join(CHECKPOINT_DIR, "gd_model_epoch_15.pt")
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+from game_env import GameEnv
+from policy_model import PolicyModel
+from type_defs import Frame
 
-shutdown_flag = False
-reset_memory_flag = False
+with Path.open("../config.json") as f:
+    _CONFIG = json.load(f)
 
-
-def on_press(key):
-    global shutdown_flag, reset_memory_flag
-    if key == Key.esc:
-        shutdown_flag = True
-    elif key == Key.backspace:
-        reset_memory_flag = True
+_is_shutdown = False
 
 
-listener = keyboard.Listener(on_press=on_press)
-listener.start()
+def _shutdown_on_press(key):
+    global _is_shutdown  # noqa: PLW0603
+
+    if key == Key[_CONFIG["keys"]["exitKeyName"]]:
+        _is_shutdown = True
 
 
-def infer():
-    global shutdown_flag, reset_memory_flag
+_listener = Listener(on_press=_shutdown_on_press)
+_listener.start()
 
-    if not os.path.exists(MODEL_PATH):
-        print(f"❌ Could not find model weights at {MODEL_PATH}")
-        sys.exit(1)
 
-    print("🧠 Loading Impala ResNet + GRU...")
-    model = GDBehavioralCloningModel().to(DEVICE)
+def _infer():
+    """Load model and weights, track frame drops and latency, and process model output."""
+    hidden_state_dim = _CONFIG["model"]["hiddenDim"]
+    pipeline_fps = _CONFIG["capture"]["fps"]
+    device = torch.device(_CONFIG["model"]["deviceName"])
 
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    if 'model_state' in checkpoint:
-        model.load_state_dict(checkpoint['model_state'])
-    else:
-        model.load_state_dict(checkpoint)
+    weight_dir: str = Path / (
+        Path / (Path.parent(__file__), "..", _CONFIG["fileNames"]["weightDirName"])
+    )
+    weight_name = _CONFIG["fileNames"]["weightName"]
 
-    model.eval()
-    print("✅ Model Loaded and set to Eval Mode.")
+    model: PolicyModel = PolicyModel().to(device)
+    weights: dict[str, torch.Tensor] = torch.load(
+        Path / (weight_dir, weight_name),
+        weights_only=False,
+    )
 
-    print("\n⚠️  FOCUS GEOMETRY DASH NOW... Starting in 3 seconds.")
+    model.load_state_dict(weights["model_state"])
+
+    print("Open Geometry Dash within 3 seconds.")
     time.sleep(3)
 
-    env = GeometryDashEnv()
+    env: GameEnv = GameEnv()
 
-    hidden_state = None
-    current_action = 0
-    total_flushed = 0
-    step_count = 0
-    jumped_in_window = False
+    hidden_state: Float32[torch.Tensor, "L N D"] = torch.zeros(
+        1,
+        1,
+        hidden_state_dim,
+        device=device,
+    )
+    curr_action_bin = 0
 
-    print("\n--- AI IS NOW PLAYING ---")
-
-    latencies = []
-
+    i = 0
     with torch.inference_mode():
-        while not shutdown_flag:
-            frame, _, flushed_count = env.step(current_action)
-            total_flushed += flushed_count
+        while not _is_shutdown:
+            i += 1
 
-            t_start = time.perf_counter()
+            frame_HWC: Frame
+            frame_HWC, _ = env.step(curr_action_bin)
 
-            if reset_memory_flag:
-                hidden_state = None
-                current_action = 0
-                reset_memory_flag = False
-                env.reset()
+            time_start: float = time.perf_counter()
 
-            frame_chw = np.transpose(frame, (2, 0, 1))
-            frame_tensor = torch.from_numpy(frame_chw).unsqueeze(0).unsqueeze(0)
-            frame_tensor = frame_tensor.to(DEVICE, dtype=torch.float32).div(255.0)
+            frame_NTHWC: np.uint8 = (
+                torch.from_numpy(frame_HWC).unsqueeze(0).unsqueeze(0)
+            )
+            frame_NTHWC = frame_NTHWC.to(device=device, dtype=torch.float32)
 
-            prev_action_tensor = torch.tensor([[current_action]], dtype=torch.long, device=DEVICE)
+            logits: Float32[torch.Tensor, "N T V"]
+            hidden_state: Float32[torch.Tensor, "N L D"]
 
-            logits, hidden_state = model(frame_tensor, prev_action_tensor, hidden_state)
+            logits, hidden_state = model.forward(frame_NTHWC, hidden_state)
 
-            current_action = torch.argmax(logits, dim=-1).item()
-            if current_action == 1:
-                jumped_in_window = True
+            curr_action_bin = torch.argmax(logits, dim=-1)
 
-            step_count += 1
+            infer_time: float = (time.perf_counter() - time_start) * 1000
 
-            inf_ms = (time.perf_counter() - t_start) * 1000
-            latencies.append(inf_ms)
-            if len(latencies) > 120:
-                latencies.pop(0)
+            if i % (120 / pipeline_fps) == 0:
+                frame_drops = env.capture_engine.frame_drops
+                print(
+                    f"\rInference latency: {infer_time} | Frame drops: {frame_drops}",
+                    end="",
+                    flush=True,
+                )
 
-            if step_count % 30 == 0:
-                avg_lat = sum(latencies) / len(latencies)
-                action_str = "🟩 JUMP" if jumped_in_window else "⬜ IDLE"
-                jumped_in_window = False
-                true_drops = env.engine.drop_count + total_flushed
-
-                color = "\033[92m" if avg_lat < 6.0 else "\033[93m" if avg_lat < 8.33 else "\033[91m"
-                reset_c = "\033[0m"
-
-                sys.stdout.write(
-                    f"\r[Live] Action: {action_str} | Latency: {color}{avg_lat:.2f} ms{reset_c} | Frame Drops: {true_drops} ")
-                sys.stdout.flush()
-
-    print("\n\n🛑 AI Offline. Shutting down gracefully.")
-    env.engine.stop()
-    sys.exit(0)
+        env.capture_engine.stop_capture_stream()
 
 
 if __name__ == "__main__":
-    infer()
+    _infer()
