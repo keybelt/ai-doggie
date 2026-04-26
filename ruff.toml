@@ -1,0 +1,21 @@
+[lint]
+
+select = ["ALL"]
+ignore = [
+    "E501",     # line too long
+    "TC002",    # typing only third party import.
+    "TC001",    # typing only first party import
+    "ANN202",   # missing return type private function
+    "ANN001",   # missing type function argument
+    "F722",     # forward annotation syntax error
+    "T201",     # print
+    "ANN204",   # missing return type special method
+    "ANN201",   # missing return type undocumented public function
+    "N806",     # non lowercase variable in function
+    "F821",     # undefined name
+    "UP037",    # quoted annotation
+    "N803",     # invalid argument name
+    "ANN205",   # missing return type static method
+    "D413",     # missing blank line after last section
+    "D102",     # undocumented public method
+]
