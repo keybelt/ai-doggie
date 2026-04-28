@@ -25,7 +25,8 @@ from libdispatch import dispatch_queue_create
 
 from type_defs import Frame, FrameQueue
 
-with Path.open("../config.json") as f:
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+with _CONFIG_PATH.open("r") as f:
     _CONFIG_CAPTURE = json.load(f)["capture"]
 
 _PIPELINE_FRAME_WIDTH_PX = _CONFIG_CAPTURE["frameDims"]["pipelineWidthPx"]
@@ -50,9 +51,13 @@ class _CaptureEngine(NSObject):
         self.capture_stream = None
 
         for _ in range(_QUEUE_DEPTH):
-            # 3rd axis represent BGRA channel. Use uint8 because color channels contain 256 distinct values.
+            color_channel_depth = 4
             frame = np.zeros(
-                (_PIPELINE_FRAME_HEIGHT_PX, _PIPELINE_FRAME_WIDTH_PX, 4),
+                (
+                    _PIPELINE_FRAME_HEIGHT_PX,
+                    _PIPELINE_FRAME_WIDTH_PX,
+                    color_channel_depth,
+                ),
                 dtype=np.uint8,
             )
             self.queue_empty.put(frame)
@@ -89,22 +94,22 @@ class _CaptureEngine(NSObject):
 
                 # Convert to a 1d memory buffer of size bytes per row * height for the full frame.
                 frame_bytes: memoryview = frame_ptr.as_buffer(
-                    bytes_per_row * self.target_height,
+                    bytes_per_row * _PIPELINE_FRAME_HEIGHT_PX,
                 )
 
                 # Convert to a 2d array to represent width and height.
                 frame_arr = np.frombuffer(
                     frame_bytes,
                     dtype=np.uint8,
-                ).reshape(self.target_height, bytes_per_row)
+                ).reshape(_PIPELINE_FRAME_HEIGHT_PX, bytes_per_row)
 
                 # Make sure the buffer fits the frame (color and width axes are combined).
                 frame_buf_view = frame_buf.view(
                     np.uint8,
-                ).reshape(self.target_height, self.target_width * 4)
+                ).reshape(_PIPELINE_FRAME_HEIGHT_PX, _PIPELINE_FRAME_WIDTH_PX * 4)
 
                 # Crop out the padding.
-                np.copyto(frame_buf_view, frame_arr[:, : self.target_width * 4])
+                np.copyto(frame_buf_view, frame_arr[:, : _PIPELINE_FRAME_WIDTH_PX * 4])
             finally:
                 Quartz.CVPixelBufferUnlockBaseAddress(frame_px, read_only_flag)
 
@@ -123,8 +128,8 @@ def start_capture_engine() -> _CaptureEngine:
 
     def on_shareable_content(content: Sck.SCShareableContent) -> None:
         """Asynchronous function that handles the window configurations."""
-        height_src_px = _CONFIG_CAPTURE["frameDims"]["srcHeightPx"]
-        width_src_px = _CONFIG_CAPTURE["frameDims"]["srcHeightPx"]
+        src_height_px = _CONFIG_CAPTURE["frameDims"]["srcHeightPx"]
+        src_width_px = _CONFIG_CAPTURE["frameDims"]["srcWidthPx"]
 
         title_bar_crop_px = 28
         pixel_format_bgra: int = 1111970369
@@ -142,7 +147,7 @@ def start_capture_engine() -> _CaptureEngine:
 
         config: Sck.SCStreamConfiguration = Sck.SCStreamConfiguration.alloc().init()
         config.setSourceRect_(
-            Quartz.CGRectMake(0, title_bar_crop_px, width_src_px, height_src_px),
+            Quartz.CGRectMake(0, title_bar_crop_px, src_width_px, src_height_px),
         )
         config.setWidth_(_PIPELINE_FRAME_WIDTH_PX)
         config.setHeight_(_PIPELINE_FRAME_HEIGHT_PX)

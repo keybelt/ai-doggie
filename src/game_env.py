@@ -18,7 +18,8 @@ from AppKit import NSApplication
 from capture import _CaptureEngine, start_capture_engine
 from type_defs import Frame, FramePackage
 
-with pathlib.Path.open("../config.json") as f:
+_CONFIG_PATH = pathlib.Path(__file__).resolve().parents[1] / "config.json"
+with _CONFIG_PATH.open("r") as f:
     _CONFIG_CAPTURE = json.load(f)["capture"]
 
 
@@ -36,9 +37,11 @@ class _KeyboardController:
         event_src = Quartz.CGEventSourceCreate(
             Quartz.kCGEventSourceStateHIDSystemState,
         )
+
+        space_keycode = 49
         e = Quartz.CGEventCreateKeyboardEvent(
             event_src,
-            49,  # The space keycode.
+            space_keycode,
             is_keydown,
         )
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
@@ -51,7 +54,6 @@ class _KeyboardController:
             self._send_keypress(is_keydown=False)
 
     def toggle_key(self, is_keydown):
-        """Post key state if key wasn't already in said state."""
         if self._is_keydown != is_keydown:
             self._send_keypress(is_keydown)
 
@@ -67,9 +69,9 @@ class GameEnv:
         self.capture_engine: _CaptureEngine = start_capture_engine()
         self._keyboard_controller: _KeyboardController = _KeyboardController()
 
-        # 3rd axis represent color channels (dim=3, because dropped alpha). Use uint8 for optimal color representation.
+        color_channel_depth = 3
         self._last_fresh_frame: Frame = np.zeros(
-            (frame_height_px, frame_width_px, 3),
+            (frame_height_px, frame_width_px, color_channel_depth),
             dtype=np.uint8,
         )
 

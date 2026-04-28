@@ -13,11 +13,12 @@ import numpy as np
 import torch
 from jaxtyping import Float32, Int64
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from policy_model import PolicyModel
 
-with Path.open("../config.json") as f:
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+with _CONFIG_PATH.open("r") as f:
     _CONFIG = json.load(f)
     _CONFIG_TRAINING = _CONFIG["training"]
 
@@ -25,7 +26,7 @@ BATCH_SIZE: int = _CONFIG_TRAINING["batchSize"]
 LR = _CONFIG_TRAINING["learningRate"]
 
 
-class _DatasetGenerator:
+class _DatasetGenerator(IterableDataset):
     """Yield training batches built from parallel gameplay streams."""
 
     def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -37,7 +38,6 @@ class _DatasetGenerator:
         dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
         dataset_files_src: Path = Path(dataset_dir_name)
 
-        # Create a copy of the source files to mutate.
         dataset_files: list[Path] = list(dataset_files_src.glob())
         random.shuffle(dataset_files)
 
@@ -65,7 +65,7 @@ class _DatasetGenerator:
                         frames, actions_bin, are_first = next(curr_file_stream)
                     except StopIteration:
                         # If current file is exhausted, attempt to refill slot with a new file.
-                        if file_streams:
+                        if dataset_files:
                             file_streams[batch_idx] = self._stream_file(
                                 dataset_files.pop(0),
                             )
@@ -105,7 +105,7 @@ class _DatasetGenerator:
         with np.load(filepath) as data:
             frames: np.ndarray
             actions_bin: np.ndarray
-            frames, actions_bin = data["frame"], data["actions"]
+            frames, actions_bin = data["frame"], data["actions_bin"]
 
             # Account for the extra index for actions since we train on predicting the following action.
             num_chunks = (len(frames) - 1) // seq_len
@@ -178,15 +178,13 @@ class _AdamW:
 
     def load_state_dict(self, state_dict: dict[str, int | list[Tensor]]):
         self.step_idx = state_dict["step_idx"]
-        self.epoch_idx = state_dict["epoch_idx"]
         self._m = state_dict["mean"]
         self._v = state_dict["var"]
 
 
 def _softmax(logits: Float32[Tensor, "N V"]):
-    # Negatively offset logits for stability.
-    logits_exp = torch.exp(logits - logits.max(dim=1, keepdim=True).values)
-    return logits_exp / torch.sum(logits_exp, dim=1, keepdim=True)
+    logits_exp_stable = torch.exp(logits - logits.max(dim=1, keepdim=True).values)
+    return logits_exp_stable / torch.sum(logits_exp_stable, dim=1, keepdim=True)
 
 
 def _cross_entropy(logits: Float32[Tensor, "N V"], target: Int64[Tensor, "N"]) -> float:
@@ -197,16 +195,18 @@ def _cross_entropy(logits: Float32[Tensor, "N V"], target: Int64[Tensor, "N"]) -
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
     device: torch.Device = torch.device(_CONFIG["model"]["deviceName"])
-    hidden_state_dim = _CONFIG["model"]["hiddenStateDim"]
+    hidden_state_dim = _CONFIG["model"]["hiddenDim"]
     epochs = _CONFIG["training"]["epochs"]
-    checkpointSaveInterval: int = _CONFIG["training"]["epochs"]
+    checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
 
     dataloader: DataLoader = DataLoader(_DatasetGenerator(), batch_size=None)
     model: PolicyModel = PolicyModel().to(device)
     optimizer: _AdamW = _AdamW(model.parameters())
 
-    checkpoint_dir = Path / _CONFIG["fileNames"]["checkpointDirName"]
-    checkpoint_name = Path / _CONFIG["fileNames"]["checkpointName"]
+    checkpoint_dir = (
+        Path(__file__).resolve().parents[1] / _CONFIG["fileNames"]["checkpointDirName"]
+    )
+    checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
     checkpoint: dict[str] = torch.load(checkpoint_dir / checkpoint_name)
 
     hidden_state = torch.zeros(BATCH_SIZE, 1, hidden_state_dim)
@@ -244,7 +244,7 @@ def _train():
 
             logits: Float32[Tensor, "N T V"]
             hidden_state: Float32[Tensor, "N L D"]
-            logits, hidden_state = model.forward(frame_norm, hidden_state)
+            logits, hidden_state = model(frame_norm, hidden_state)
 
             # Ensure hidden state doesn't effect the gradients of the entire dataset.
             hidden_state = hidden_state.detach()
@@ -264,8 +264,8 @@ def _train():
         avg_loss = epoch_loss / batch_idx
         print(f"Epoch {epoch} completed | Average loss: {avg_loss:.4f}")
 
-        if epoch % checkpointSaveInterval == 0:
-            checkpoint_path = Path / (checkpoint_dir, f"epoch_{epoch}.pt")
+        if epoch % checkpoint_save_interval == 0:
+            checkpoint_path = checkpoint_dir / f"epoch_{epoch}.pt"
             torch.save(
                 {
                     "epoch": epoch,

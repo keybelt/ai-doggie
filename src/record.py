@@ -21,7 +21,8 @@ from pynput.keyboard import Key, Listener
 from game_env import GameEnv
 from type_defs import Frame, ParsedMacro
 
-with Path.open("../config.json") as f:
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+with _CONFIG_PATH.open("r") as f:
     _CONFIG = json.load(f)
 
 _curr_action_bin = 0
@@ -101,11 +102,11 @@ def _shm_bridge(macro_events: ParsedMacro):
     _curr_action_bin = 0
 
     while not _is_shutdown:
-        # Extract as integer (i). And use [0] becuase .unpack returns a tuple
+        # Extract as integer (i).
         action_ready_bin = unpack("i", shm.buf[8:12])[0]
 
         if action_ready_bin == 1:
-            frame_idx = unpack("i", shm.buf[0:4])
+            frame_idx = unpack("i", shm.buf[0:4])[0]
 
             # Only passes if there are macro events left over, and if our current frame matches the macro event's frame.
             while (
@@ -120,7 +121,7 @@ def _shm_bridge(macro_events: ParsedMacro):
             shm.buf[12:16] = pack("i", 1)
             shm.buf[8:12] = pack("i", 0)
         else:
-            time.sleep(0)
+            time.sleep(0.001)
 
     shm.close()
     shm.unlink()
@@ -134,13 +135,11 @@ def _record(macro_name: str):
     pipeline_fps = _CONFIG["capture"]["fps"]
 
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-    dataset_dir: str = Path.resolve(
-        Path / (Path.parent(__file__), "..", dataset_dir_name),
-    )
+    dataset_dir: Path = Path(__file__).resolve().parents[1] / dataset_dir_name
 
     macro_events: ParsedMacro = _load_macro(macro_name)
 
-    shm_thread = threading.Thread(target=_shm_bridge, args=macro_events, daemon=True)
+    shm_thread = threading.Thread(target=_shm_bridge, args=(macro_events,), daemon=True)
     shm_thread.start()
 
     game_env: GameEnv = GameEnv()
@@ -149,10 +148,7 @@ def _record(macro_name: str):
     listener.start()
 
     frames_buf: UInt8[np.ndarray, "frame_buf_max frame_H frame_W frame_C"] = np.empty(
-        buf_max_frames,
-        frame_height_px,
-        frame_width_px,
-        3,
+        (buf_max_frames, frame_height_px, frame_width_px, 3),
         dtype=np.uint8,
     )
     actions_bin_buf = np.empty(buf_max_frames, dtype=np.uint8)
@@ -177,10 +173,7 @@ def _record(macro_name: str):
             if frame_idx % (120 / pipeline_fps) == 0:
                 print(f"\rRecord frames: {frame_idx}", end="", flush=True)
 
-    save_path = Path / (
-        dataset_dir,
-        f"{macro_name}-{time.strftime('%m%d%H%M')}",
-    )
+    save_path = dataset_dir / f"{macro_name}-{time.strftime('%m%d%H%M')}"
     np.savez_compressed(
         save_path,
         frames=frames_buf[:frame_idx],

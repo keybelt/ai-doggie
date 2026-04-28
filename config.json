@@ -47,7 +47,8 @@
         "beta1": 0.9,
         "beta2": 0.99,
         "weightDecay": 0,
-        "checkpointSaveInterval": 5
+        "checkpointSaveInterval": 5,
+        "epochs": 50
     },
     "keys": {
         "exitKeyName": "esc",

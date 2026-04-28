@@ -17,7 +17,8 @@ from game_env import GameEnv
 from policy_model import PolicyModel
 from type_defs import Frame
 
-with Path.open("../config.json") as f:
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+with _CONFIG_PATH.open("r") as f:
     _CONFIG = json.load(f)
 
 _is_shutdown = False
@@ -40,14 +41,13 @@ def _infer():
     pipeline_fps = _CONFIG["capture"]["fps"]
     device = torch.device(_CONFIG["model"]["deviceName"])
 
-    weight_dir: str = Path / (
-        Path / (Path.parent(__file__), "..", _CONFIG["fileNames"]["weightDirName"])
-    )
+    base_dir = Path(__file__).resolve().parents[1]
+    weight_dir: Path = base_dir / _CONFIG["fileNames"]["weightDirName"]
     weight_name = _CONFIG["fileNames"]["weightName"]
 
     model: PolicyModel = PolicyModel().to(device)
     weights: dict[str, torch.Tensor] = torch.load(
-        Path / (weight_dir, weight_name),
+        weight_dir / weight_name,
         weights_only=False,
     )
 
@@ -79,14 +79,13 @@ def _infer():
             frame_NTHWC: np.uint8 = (
                 torch.from_numpy(frame_HWC).unsqueeze(0).unsqueeze(0)
             )
-            frame_NTHWC = frame_NTHWC.to(device=device, dtype=torch.float32)
+            frame_NTHWC = frame_NTHWC.to(device=device, dtype=torch.float32) / 255
 
             logits: Float32[torch.Tensor, "N T V"]
             hidden_state: Float32[torch.Tensor, "N L D"]
+            logits, hidden_state = model(frame_NTHWC, hidden_state)
 
-            logits, hidden_state = model.forward(frame_NTHWC, hidden_state)
-
-            curr_action_bin = torch.argmax(logits, dim=-1)
+            curr_action_bin = torch.argmax(logits, dim=-1).item()
 
             infer_time: float = (time.perf_counter() - time_start) * 1000
 
