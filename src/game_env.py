@@ -7,8 +7,6 @@ Example:
 """
 
 import atexit
-import json
-import pathlib
 import queue
 
 import numpy as np
@@ -16,11 +14,10 @@ import Quartz
 from AppKit import NSApplication
 
 from capture import _CaptureEngine, start_capture_engine
+from config import CONFIG as _CONFIG
 from type_defs import Frame, FramePackage
 
-_CONFIG_PATH = pathlib.Path(__file__).resolve().parents[1] / "config.json"
-with _CONFIG_PATH.open("r") as f:
-    _CONFIG_CAPTURE = json.load(f)["capture"]
+_CONFIG_CAPTURE = _CONFIG["capture"]
 
 
 class _KeyboardController:
@@ -76,14 +73,12 @@ class GameEnv:
         )
 
     def clear_frame_queue(self):
-        while self.capture_engine.queue_full.qsize() > 1:
+        while not self.capture_engine.queue_full.empty():
             # FIFO retrieval, dump all the oldest frames.
             frame = self.capture_engine.queue_full.get_nowait()
             self.capture_engine.queue_empty.put(frame)
 
             self.capture_engine.frame_drops += 1
-
-        print("queue_full cleared.")
 
     def get_frame(self) -> FramePackage:
         """Return the latest frame, recycle a previous frame if capture_engine doesn't have a fresh one ready.

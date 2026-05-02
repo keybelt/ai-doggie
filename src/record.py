@@ -18,12 +18,9 @@ import numpy as np
 from jaxtyping import UInt8
 from pynput.keyboard import Key, Listener
 
+from config import CONFIG as _CONFIG
 from game_env import GameEnv
 from type_defs import Frame, ParsedMacro
-
-_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
-with _CONFIG_PATH.open("r") as f:
-    _CONFIG = json.load(f)
 
 _curr_action_bin = 0
 _is_shutdown = False
@@ -53,22 +50,20 @@ def _load_macro(filepath: str) -> ParsedMacro:
     """
     macro_events: ParsedMacro = []
 
-    # rb = read, bytes.
-    with Path.open(filepath, "rb") as f:
-        macro_data = f.read()
+    macro_data = Path(filepath).read_bytes()
 
-        try:
-            # Unpack with utf8 decoding.
-            parsed_macro = json.loads(macro_data.decode("utf-8-sig"))
+    try:
+        # Unpack with utf8 decoding.
+        parsed_macro = json.loads(macro_data.decode("utf-8-sig"))
 
-            print("Macro parsed with JSON.")
-        except json.JSONDecodeError:
-            # Unpack from bytes.
-            parsed_macro = msgpack.unpackb(macro_data, raw=False)
+        print("Macro parsed with JSON.")
+    except json.JSONDecodeError:
+        # Unpack from bytes.
+        parsed_macro = msgpack.unpackb(macro_data, raw=False)
 
-            print("Macro parsed with MessagePack.")
+        print("Macro parsed with MessagePack.")
 
-    for macro_input in parsed_macro.get("inputs"):
+    for macro_input in parsed_macro.get("inputs", []):
         frame_idx = macro_input["frame"]
         mouse_btn: int = macro_input["btn"]
         is_player2 = macro_input["2p"]
@@ -91,12 +86,14 @@ def _shm_bridge(macro_events: ParsedMacro):
     global _curr_action_bin  # noqa: PLW0603
 
     shm_name = _CONFIG["shmName"]
-
-    shm: SharedMemory = SharedMemory(
-        name=shm_name,
-        create=True,
-        size=16,
-    )
+    try:
+        shm = SharedMemory(name=shm_name)
+    except FileNotFoundError:
+        shm: SharedMemory = SharedMemory(
+            name=shm_name,
+            create=True,
+            size=16,
+        )
 
     event_idx = 0
     _curr_action_bin = 0
@@ -108,10 +105,10 @@ def _shm_bridge(macro_events: ParsedMacro):
         if action_ready_bin == 1:
             frame_idx = unpack("i", shm.buf[0:4])[0]
 
-            # Only passes if there are macro events left over, and if our current frame matches the macro event's frame.
+            # Only passes if there are macro events left over, and if our current frame matches or is ahead of the macro event's frame.
             while (
                 event_idx < len(macro_events)
-                and frame_idx == macro_events[event_idx][0]
+                and frame_idx >= macro_events[event_idx][0]
             ):
                 _curr_action_bin = macro_events[event_idx][1]
                 event_idx += 1
@@ -132,7 +129,7 @@ def _record(macro_name: str):
     buf_max_frames = _CONFIG["bufMaxFrames"]
     frame_height_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
     frame_width_px = _CONFIG["capture"]["frameDims"]["pipelineWidthPx"]
-    pipeline_fps = _CONFIG["capture"]["fps"]
+    log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
 
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
     dataset_dir: Path = Path(__file__).resolve().parents[1] / dataset_dir_name
@@ -151,7 +148,8 @@ def _record(macro_name: str):
         (buf_max_frames, frame_height_px, frame_width_px, 3),
         dtype=np.uint8,
     )
-    actions_bin_buf = np.empty(buf_max_frames, dtype=np.uint8)
+    # Store an extra for next action prediction.
+    actions_bin_buf = np.zeros(buf_max_frames + 1, dtype=np.uint8)
 
     frame_idx = 0
     game_env.clear_frame_queue()
@@ -160,9 +158,12 @@ def _record(macro_name: str):
         frame: Frame
         frame, is_stale = game_env.get_frame()
 
-        if _is_recording:
-            game_env.clear_frame_queue()
+        if frame_idx >= buf_max_frames:
+            print("Frame buffer exceeded.")
+            break
 
+        game_env.clear_frame_queue()
+        if _is_recording:
             if is_stale:
                 continue
 
@@ -170,14 +171,14 @@ def _record(macro_name: str):
             actions_bin_buf[frame_idx] = _curr_action_bin
             frame_idx += 1
 
-            if frame_idx % (120 / pipeline_fps) == 0:
+            if frame_idx % log_interval == 0:
                 print(f"\rRecord frames: {frame_idx}", end="", flush=True)
 
     save_path = dataset_dir / f"{macro_name}-{time.strftime('%m%d%H%M')}"
     np.savez_compressed(
         save_path,
         frames=frames_buf[:frame_idx],
-        actions_bin=actions_bin_buf[:frame_idx],
+        actions_bin=actions_bin_buf[: frame_idx + 1],
     )
     print(f"Saved recording to {save_path}")
 

@@ -1,7 +1,7 @@
 """Contains the entire screen capture mechanism and is the single source of truth for the frame drop metric.
 
 Examples:
-    >>> capture_engine = start_capture()
+    >>> capture_engine = start_capture_engine()
 
     Get a frame from the queue:
     >>> capture_engine.queue_full.get()
@@ -10,9 +10,7 @@ Examples:
     >>> frame_drops = capture_engine.frame_drops
 """
 
-import json
 import queue
-from pathlib import Path
 from typing import Self, override
 
 import CoreMedia
@@ -23,11 +21,10 @@ import ScreenCaptureKit as Sck
 from Foundation import NSObject
 from libdispatch import dispatch_queue_create
 
+from config import CONFIG as _CONFIG
 from type_defs import Frame, FrameQueue
 
-_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
-with _CONFIG_PATH.open("r") as f:
-    _CONFIG_CAPTURE = json.load(f)["capture"]
+_CONFIG_CAPTURE = _CONFIG["capture"]
 
 _PIPELINE_FRAME_WIDTH_PX = _CONFIG_CAPTURE["frameDims"]["pipelineWidthPx"]
 _PIPELINE_FRAME_HEIGHT_PX = _CONFIG_CAPTURE["frameDims"]["pipelineHeightPx"]
@@ -135,47 +132,57 @@ def start_capture_engine() -> _CaptureEngine:
         pixel_format_bgra: int = 1111970369
         capture_fps = _CONFIG_CAPTURE["fps"]
 
-        window_target = next(
-            w for w in content.windows() if "geometry dash" in (w.title() or "").lower()
-        )
+        try:
+            window_target = next(
+                w
+                for w in content.windows()
+                if "geometry dash" in (w.title() or "").lower()
+            )
 
-        print("Geometry Dash window found.")
+            print("Geometry Dash window found.")
 
-        window_filter = Sck.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
-            window_target,
-        )
+            window_filter = (
+                Sck.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
+                    window_target,
+                )
+            )
 
-        config: Sck.SCStreamConfiguration = Sck.SCStreamConfiguration.alloc().init()
-        config.setSourceRect_(
-            Quartz.CGRectMake(0, title_bar_crop_px, src_width_px, src_height_px),
-        )
-        config.setWidth_(_PIPELINE_FRAME_WIDTH_PX)
-        config.setHeight_(_PIPELINE_FRAME_HEIGHT_PX)
-        config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, capture_fps))
-        config.setShowsCursor_(False)
-        config.setQueueDepth_(_QUEUE_DEPTH)
-        config.setPixelFormat_(pixel_format_bgra)
+            config: Sck.SCStreamConfiguration = Sck.SCStreamConfiguration.alloc().init()
+            config.setSourceRect_(
+                Quartz.CGRectMake(0, title_bar_crop_px, src_width_px, src_height_px),
+            )
+            config.setWidth_(_PIPELINE_FRAME_WIDTH_PX)
+            config.setHeight_(_PIPELINE_FRAME_HEIGHT_PX)
+            config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, capture_fps))
+            config.setShowsCursor_(False)
+            config.setQueueDepth_(_QUEUE_DEPTH)
+            config.setPixelFormat_(pixel_format_bgra)
 
-        capture_stream = Sck.SCStream.alloc().initWithFilter_configuration_delegate_(
-            window_filter,
-            config,
-            capture_engine,
-        )
-        capture_engine.capture_stream = capture_stream
+            capture_stream = (
+                Sck.SCStream.alloc().initWithFilter_configuration_delegate_(
+                    window_filter,
+                    config,
+                    capture_engine,
+                )
+            )
+            capture_engine.capture_stream = capture_stream
 
-        print("Capture stream live.")
+            print("Capture stream live.")
 
-        # Create a background thread so the capture stream doesn't interrupt the main pipeline.
-        dispatch_queue = dispatch_queue_create(b"com.ai-doggie.capture")
+            # Create a background thread so the capture stream doesn't interrupt the main pipeline.
+            dispatch_queue = dispatch_queue_create(b"com.ai-doggie.capture")
 
-        # Tell the capture stream to send frames to the capture engine using type video.
-        capture_stream.addStreamOutput_type_sampleHandlerQueue_error_(
-            capture_engine,
-            0,
-            dispatch_queue,
-            None,
-        )
-        capture_stream.startCaptureWithCompletionHandler_()
+            # Tell the capture stream to send frames to the capture engine using type video.
+            capture_stream.addStreamOutput_type_sampleHandlerQueue_error_(
+                capture_engine,
+                0,
+                dispatch_queue,
+                None,
+            )
+            capture_stream.startCaptureWithCompletionHandler_()
+        except StopIteration:
+            err_msg = "Geometry Dash window not found."
+            raise Exception(err_msg) from StopIteration  # noqa: TRY002
 
     # Find available windows to begin capture.
     Sck.SCShareableContent.getShareableContentWithCompletionHandler_(

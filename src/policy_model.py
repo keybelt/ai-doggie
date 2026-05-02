@@ -5,19 +5,14 @@ Example:
     model.load_state_dict(...)
 """
 
-import json
-import pathlib
-
 import torch
 from jaxtyping import Float32
 from torch import Tensor, nn
 
+from config import CONFIG as _CONFIG
 from type_defs import ConvBias, ConvWeight
 
-_CONFIG_PATH = pathlib.Path(__file__).resolve().parents[1] / "config.json"
-with _CONFIG_PATH.open("r") as f:
-    _CONFIG = json.load(f)
-    _CONFIG_MODEL = _CONFIG["model"]
+_CONFIG_MODEL = _CONFIG["model"]
 
 
 class PolicyModel(nn.Module):
@@ -27,6 +22,7 @@ class PolicyModel(nn.Module):
         """Initialize hidden dim, all weights and biases, and calculate flat size."""
         super().__init__()
         self._hidden_dim = _CONFIG_MODEL["hiddenDim"]
+        self._vocab_size = _CONFIG_MODEL["vocabSize"]
 
         self._conv1_shape = _CONFIG_MODEL["weightShapes"]["conv1"]
         self._conv1_W: ConvWeight = nn.Parameter(
@@ -113,10 +109,12 @@ class PolicyModel(nn.Module):
         )
 
         self._policy_W: Float32[Tensor, "out_heads hidden_dim"] = nn.Parameter(
-            torch.empty(2, self._hidden_dim),
+            torch.empty(self._vocab_size, self._hidden_dim),
         )
         nn.init.normal_(self._policy_W, mean=0.0, std=0.02)
-        self._policy_b: Float32[Tensor, "out_heads"] = nn.Parameter(torch.zeros(2))
+        self._policy_b: Float32[Tensor, "out_heads"] = nn.Parameter(
+            torch.zeros(self._vocab_size),
+        )
 
     @staticmethod
     def _relu(X: Tensor):
@@ -124,14 +122,25 @@ class PolicyModel(nn.Module):
 
     @staticmethod
     def _sigmoid(X: Tensor):
-        return 1 / (1 + torch.exp(-X))
+        X_exp_stable = torch.exp(-X + X.max(dim=-1, keepdim=True).values)
+        return 1 / (1 + X_exp_stable)
 
     @staticmethod
     def _tanh(X: Tensor):
-        return (torch.exp(X) - torch.exp(-X)) / (torch.exp(X) + torch.exp(-X))
+        X_exp_stable_pos = torch.exp(X - X.max(dim=-1, keepdim=True).values)
+        X_exp_stable_neg = torch.exp(-X + X.max(dim=-1, keepdim=True).values)
+
+        return (X_exp_stable_pos - X_exp_stable_neg) / (
+            X_exp_stable_pos + X_exp_stable_neg
+        )
 
     @staticmethod
-    def _calculate_out_dim(H, W, kernel_size: int, stride) -> tuple[int, int]:
+    def _calculate_out_dim(
+        H: int,
+        W: int,
+        kernel_size: int,
+        stride: int,
+    ) -> tuple[int, int]:
         """Calculate the feature map dimensions.
 
         Returns:
@@ -143,7 +152,7 @@ class PolicyModel(nn.Module):
         self,
         X: Float32[Tensor, "N H W C"],
         kernel_size: int,
-        stride,
+        stride: int,
     ) -> tuple[Tensor, int, int]:
         """Use for square kernel sliding and reshaping.
 
@@ -180,7 +189,7 @@ class PolicyModel(nn.Module):
         self,
         X: Float32[Tensor, "N H W C"],
         kernel_size: int,
-        stride,
+        stride: int,
     ) -> Float32[Tensor, "N H_out W_out C"]:
         """Get the maximum pixel values per receptive field.
 
@@ -196,7 +205,7 @@ class PolicyModel(nn.Module):
         X: Float32[Tensor, "N H W C"],
         W: Float32[Tensor, "kernel_size kernel_size C_in C_out"],
         b: Float32[Tensor, "C_out"],
-        stride,
+        stride: int,
     ) -> Float32[Tensor, "N H_out W_out C_out"]:
         """Multiply weights with unfolded image tensor and adds bias."""
         N, _, _, C = X.shape
@@ -217,7 +226,7 @@ class PolicyModel(nn.Module):
         W_col = W.view(-1, C_out)
 
         # Every value in each channel gets offset by the same amount.
-        out: Float32[Tensor, "pixels C_out"] = patch_col @ W_col + b
+        out: Float32[Tensor, "all_px C_out"] = patch_col @ W_col + b
 
         return out.view(N, H_out, width_out, C_out)
 
@@ -326,8 +335,7 @@ class PolicyModel(nn.Module):
             gru_out @ self._policy_W.T + self._policy_b
         )
 
-        vocab_size = _CONFIG_MODEL["vocabSize"]
-        logits = logits_nonsequential.view(N, T, vocab_size)
+        logits = logits_nonsequential.view(N, T, self._vocab_size)
 
         # Hidden state needs the L axis back.
         return logits, h.unsqueeze(1)

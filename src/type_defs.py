@@ -1,4 +1,4 @@
-"""Contain the custom type defintions of the pipeline.
+"""Contains the custom type definitions of the pipeline.
 
 Example:
     >>> from type_defs import Frame

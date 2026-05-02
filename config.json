@@ -35,9 +35,8 @@
         "deviceName": "mps"
     },
     "fileNames": {
-        "weightDirName": "weights",
-        "weightName": "placeholder.pt",
         "datasetDirName": "data",
+        "checkpointName": "placeholder.pt",
         "checkpointDirName": "checkpoints"
     },
     "training": {
@@ -55,5 +54,6 @@
         "recordKeyName": "space"
     },
     "shmName": "GDMem",
-    "bufMaxFrames": 50000
+    "bufMaxFrames": 50000,
+    "logIntervalSec": 0.5
 }
