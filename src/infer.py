@@ -21,7 +21,7 @@ _is_shutdown = False
 
 
 def _shutdown_on_press(key):
-    global _is_shutdown  # noqa: PLW0603
+    global _is_shutdown
 
     if key == Key[_CONFIG["keys"]["exitKeyName"]]:
         _is_shutdown = True
@@ -33,7 +33,6 @@ def _infer():
     listener.start()
 
     hidden_state_dim = _CONFIG["model"]["hiddenDim"]
-    pipeline_fps = _CONFIG["capture"]["fps"]
     device: torch.device = torch.device(_CONFIG["model"]["deviceName"])
 
     base_dir = Path(__file__).resolve().parents[1]
@@ -43,7 +42,8 @@ def _infer():
     model: PolicyModel = PolicyModel().to(device)
     checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
         checkpoint_dir / checkpoint_name,
-        weights_only=False,
+        weights_only=True,
+        map_location=device,
     )
 
     model.load_state_dict(checkpoint["model_state"])

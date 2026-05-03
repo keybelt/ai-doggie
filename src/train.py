@@ -38,10 +38,6 @@ class _DatasetGenerator(IterableDataset):
         dataset_files: list[Path] = list(dataset_files_src.glob("*.npz"))
         random.shuffle(dataset_files)
 
-        if len(dataset_files) < BATCH_SIZE:
-            err_msg = "Not enough data files."
-            raise Exception(err_msg)  # noqa: TRY002
-
         file_streams: list[Iterator[tuple[np.ndarray, np.ndarray, bool]]] = [
             self._stream_file(dataset_files.pop(0)) for _ in range(BATCH_SIZE)
         ]
@@ -142,7 +138,7 @@ class _AdamW:
             grad = param.grad
             if grad is None:
                 err_msg = "Parameter has no gradient."
-                raise Exception(err_msg)  # noqa: TRY002
+                raise Exception(err_msg)
 
             # Store the pre-corrected moments.
             self._m[i] = beta1 * self._m[i] + (1 - beta1) * grad
@@ -211,6 +207,7 @@ def _train():
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
     checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
         checkpoint_dir / checkpoint_name,
+        map_location=device,
     )
 
     start_epoch: int = checkpoint["epoch"] + 1
@@ -288,7 +285,7 @@ def _train():
 
             epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / num_batches
+        avg_loss = (epoch_loss / num_batches) if num_batches > 0 else 0
         print(f"Epoch {epoch} completed | Average loss: {avg_loss:.4f}")
 
         if epoch % checkpoint_save_interval == 0:

@@ -36,7 +36,7 @@
     },
     "fileNames": {
         "datasetDirName": "data",
-        "checkpointName": "placeholder.pt",
+        "checkpointName": "epoch_15.pt",
         "checkpointDirName": "checkpoints"
     },
     "training": {

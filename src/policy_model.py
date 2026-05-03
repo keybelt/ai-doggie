@@ -1,8 +1,8 @@
 """Contains the custom CNN + GRU model.
 
 Example:
-    model = PolicyModel()
-    model.load_state_dict(...)
+    >>> model = PolicyModel()
+    >>> model.load_state_dict(...)
 """
 
 import torch
@@ -122,13 +122,13 @@ class PolicyModel(nn.Module):
 
     @staticmethod
     def _sigmoid(X: Tensor):
-        X_exp_stable = torch.exp(-X + X.max(dim=-1, keepdim=True).values)
+        X_exp_stable = torch.exp(-X + X.max())
         return 1 / (1 + X_exp_stable)
 
     @staticmethod
     def _tanh(X: Tensor):
-        X_exp_stable_pos = torch.exp(X - X.max(dim=-1, keepdim=True).values)
-        X_exp_stable_neg = torch.exp(-X + X.max(dim=-1, keepdim=True).values)
+        X_exp_stable_pos = torch.exp(X - X.max())
+        X_exp_stable_neg = torch.exp(-X + X.max())
 
         return (X_exp_stable_pos - X_exp_stable_neg) / (
             X_exp_stable_pos + X_exp_stable_neg

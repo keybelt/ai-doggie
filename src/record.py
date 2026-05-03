@@ -29,7 +29,7 @@ _is_recording = False
 
 def _on_press(key):
     """Activate shutdown state upon keypress."""
-    global _is_shutdown, _is_recording  # noqa: PLW0603
+    global _is_shutdown, _is_recording
 
     exit_key_name = _CONFIG["keys"]["exitKeyName"]
     record_key_name = _CONFIG["keys"]["recordKeyName"]
@@ -55,13 +55,14 @@ def _load_macro(filepath: str) -> ParsedMacro:
     try:
         # Unpack with utf8 decoding.
         parsed_macro = json.loads(macro_data.decode("utf-8-sig"))
-
-        print("Macro parsed with JSON.")
-    except json.JSONDecodeError:
+        print("Macro parsed using JSON.")
+    except (json.JSONDecodeError, UnicodeDecodeError):
         # Unpack from bytes.
         parsed_macro = msgpack.unpackb(macro_data, raw=False)
+        print("Macro parsed using msgpack.")
 
-        print("Macro parsed with MessagePack.")
+    macro_fps = parsed_macro.get("framerate")
+    print(f"Macro FPS: {macro_fps}.")
 
     for macro_input in parsed_macro.get("inputs", []):
         frame_idx = macro_input["frame"]
@@ -83,7 +84,7 @@ def _load_macro(filepath: str) -> ParsedMacro:
 
 def _shm_bridge(macro_events: ParsedMacro):
     """Initialize a shared memory block between this script and the c++ mod."""
-    global _curr_action_bin  # noqa: PLW0603
+    global _curr_action_bin
 
     shm_name = _CONFIG["shmName"]
     try:

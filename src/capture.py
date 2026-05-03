@@ -38,7 +38,7 @@ class _CaptureEngine(NSObject):
     @override
     def init(self) -> Self:
         """Initialize and populate queues, frame drop counter, frame specifications, and capture stream reference."""
-        self = objc.super(_CaptureEngine, self).init()  # noqa: PLW0642
+        self = objc.super(_CaptureEngine, self).init()
 
         self.queue_empty: FrameQueue = queue.Queue()
         self.queue_full: FrameQueue = queue.Queue()
@@ -182,7 +182,7 @@ def start_capture_engine() -> _CaptureEngine:
             capture_stream.startCaptureWithCompletionHandler_()
         except StopIteration:
             err_msg = "Geometry Dash window not found."
-            raise Exception(err_msg) from StopIteration  # noqa: TRY002
+            raise Exception(err_msg) from StopIteration
 
     # Find available windows to begin capture.
     Sck.SCShareableContent.getShareableContentWithCompletionHandler_(

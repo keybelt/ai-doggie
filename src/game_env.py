@@ -73,12 +73,13 @@ class GameEnv:
         )
 
     def clear_frame_queue(self):
-        while not self.capture_engine.queue_full.empty():
-            # FIFO retrieval, dump all the oldest frames.
-            frame = self.capture_engine.queue_full.get_nowait()
-            self.capture_engine.queue_empty.put(frame)
-
-            self.capture_engine.frame_drops += 1
+        try:
+            while True:
+                # FIFO retrieval, dump all the oldest frames.
+                frame = self.capture_engine.queue_full.get_nowait()
+                self.capture_engine.queue_empty.put(frame)
+        except queue.Empty:
+            pass
 
     def get_frame(self) -> FramePackage:
         """Return the latest frame, recycle a previous frame if capture_engine doesn't have a fresh one ready.
