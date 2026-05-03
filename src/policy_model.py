@@ -117,18 +117,18 @@ class PolicyModel(nn.Module):
         )
 
     @staticmethod
-    def _relu(X: Tensor):
+    def _relu(X: Float32[Tensor, "N H_out W_out C_out"]):
         return torch.maximum(torch.zeros_like(X), X)
 
     @staticmethod
-    def _sigmoid(X: Tensor):
-        X_exp_stable = torch.exp(-X + X.max())
+    def _sigmoid(X: Float32[Tensor, "N D"]):
+        X_exp_stable = torch.exp(-X)
         return 1 / (1 + X_exp_stable)
 
     @staticmethod
-    def _tanh(X: Tensor):
-        X_exp_stable_pos = torch.exp(X - X.max())
-        X_exp_stable_neg = torch.exp(-X + X.max())
+    def _tanh(X: Float32[Tensor, "N D"]):
+        X_exp_stable_pos = torch.exp(X)
+        X_exp_stable_neg = torch.exp(-X)
 
         return (X_exp_stable_pos - X_exp_stable_neg) / (
             X_exp_stable_pos + X_exp_stable_neg
@@ -274,20 +274,20 @@ class PolicyModel(nn.Module):
         Returns:
             The new hidden state.
         """
-        input_combined: Float32[Tensor, "N combined_hidden_dim"] = (
+        in_combined: Float32[Tensor, "N combined_D"] = (
             X @ self._gru_in_W.T + self._gru_in_b
         )
-        hidden_combined: Float32[Tensor, "N combined_hidden_dim"] = (
+        hidden_combined: Float32[Tensor, "N combined_D"] = (
             prev_h @ self._gru_hidden_W.T + self._gru_hidden_b
         )
 
         # Split the combined input and hidden tensors into 3 chunks along the combined hidden dim (3 * D) axes.
-        r_input, z_input, h_tilde_input = input_combined.chunk(3, dim=-1)
+        r_in, z_in, h_tilde_in = in_combined.chunk(3, dim=-1)
         r_hidden, z_hidden, h_tilde_hidden = hidden_combined.chunk(3, dim=-1)
 
-        r = self._sigmoid(r_input + r_hidden)
-        z = self._sigmoid(z_input + z_hidden)
-        h_tilde = self._tanh(h_tilde_input + h_tilde_hidden * r)
+        r = self._sigmoid(r_in + r_hidden)
+        z = self._sigmoid(z_in + z_hidden)
+        h_tilde = self._tanh(h_tilde_in + h_tilde_hidden * r)
 
         return (1 - z) * h_tilde + prev_h * z
 
