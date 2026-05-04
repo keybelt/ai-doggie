@@ -64,7 +64,12 @@ class _CaptureEngine(NSObject):
     # Use type encoding (v@:@@q) to tell macOS what to expect.
     @objc.typedSelector(b"v@:@@q")
     @override
-    def stream_didOutputSampleBuffer_ofType_(self, _stream, sample_buffer, _media_type):
+    def stream_didOutputSampleBuffer_ofType_(
+        self,
+        _stream,
+        sample_buffer: CoreMedia.CMSampleBuffer,
+        _media_type,
+    ):
         """Use a delegate callback to get a frame immediately as macOS produces one."""
         # Ensure the Obj-C objects get cleaned up properly.
         with objc.autorelease_pool():
