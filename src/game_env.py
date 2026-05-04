@@ -87,11 +87,11 @@ class GameEnv:
         Returns:
             The frame in RGB format, and whether the frame is fresh or reused.
         """
-        pipeline_fps = _CONFIG_CAPTURE["fps"]
+        self.clear_frame_queue()
 
         is_stale = False
-
         try:
+            pipeline_fps = _CONFIG_CAPTURE["fps"]
             bgra_frame: Frame = self.capture_engine.queue_full.get(
                 timeout=1 / pipeline_fps,
             )

@@ -122,17 +122,15 @@ class PolicyModel(nn.Module):
 
     @staticmethod
     def _sigmoid(X: Float32[Tensor, "N D"]):
-        X_exp_stable = torch.exp(-X)
-        return 1 / (1 + X_exp_stable)
+        X_exp = torch.exp(-X)
+        return 1 / (1 + X_exp)
 
     @staticmethod
     def _tanh(X: Float32[Tensor, "N D"]):
-        X_exp_stable_pos = torch.exp(X)
-        X_exp_stable_neg = torch.exp(-X)
+        X_exp_positive = torch.exp(X)
+        X_exp_negative = torch.exp(-X)
 
-        return (X_exp_stable_pos - X_exp_stable_neg) / (
-            X_exp_stable_pos + X_exp_stable_neg
-        )
+        return (X_exp_positive - X_exp_negative) / (X_exp_positive + X_exp_negative)
 
     @staticmethod
     def _calculate_out_dim(

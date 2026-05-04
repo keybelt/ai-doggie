@@ -70,10 +70,11 @@ def _load_macro(filepath: str) -> ParsedMacro:
         is_player2 = macro_input["2p"]
         is_keydown = macro_input["down"]
 
-        if mouse_btn != 1 or is_player2:
-            continue
+        if mouse_btn == 1 and not is_player2:
+            if macro_fps != _CONFIG["macroFps"]:
+                frame_idx = int(frame_idx * _CONFIG["macroFps"] / macro_fps)
 
-        macro_events.append((frame_idx, 1 if is_keydown else 0))
+            macro_events.append((frame_idx, 1 if is_keydown else 0))
 
     macro_events.sort(key=lambda x: x[0])
 
@@ -164,10 +165,7 @@ def _record(macro_name: str):
             break
 
         game_env.clear_frame_queue()
-        if _is_recording:
-            if is_stale:
-                continue
-
+        if _is_recording and not is_stale:
             frames_buf[frame_idx] = frame
             actions_bin_buf[frame_idx] = _curr_action_bin
             frame_idx += 1
