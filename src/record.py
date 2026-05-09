@@ -72,7 +72,7 @@ def _load_macro(filepath: str) -> ParsedMacro:
 
         if mouse_btn == 1 and not is_player2:
             if macro_fps != _CONFIG["macroFps"]:
-                frame_idx = int(frame_idx * _CONFIG["macroFps"] / macro_fps)
+                frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
 
@@ -90,6 +90,7 @@ def _shm_bridge(macro_events: ParsedMacro):
     shm_name = _CONFIG["shmName"]
     try:
         shm = SharedMemory(name=shm_name)
+        shm.buf[0:16] = bytes(16)
     except FileNotFoundError:
         shm: SharedMemory = SharedMemory(
             name=shm_name,
@@ -173,11 +174,11 @@ def _record(macro_name: str):
             if frame_idx % log_interval == 0:
                 print(f"\rRecord frames: {frame_idx}", end="", flush=True)
 
-    save_path = dataset_dir / f"{macro_name}-{time.strftime('%m%d%H%M')}"
+    save_path = dataset_dir / f"{macro_name}-{time.strftime('%m%d%H%M%S')}"
     np.savez_compressed(
         save_path,
-        frames=frames_buf[:frame_idx],
-        actions_bin=actions_bin_buf[: frame_idx + 1],
+        frames=frames_buf[: frame_idx - 1],
+        actions_bin=actions_bin_buf[:frame_idx],
     )
     print(f"Saved recording to {save_path}")
 
