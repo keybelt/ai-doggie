@@ -75,49 +75,49 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     if (m_levelSettings->m_twoPlayerMode && m_gameState.m_isDualMode) {
       PlayerObject *plr = player2 ? m_player2 : m_player1;
       if (plr)
-        (plr->*performButton)(button);
+        (plr->*isClick)(button);
     } else {
       if (m_player1)
-        (m_player1->*performButton)(button);
+        (m_player1->*isClick)(button);
 
       if (m_gameState.m_isDualMode && m_player2) {
-        (m_player2->*performButton)(button);
+        (m_player2->*isClick)(button);
       }
     }
 
     m_effectManager->playerButton(down, !player2);
-  }
 
-  if (down) {
-    m_clicks++;
-    if (button == PlayerButton::Jump)
-      m_jumping = true;
+    if (down) {
+      m_clicks++;
+      if (button == PlayerButton::Jump)
+        m_jumping = true;
+    }
   }
 
   void processClick() {
     if (!m_player1)
       return;
 
-    if (!sharedData) {
-      initSharedMemory();
-      if (!sharedData)
+    if (!data) {
+      initShm();
+      if (!data)
         return;
     }
 
     // Python expects halved frame index for whatever reason I forgot.
-    int current_frame = m_gameState.m_currentProgress / 2;
+    int frameIdx = m_gameState.m_currentProgress / 2;
 
-    sharedData->action_ready = 0;
-    sharedData->current_frame = current_frame;
-    sharedData->frame_ready = 1;
+    data->currActionBin = 0;
+    data->frameIdx = frameIdx;
+    data->frameReadyBin = 1;
 
     int timeout = 50000;
-    while (sharedData->action_ready == 0 && timeout > 0) {
+    while (data->currActionBin == 0 && timeout > 0) {
       timeout--;
     }
 
     if (timeout > 0) {
-      bool shouldJump = (sharedData->current_action == 1);
+      bool shouldJump = (data->current_action == 1);
 
       if (shouldJump && !isJumping) {
         sendClick(PlayerButton::Jump, true, false);
@@ -131,6 +131,6 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
 
   void processQueuedButtons(float dt, bool clearInputQueue) {
     GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
-    this->processBotInput();
+    this->processClick();
   }
 };
