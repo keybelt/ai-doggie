@@ -149,7 +149,7 @@ def _record(macro_name: str):
     listener = Listener(on_press=_on_press)
     listener.start()
 
-    frames_buf: UInt8[np.ndarray, "frame_buf_max frame_H frame_W frame_C"] = np.empty(
+    frames_buf: UInt8[np.ndarray, "frame_buf_max frame_H frame_W frame_C"] = np.empty(  # noqa: F722
         (buf_max_frames, frame_height_px, frame_width_px, 3),
         dtype=np.uint8,
     )
@@ -179,8 +179,8 @@ def _record(macro_name: str):
     save_path = dataset_dir / f"{macro_name}-{time.strftime('%m%d%H%M%S')}"
     np.savez_compressed(
         save_path,
-        frames=frames_buf[: frame_idx - 1],
-        actions_bin=actions_bin_buf[:frame_idx],
+        frames=frames_buf[:frame_idx],
+        actions_bin=actions_bin_buf[: frame_idx + 1],
     )
     print(f"Saved recording to {save_path}")
 

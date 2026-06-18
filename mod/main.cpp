@@ -28,7 +28,7 @@ void initShm() {
     return;
 
   // 0_RDWR is read/write, 0666 is read/write for owner, group, and others.
-  fileDescriptor = shm_open("/" + shmName, O_RDWR, 0666);
+  fileDescriptor = shm_open(("/" + shmName).c_str(), O_RDWR, 0666);
 
   if (fileDescriptor != -1) {
     data = (SharedData *)mmap(NULL, sizeof(SharedData), PROT_READ | PROT_WRITE,
@@ -104,20 +104,22 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
         return;
     }
 
-    // Python expects halved frame index for whatever reason I forgot.
+    // Python expects halved frame index for whatever reason I forgot (probably
+    // macro related).
     int frameIdx = m_gameState.m_currentProgress / 2;
 
     data->currActionBin = 0;
     data->frameIdx = frameIdx;
     data->frameReadyBin = 1;
+    data->actionReadyBin = 0;
 
     int timeout = 50000;
-    while (data->currActionBin == 0 && timeout > 0) {
+    while (data->actionReadyBin == 0 && timeout > 0) {
       timeout--;
     }
 
     if (timeout > 0) {
-      bool shouldJump = (data->current_action == 1);
+      bool shouldJump = (data->currActionBin == 1);
 
       if (shouldJump && !isJumping) {
         sendClick(PlayerButton::Jump, true, false);

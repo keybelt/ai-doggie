@@ -45,7 +45,6 @@ def _infer():
     model: PolicyModel = PolicyModel().to(device)
     checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
         checkpoint_dir / checkpoint_name,
-        weights_only=True,
         map_location=device,
     )
 
@@ -78,8 +77,8 @@ def _infer():
             frame_NTHWC = torch.from_numpy(frame_HWC).unsqueeze(0).unsqueeze(0)
             frame_NTHWC = frame_NTHWC.to(device=device, dtype=torch.float32) / 255
 
-            logits: Float32[Tensor, "N T V"]
-            hidden_state: Float32[Tensor, "N L D"]
+            logits: Float32[Tensor, "N T V"]  # noqa: F722
+            hidden_state: Float32[Tensor, "N L D"]  # noqa: F722
             logits, hidden_state = model(frame_NTHWC, hidden_state)
 
             curr_action_bin = torch.argmax(logits, dim=-1).item()

@@ -89,9 +89,8 @@ class _CaptureEngine(NSObject):
                 frame_buf: Frame = self.queue_full.get_nowait()
                 self.frame_drops += 1
 
-            # Safe access and override prevention.
-            read_only_flag = 1
-            Quartz.CVPixelBufferLockBaseAddress(frame_px, read_only_flag)
+            # Safe access and override prevention. 1 is read only.
+            Quartz.CVPixelBufferLockBaseAddress(frame_px, 1)
 
             try:
                 # bytes per row contains the padded row length.
@@ -118,7 +117,7 @@ class _CaptureEngine(NSObject):
                 # Crop out the padding.
                 np.copyto(frame_buf_view, frame_arr[:, : _PIPELINE_FRAME_WIDTH_PX * 4])
             finally:
-                Quartz.CVPixelBufferUnlockBaseAddress(frame_px, read_only_flag)
+                Quartz.CVPixelBufferUnlockBaseAddress(frame_px, 1)
 
             self.queue_full.put(frame_buf)
 
@@ -198,4 +197,5 @@ def start_capture_engine() -> _CaptureEngine:
     Sck.SCShareableContent.getShareableContentWithCompletionHandler_(
         on_shareable_content,
     )
+
     return capture_engine

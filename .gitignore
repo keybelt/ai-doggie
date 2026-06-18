@@ -3,3 +3,4 @@ data
 .venv
 .src_old
 .ds_store
+__pycache__

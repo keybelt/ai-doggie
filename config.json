@@ -4,7 +4,7 @@
             "srcHeightPx": 664,
             "srcWidthPx": 1176,
             "pipelineHeightPx": 332,
-            "pipelineWidthPx": 558
+            "pipelineWidthPx": 588
         },
         "queueDepth": 3,
         "fps": 120
@@ -36,7 +36,7 @@
     },
     "fileNames": {
         "datasetDirName": "data",
-        "checkpointName": "epoch_15.pt",
+        "checkpointName": "",
         "checkpointDirName": "checkpoints"
     },
     "training": {

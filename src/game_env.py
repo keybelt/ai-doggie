@@ -22,6 +22,7 @@ with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
 
 _CONFIG_CAPTURE = _CONFIG["capture"]
+CAPTURE_ENGINE_TIMEOUT: int = 10
 
 
 class _KeyboardController:
@@ -75,6 +76,10 @@ class GameEnv:
             (frame_height_px, frame_width_px, color_channel_depth),
             dtype=np.uint8,
         )
+
+        frame, _ = self.capture_engine.queue_full.get(timeout=CAPTURE_ENGINE_TIMEOUT)
+        self.capture_engine.queue_empty.put(frame)
+        print("Vision connected.")
 
     def clear_frame_queue(self):
         try:

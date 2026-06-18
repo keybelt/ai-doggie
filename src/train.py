@@ -96,22 +96,22 @@ class _DatasetGenerator(IterableDataset):
         Yields:
             The frames, action binaries, and whether the chunk is the first of the file.
         """
-        seq_len: int = _CONFIG_TRAINING["seqLen"]
-
         with np.load(filepath) as data:
             frames: np.ndarray
             actions_bin: np.ndarray
             frames, actions_bin = data["frames"], data["actions_bin"]
 
-            num_chunks = len(frames) // seq_len
+            num_chunks = (len(frames) - 1) // _CONFIG_TRAINING["seqLen"]
 
             # Chop up each file stream into chunks with length seq_len.
             for chunk_idx in range(num_chunks):
-                start_idx = chunk_idx * seq_len
+                start_idx = chunk_idx * _CONFIG_TRAINING["seqLen"]
 
-                chunk_frames: np.ndarray = frames[start_idx : start_idx + seq_len]
+                chunk_frames: np.ndarray = frames[
+                    start_idx : start_idx + _CONFIG_TRAINING["seqLen"]
+                ]
                 chunk_actions_bin: np.ndarray = actions_bin[
-                    start_idx : start_idx + seq_len + 1
+                    start_idx : start_idx + _CONFIG_TRAINING["seqLen"] + 1
                 ]
 
                 yield chunk_frames, chunk_actions_bin, (chunk_idx == 0)
