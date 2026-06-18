@@ -4,6 +4,7 @@ Example:
     $ python infer.py
 """
 
+import json
 import time
 from pathlib import Path
 
@@ -12,10 +13,12 @@ from jaxtyping import Float32
 from pynput.keyboard import Key, Listener
 from torch import Tensor
 
-from config import CONFIG as _CONFIG
 from game_env import GameEnv
 from policy_model import PolicyModel
 from type_defs import Frame
+
+with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
+    _CONFIG = json.load(f)
 
 _is_shutdown = False
 

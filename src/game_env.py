@@ -7,15 +7,19 @@ Example:
 """
 
 import atexit
+import json
 import queue
+from pathlib import Path
 
 import numpy as np
 import Quartz
 from AppKit import NSApplication
 
 from capture import _CaptureEngine, start_capture_engine
-from config import CONFIG as _CONFIG
 from type_defs import Frame, FramePackage
+
+with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
+    _CONFIG = json.load(f)
 
 _CONFIG_CAPTURE = _CONFIG["capture"]
 

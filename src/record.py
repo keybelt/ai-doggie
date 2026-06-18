@@ -18,9 +18,11 @@ import numpy as np
 from jaxtyping import UInt8
 from pynput.keyboard import Key, Listener
 
-from config import CONFIG as _CONFIG
 from game_env import GameEnv
 from type_defs import Frame, ParsedMacro
+
+with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
+    _CONFIG = json.load(f)
 
 _curr_action_bin = 0
 _is_shutdown = False

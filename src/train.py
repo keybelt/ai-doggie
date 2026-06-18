@@ -4,6 +4,7 @@ Example:
     $ python train.py
 """
 
+import json
 import random
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -14,8 +15,10 @@ from jaxtyping import Float32, Int64, UInt8
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
-from config import CONFIG as _CONFIG
 from policy_model import PolicyModel
+
+with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
+    _CONFIG = json.load(f)
 
 _CONFIG_TRAINING = _CONFIG["training"]
 

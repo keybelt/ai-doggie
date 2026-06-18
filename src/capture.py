@@ -10,7 +10,9 @@ Examples:
     >>> frame_drops = capture_engine.frame_drops
 """
 
+import json
 import queue
+from pathlib import Path
 from typing import Self, override
 
 import CoreMedia
@@ -21,8 +23,11 @@ import ScreenCaptureKit as Sck
 from Foundation import NSObject
 from libdispatch import dispatch_queue_create
 
-from config import CONFIG as _CONFIG
 from type_defs import Frame, FrameQueue
+
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+with _CONFIG_PATH.open() as f:
+    _CONFIG = json.load(f)
 
 _CONFIG_CAPTURE = _CONFIG["capture"]
 

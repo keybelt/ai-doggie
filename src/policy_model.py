@@ -5,12 +5,17 @@ Example:
     >>> model.load_state_dict(...)
 """
 
+import json
+from pathlib import Path
+
 import torch
 from jaxtyping import Float32
 from torch import Tensor, nn
 
-from config import CONFIG as _CONFIG
 from type_defs import ConvBias, ConvWeight
+
+with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
+    _CONFIG = json.load(f)
 
 _CONFIG_MODEL = _CONFIG["model"]
 
