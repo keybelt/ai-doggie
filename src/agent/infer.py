@@ -23,25 +23,29 @@ from type_defs import Frame
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
 
+_is_inferring = False
 _is_shutdown = False
 
 
-def _shutdown_on_press(key):
+def _on_press(key):
     global _is_shutdown
+    global _is_inferring
 
     if key == Key[_CONFIG["keys"]["exitKeyName"]]:
         _is_shutdown = True
+    elif key == Key[_CONFIG["keys"]["recordKeyName"]]:
+        _is_inferring = True
 
 
 def _infer():
     """Load model and weights, track frame drops and latency, and process model output."""
-    listener = Listener(on_press=_shutdown_on_press)
+    listener = Listener(on_press=_on_press)
     listener.start()
 
     hidden_state_dim = _CONFIG["model"]["hiddenDim"]
     device: torch.device = torch.device(_CONFIG["model"]["deviceName"])
 
-    base_dir = Path(__file__).resolve().parents[1]
+    base_dir = Path(__file__).resolve().parents[2]
     checkpoint_dir: Path = base_dir / _CONFIG["fileNames"]["checkpointDirName"]
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 
@@ -52,9 +56,6 @@ def _infer():
     )
 
     model.load_state_dict(checkpoint["model_state"])
-
-    print("Open Geometry Dash within 3 seconds.")
-    time.sleep(3)
 
     env: GameEnv = GameEnv()
 
@@ -68,8 +69,12 @@ def _infer():
 
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
     i = 0
+
     with torch.inference_mode():
         while not _is_shutdown:
+            if not _is_inferring:
+                continue
+
             i += 1
 
             frame_HWC: Frame
@@ -89,9 +94,8 @@ def _infer():
             infer_time: float = (time.perf_counter() - time_start) * 1000
 
             if i % log_interval == 0:
-                frame_drops = env.capture_engine.frame_drops
                 print(
-                    f"\rInference latency: {infer_time} | Frame drops: {frame_drops}",
+                    f"\rInference latency: {infer_time:.2f}ms | Frame drop rate: {}/s",
                     end="",
                     flush=True,
                 )
