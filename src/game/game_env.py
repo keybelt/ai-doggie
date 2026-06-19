@@ -13,9 +13,12 @@ from pathlib import Path
 
 import numpy as np
 import Quartz
+import sys
 from AppKit import NSApplication
 
-from capture import _CaptureEngine, start_capture_engine
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from game.screen_capture import _CaptureEngine, start_capture_engine
 from type_defs import Frame, FramePackage
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
@@ -77,7 +80,7 @@ class GameEnv:
             dtype=np.uint8,
         )
 
-        frame, _ = self.capture_engine.queue_full.get(timeout=CAPTURE_ENGINE_TIMEOUT)
+        frame = self.capture_engine.queue_full.get(timeout=CAPTURE_ENGINE_TIMEOUT)
         self.capture_engine.queue_empty.put(frame)
         print("Vision connected.")
 

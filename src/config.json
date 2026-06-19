@@ -40,7 +40,7 @@
         "checkpointDirName": "checkpoints"
     },
     "training": {
-        "batchSize": 8,
+        "batchSize": 1,
         "seqLen": 128,
         "learningRate": 1e-5,
         "beta1": 0.9,
@@ -50,7 +50,7 @@
         "epochs": 50
     },
     "keys": {
-        "exitKeyName": "esc",
+        "exitKeyName": "backspace",
         "recordKeyName": "space"
     },
     "shmName": "GDMem",

@@ -6,6 +6,7 @@ Example:
 
 import json
 import random
+import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -15,7 +16,9 @@ from jaxtyping import Float32, Int64, UInt8
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
-from policy_model import PolicyModel
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from agent.model import PolicyModel
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
@@ -36,7 +39,7 @@ class _DatasetGenerator(IterableDataset):
             Tuple of arrays of frames, action binaries, and is_first flags of the concatenated mini batches.
         """
         dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-        dataset_files_src: Path = Path(__file__).resolve().parents[1] / dataset_dir_name
+        dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
         dataset_files: list[Path] = list(dataset_files_src.glob("*.npz"))
         random.shuffle(dataset_files)
@@ -208,14 +211,20 @@ def _train():
         Path(__file__).resolve().parents[1] / _CONFIG["fileNames"]["checkpointDirName"]
     )
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
-    checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
-        checkpoint_dir / checkpoint_name,
-        map_location=device,
-    )
 
-    start_epoch: int = checkpoint["epoch"] + 1
-    model.load_state_dict(checkpoint["model_state"])
-    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    if checkpoint_name:
+        checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
+            checkpoint_dir / checkpoint_name,
+            map_location=device,
+        )
+
+        start_epoch: int = checkpoint["epoch"] + 1
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+
+        print(f"Loading checkpoint {checkpoint_name}.")
+    else:
+        start_epoch: int = 1
 
     for epoch in range(start_epoch, epochs + 1):
         epoch_loss: float = 0
@@ -230,9 +239,9 @@ def _train():
 
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
             # Note that the variables from dataloader are actually concatenated from different mini batches.
-            frames: np.ndarray
-            actions_bin: np.ndarray
-            are_first: np.ndarray
+            frames: Tensor
+            actions_bin: Tensor
+            are_first: Tensor
 
             vocab_size: int = _CONFIG["model"]["vocabSize"]
 
@@ -240,10 +249,7 @@ def _train():
 
             keep_hidden_mask = ~are_first
             keep_hidden_mask: Float32[Tensor, "N L D"] = (
-                torch.from_numpy(
-                    keep_hidden_mask,
-                )
-                .to(
+                keep_hidden_mask.to(
                     device,
                     dtype=torch.float32,
                 )
@@ -254,11 +260,9 @@ def _train():
             hidden_state = hidden_state * keep_hidden_mask
 
             frame_norm: Float32[Tensor, "N H W C"] = (
-                torch.from_numpy(frames).to(device, dtype=torch.float32) / 255
+                frames.to(device, dtype=torch.float32) / 255
             )
-            target_actions_bin: Int64[Tensor, "N seq_len"] = torch.from_numpy(
-                actions_bin[:, 1:],
-            ).to(
+            target_actions_bin: Int64[Tensor, "N seq_len"] = actions_bin[:, 1:].to(
                 device,
                 dtype=torch.long,
             )

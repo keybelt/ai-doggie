@@ -12,6 +12,7 @@ Examples:
 
 import json
 import queue
+import sys
 from pathlib import Path
 from typing import Self, override
 
@@ -22,6 +23,8 @@ import Quartz
 import ScreenCaptureKit as Sck
 from Foundation import NSObject
 from libdispatch import dispatch_queue_create
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from type_defs import Frame, FrameQueue
 
@@ -123,7 +126,7 @@ class _CaptureEngine(NSObject):
 
     def stop_capture_stream(self):
         if self.capture_stream:
-            self.capture_stream.stopCaptureWithCompletionHandler_()
+            self.capture_stream.stopCaptureWithCompletionHandler_(lambda err: None)
             self.capture_stream = None
 
 
@@ -132,8 +135,9 @@ def start_capture_engine() -> _CaptureEngine:
     # Initialize with .alloc().init() because it's an inheritance of NSObject.
     capture_engine: _CaptureEngine = _CaptureEngine.alloc().init()
 
-    def on_shareable_content(content: Sck.SCShareableContent) -> None:
+    def on_shareable_content(content: Sck.SCShareableContent, error) -> None:
         """Asynchronous function that handles the window configurations."""
+
         src_height_px = _CONFIG_CAPTURE["frameDims"]["srcHeightPx"]
         src_width_px = _CONFIG_CAPTURE["frameDims"]["srcWidthPx"]
 
@@ -179,7 +183,7 @@ def start_capture_engine() -> _CaptureEngine:
             print("Capture stream live.")
 
             # Create a background thread so the capture stream doesn't interrupt the main pipeline.
-            dispatch_queue = dispatch_queue_create(b"com.ai-doggie.capture")
+            dispatch_queue = dispatch_queue_create(b"com.ai-doggie.capture", None)
 
             # Tell the capture stream to send frames to the capture engine using type video.
             capture_stream.addStreamOutput_type_sampleHandlerQueue_error_(
@@ -188,7 +192,7 @@ def start_capture_engine() -> _CaptureEngine:
                 dispatch_queue,
                 None,
             )
-            capture_stream.startCaptureWithCompletionHandler_()
+            capture_stream.startCaptureWithCompletionHandler_(lambda err: None)
         except StopIteration:
             err_msg = "Geometry Dash window not found."
             raise Exception(err_msg) from StopIteration

@@ -60,6 +60,11 @@ class $modify(MyPlayLayer, PlayLayer) {
     return true;
   }
 
+  void resetLevel() {
+    PlayLayer::resetLevel();
+    isJumping = false;
+  }
+
   void onQuit() {
     closeShm();
     PlayLayer::onQuit();
@@ -104,8 +109,6 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
         return;
     }
 
-    // Python expects halved frame index for whatever reason I forgot (probably
-    // macro related).
     int frameIdx = m_gameState.m_currentProgress / 2;
 
     data->currActionBin = 0;

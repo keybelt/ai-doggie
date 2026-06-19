@@ -6,6 +6,7 @@ Example:
 """
 
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -13,12 +14,14 @@ from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from struct import pack, unpack
 
-import msgpack
 import numpy as np
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from jaxtyping import UInt8
 from pynput.keyboard import Key, Listener
 
-from game_env import GameEnv
+from game.game_env import GameEnv
 from type_defs import Frame, ParsedMacro
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
@@ -45,23 +48,17 @@ def _on_press(key):
 
 
 def _load_macro(filepath: str) -> ParsedMacro:
-    """Unpack .gdr macro files with a modified version of maxnut/gdr-converter's algorithm.
+    """Unpack .gdr macro files using the C++ parser.
 
     Returns:
         actions in format (frame, action).
     """
     macro_events: ParsedMacro = []
 
-    macro_data = Path(filepath).read_bytes()
+    cli_path = Path(__file__).parent.parent / "gdreplayformat" / "macro_parser"
 
-    try:
-        # Unpack with utf8 decoding.
-        parsed_macro = json.loads(macro_data.decode("utf-8-sig"))
-        print("Macro parsed using JSON.")
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        # Unpack from bytes.
-        parsed_macro = msgpack.unpackb(macro_data, raw=False)
-        print("Macro parsed using msgpack.")
+    result = subprocess.run([str(cli_path), filepath], capture_output=True, text=True)
+    parsed_macro = json.loads(result.stdout)
 
     macro_fps = parsed_macro.get("framerate")
     print(f"Macro FPS: {macro_fps}.")
@@ -69,10 +66,10 @@ def _load_macro(filepath: str) -> ParsedMacro:
     for macro_input in parsed_macro.get("inputs", []):
         frame_idx = macro_input["frame"]
         mouse_btn: int = macro_input["btn"]
-        is_player2 = macro_input["2p"]
         is_keydown = macro_input["down"]
+        is_p2 = macro_input.get("2p", False)
 
-        if mouse_btn == 1 and not is_player2:
+        if mouse_btn == 1 and not is_p2:
             if macro_fps != _CONFIG["macroFps"]:
                 frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
 
@@ -105,10 +102,15 @@ def _shm_bridge(macro_events: ParsedMacro):
 
     while not _is_shutdown:
         # Extract as integer (i).
-        action_ready_bin = unpack("i", shm.buf[8:12])[0]
+        frame_ready_bin = unpack("i", shm.buf[8:12])[0]
 
-        if action_ready_bin == 1:
+        if frame_ready_bin == 1:
             frame_idx = unpack("i", shm.buf[0:4])[0]
+
+            # Reset event index on respawn / level restart
+            if frame_idx < 5:
+                event_idx = 0
+                _curr_action_bin = 0
 
             # Only passes if there are macro events left over, and if our current frame matches or is ahead of the macro event's frame.
             while (
@@ -120,10 +122,10 @@ def _shm_bridge(macro_events: ParsedMacro):
 
             # 4:8 - Current action. 12:16 - Python acknowledgement
             shm.buf[4:8] = pack("i", _curr_action_bin)
-            shm.buf[12:16] = pack("i", 1)
             shm.buf[8:12] = pack("i", 0)
+            shm.buf[12:16] = pack("i", 1)
         else:
-            time.sleep(0.001)
+            time.sleep(0)
 
     shm.close()
     shm.unlink()
@@ -182,7 +184,7 @@ def _record(macro_name: str):
         frames=frames_buf[:frame_idx],
         actions_bin=actions_bin_buf[: frame_idx + 1],
     )
-    print(f"Saved recording to {save_path}")
+    print(f"\nSaved recording to {save_path}")
 
     game_env.capture_engine.stop_capture_stream()
 

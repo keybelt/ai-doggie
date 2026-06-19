@@ -10,7 +10,10 @@ from pathlib import Path
 
 import torch
 from jaxtyping import Float32
+import sys
 from torch import Tensor, nn
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from type_defs import ConvBias, ConvWeight
 

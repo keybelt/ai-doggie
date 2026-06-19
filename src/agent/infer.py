@@ -5,6 +5,7 @@ Example:
 """
 
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -13,8 +14,10 @@ from jaxtyping import Float32
 from pynput.keyboard import Key, Listener
 from torch import Tensor
 
-from game_env import GameEnv
-from policy_model import PolicyModel
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from agent.model import PolicyModel
+from game.game_env import GameEnv
 from type_defs import Frame
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
