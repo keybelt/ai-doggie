@@ -55,7 +55,7 @@ def _load_macro(filepath: str) -> ParsedMacro:
     """
     macro_events: ParsedMacro = []
 
-    cli_path = Path(__file__).parent.parent / "gdreplayformat" / "macro_parser"
+    cli_path = Path(__file__).parent.parent.parent / "third_party" / "macro_parser"
 
     result = subprocess.run([str(cli_path), filepath], capture_output=True, text=True)
     parsed_macro = json.loads(result.stdout)
@@ -67,9 +67,9 @@ def _load_macro(filepath: str) -> ParsedMacro:
         frame_idx = macro_input["frame"]
         mouse_btn: int = macro_input["btn"]
         is_keydown = macro_input["down"]
-        is_p2 = macro_input.get("2p", False)
+        # is_p2 = macro_input.get("2p", False)
 
-        if mouse_btn == 1 and not is_p2:
+        if mouse_btn == 1:  # and not is_p2:
             if macro_fps != _CONFIG["macroFps"]:
                 frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
 
@@ -139,7 +139,7 @@ def _record(macro_name: str):
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
 
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-    dataset_dir: Path = Path(__file__).resolve().parents[1] / dataset_dir_name
+    dataset_dir: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
     macro_events: ParsedMacro = _load_macro(macro_name)
 
@@ -178,6 +178,12 @@ def _record(macro_name: str):
             if frame_idx % log_interval == 0:
                 print(f"\rRecord frames: {frame_idx}", end="", flush=True)
 
+    game_env.capture_engine.stop_capture_stream()
+
+    should_save: bool = input("Save this recording?")
+    if not should_save:
+        return
+
     save_path = dataset_dir / f"{macro_name}-{time.strftime('%m%d%H%M%S')}"
     np.savez_compressed(
         save_path,
@@ -185,8 +191,6 @@ def _record(macro_name: str):
         actions_bin=actions_bin_buf[: frame_idx + 1],
     )
     print(f"\nSaved recording to {save_path}")
-
-    game_env.capture_engine.stop_capture_stream()
 
 
 if __name__ == "__main__":
