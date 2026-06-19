@@ -86,6 +86,9 @@ class _CaptureEngine(NSObject):
                 sample_buffer,
             )
 
+            if frame_px is None:
+                return
+
             try:
                 frame_buf: Frame = self.queue_empty.get_nowait()
             except queue.Empty:

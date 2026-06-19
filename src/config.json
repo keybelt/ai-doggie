@@ -36,7 +36,7 @@
     },
     "fileNames": {
         "datasetDirName": "data",
-        "checkpointName": "epoch_50.pt",
+        "checkpointName": "epoch_1000.pt",
         "checkpointDirName": "checkpoints"
     },
     "training": {
@@ -46,8 +46,8 @@
         "beta1": 0.9,
         "beta2": 0.99,
         "weightDecay": 0,
-        "checkpointSaveInterval": 25,
-        "epochs": 500
+        "checkpointSaveInterval": 50,
+        "epochs": 1000
     },
     "keys": {
         "exitKeyName": "backspace",
@@ -55,6 +55,6 @@
     },
     "shmName": "GDMem",
     "bufMaxFrames": 50000,
-    "logIntervalSec": 0.5,
+    "logIntervalSec": 1,
     "macroFps": 240
 }
