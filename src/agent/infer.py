@@ -68,8 +68,10 @@ def _infer():
     curr_action_bin = 0
 
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
-    i = 0
+    now = time.perf_counter()
+    frame_drop_cache = env.capture_engine.frame_drops
 
+    i = 0
     with torch.inference_mode():
         while not _is_shutdown:
             if not _is_inferring:
@@ -94,10 +96,16 @@ def _infer():
             infer_time: float = (time.perf_counter() - time_start) * 1000
 
             if i % log_interval == 0:
+                elapsed = time.perf_counter() - now
+                drops = env.capture_engine.frame_drops - frame_drop_cache
                 print(
-                    f"\rInference latency: {infer_time:.2f}ms | Frame drop rate: {}/s",
+                    f"\rInference latency: {infer_time:.2f}ms | Frame drop rate: {drops / elapsed:.2f}/s",
                     end="",
                     flush=True,
+                )
+                now, frame_drop_cache = (
+                    time.perf_counter(),
+                    env.capture_engine.frame_drops,
                 )
 
     env.capture_engine.stop_capture_stream()
