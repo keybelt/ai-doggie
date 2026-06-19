@@ -180,11 +180,11 @@ def _record(macro_name: str):
 
     game_env.capture_engine.stop_capture_stream()
 
-    should_save: bool = input("Save this recording?")
-    if not should_save:
+    should_save: str = input("\nSave this recording? (Y/n): ")
+    if should_save == "n":
         return
 
-    save_path = dataset_dir / f"{macro_name}-{time.strftime('%m%d%H%M%S')}"
+    save_path = dataset_dir / f"{Path(macro_name).name}-{time.strftime('%m%d%H%M%S')}"
     np.savez_compressed(
         save_path,
         frames=frames_buf[:frame_idx],
