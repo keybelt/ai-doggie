@@ -36,7 +36,7 @@
     },
     "fileNames": {
         "datasetDirName": "data",
-        "checkpointName": "",
+        "checkpointName": "epoch_50.pt",
         "checkpointDirName": "checkpoints"
     },
     "training": {
@@ -46,8 +46,8 @@
         "beta1": 0.9,
         "beta2": 0.99,
         "weightDecay": 0,
-        "checkpointSaveInterval": 5,
-        "epochs": 50
+        "checkpointSaveInterval": 25,
+        "epochs": 500
     },
     "keys": {
         "exitKeyName": "backspace",

@@ -208,7 +208,7 @@ def _train():
     optimizer: _AdamW = _AdamW(model.parameters())
 
     checkpoint_dir = (
-        Path(__file__).resolve().parents[1] / _CONFIG["fileNames"]["checkpointDirName"]
+        Path(__file__).resolve().parents[2] / _CONFIG["fileNames"]["checkpointDirName"]
     )
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 

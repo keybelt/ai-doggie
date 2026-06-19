@@ -1,3 +1,5 @@
+// Original file is maxnut/GDReplayFormat/include/gdr/binarystream.hpp.
+
 #pragma once
 
 #include <algorithm>

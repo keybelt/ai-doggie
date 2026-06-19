@@ -1,3 +1,6 @@
+// Original file is maxnut/GDReplayFormat/include/gdr/gdr.hpp.
+// Modification starts on line 500, to integrate with my python pipeline.
+
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -511,7 +514,6 @@ int main(int argc, char **argv) {
 
   auto &replay = result.unwrap();
 
-  // Print out JSON format matching what Python expects
   std::cout << "{\n";
   std::cout << "  \"framerate\": " << replay.framerate << ",\n";
   std::cout << "  \"inputs\": [\n";
