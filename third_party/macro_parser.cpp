@@ -1,5 +1,5 @@
 // Original file is maxnut/GDReplayFormat/include/gdr/gdr.hpp.
-// Modification starts on line 500, to integrate with my python pipeline.
+// Modification starts on line 503, to integrate with my python pipeline.
 
 #include <array>
 #include <cstdint>
