@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from jaxtyping import Float32, Int64, UInt8
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
@@ -183,18 +184,6 @@ class _AdamW:
         self._v = state_dict["var"]
 
 
-def _softmax(logits: Float32[Tensor, "N V"]) -> Float32[Tensor, "N V"]:
-    logits_exp_stable = torch.exp(logits - logits.max(dim=1, keepdim=True).values)
-    return logits_exp_stable / torch.sum(logits_exp_stable, dim=1, keepdim=True)
-
-
-def _cross_entropy(
-    logits: Float32[Tensor, "N V"],
-    target: Int64[Tensor, "actions"],
-) -> Tensor:
-    batches = torch.arange(target.shape[0], device=target.device)
-    return -torch.log(_softmax(logits)[batches, target]).mean()
-
 
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
@@ -282,11 +271,12 @@ def _train():
                 -1,
             )
 
-            loss: Tensor = _cross_entropy(
-                logits=logits,
-                target=target_actions,
+            loss: Tensor = F.cross_entropy(
+                logits,
+                target_actions,
             )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.clear_grad()
 

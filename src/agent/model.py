@@ -124,21 +124,6 @@ class PolicyModel(nn.Module):
             torch.zeros(self._vocab_size),
         )
 
-    @staticmethod
-    def _relu(X: Float32[Tensor, "N H_out W_out C_out"]):
-        return torch.maximum(torch.zeros_like(X), X)
-
-    @staticmethod
-    def _sigmoid(X: Float32[Tensor, "N D"]):
-        X_exp = torch.exp(-X)
-        return 1 / (1 + X_exp)
-
-    @staticmethod
-    def _tanh(X: Float32[Tensor, "N D"]):
-        X_exp_positive = torch.exp(X)
-        X_exp_negative = torch.exp(-X)
-
-        return (X_exp_positive - X_exp_negative) / (X_exp_positive + X_exp_negative)
 
     @staticmethod
     def _calculate_out_dim(
@@ -241,7 +226,7 @@ class PolicyModel(nn.Module):
         X: Float32[Tensor, "N H W C"],
     ) -> Float32[Tensor, "N H W C"]:
         """3 convolution layers, 2 max pooling layers, ReLU activation."""
-        X = self._relu(
+        X = torch.relu(
             self._conv(
                 X,
                 W=self._conv1_W,
@@ -251,7 +236,7 @@ class PolicyModel(nn.Module):
         )
         X = self._maxpool(X, kernel_size=2, stride=2)
 
-        X = self._relu(
+        X = torch.relu(
             self._conv(
                 X,
                 W=self._conv2_W,
@@ -261,7 +246,7 @@ class PolicyModel(nn.Module):
         )
         X = self._maxpool(X, kernel_size=2, stride=2)
 
-        return self._relu(
+        return torch.relu(
             self._conv(
                 X,
                 W=self._conv3_W,
@@ -291,9 +276,9 @@ class PolicyModel(nn.Module):
         r_in, z_in, h_tilde_in = in_combined.chunk(3, dim=-1)
         r_hidden, z_hidden, h_tilde_hidden = hidden_combined.chunk(3, dim=-1)
 
-        r = self._sigmoid(r_in + r_hidden)
-        z = self._sigmoid(z_in + z_hidden)
-        h_tilde = self._tanh(h_tilde_in + h_tilde_hidden * r)
+        r = torch.sigmoid(r_in + r_hidden)
+        z = torch.sigmoid(z_in + z_hidden)
+        h_tilde = torch.tanh(h_tilde_in + h_tilde_hidden * r)
 
         return (1 - z) * h_tilde + prev_h * z
 
@@ -315,7 +300,7 @@ class PolicyModel(nn.Module):
 
         X_flat = X_conv.view(N * T, -1)
 
-        X_proj: Float32[Tensor, "N_nonsequential D"] = self._relu(
+        X_proj: Float32[Tensor, "N_nonsequential D"] = torch.relu(
             X_flat @ self._fc_W.T + self._fc_b,
         )
 
