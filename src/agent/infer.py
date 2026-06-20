@@ -102,7 +102,7 @@ def _infer():
                 elapsed = time.perf_counter() - now
                 drops = env.capture_engine.frame_drops - frame_drop_cache
                 print(
-                    f"\rInference latency: {infer_time:.2f}ms | Frame drop rate: {drops / elapsed:.2f}/s",
+                    f"\rInference latency: {infer_time:.2f}ms | Frame drops: {drops / elapsed:.2f}/s",
                     end="",
                     flush=True,
                 )
