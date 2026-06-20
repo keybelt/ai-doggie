@@ -56,6 +56,9 @@ def _infer():
     )
 
     model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+
+    model = torch.compile(model)
 
     env: GameEnv = GameEnv()
 

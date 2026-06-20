@@ -13,19 +13,25 @@
         "weightShapes": {
             "conv1": {
                 "inChannels": 3,
-                "outChannels": 16,
+                "outChannels": 32,
                 "kernelSize": 8,
                 "stride": 4
             },
             "conv2": {
-                "inChannels": 16,
-                "outChannels": 32,
+                "inChannels": 32,
+                "outChannels": 64,
                 "kernelSize": 4,
                 "stride": 2
             },
             "conv3": {
-                "inChannels": 32,
-                "outChannels": 32,
+                "inChannels": 64,
+                "outChannels": 128,
+                "kernelSize": 3,
+                "stride": 2
+            },
+            "conv4": {
+                "inChannels": 128,
+                "outChannels": 128,
                 "kernelSize": 3,
                 "stride": 1
             }
@@ -36,18 +42,20 @@
     },
     "fileNames": {
         "datasetDirName": "data",
-        "checkpointName": "epoch_1000.pt",
+        "checkpointName": "",
         "checkpointDirName": "checkpoints"
     },
     "training": {
-        "batchSize": 1,
-        "seqLen": 128,
-        "learningRate": 1e-5,
+        "batchSize": 8,
+        "seqLen": 256,
+        "learningRate": 3e-4,
         "beta1": 0.9,
-        "beta2": 0.99,
-        "weightDecay": 0,
+        "beta2": 0.999,
+        "weightDecay": 1e-4,
+        "warmupSteps": 1000,
         "checkpointSaveInterval": 50,
-        "epochs": 1000
+        "epochs": 5000,
+        "gradAccumSteps": 4
     },
     "keys": {
         "exitKeyName": "backspace",

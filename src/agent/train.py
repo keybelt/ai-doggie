@@ -7,7 +7,7 @@ Example:
 import json
 import random
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -121,68 +121,48 @@ class _DatasetGenerator(IterableDataset):
                 yield chunk_frames, chunk_actions_bin, (chunk_idx == 0)
 
 
-class _AdamW:
-    """Manual implementation of the AdamW optimizer."""
-
-    def __init__(self, params: Iterable[Tensor]):
-        """Initialize the model parameters, first and second moments."""
-        self._params: list[Tensor] = list(params)
-
-        self._m: list[Tensor] = [torch.zeros_like(p) for p in self._params]
-        self._v: list[Tensor] = [torch.zeros_like(p) for p in self._params]
-
-        self.step_idx = 1
-
-    # Ensure autograd graph doesn't get contaminated from tensor ops.
-    @torch.no_grad()
-    def step(self):
-        """Perform a parameter update step."""
-        beta1: float = _CONFIG_TRAINING["beta1"]
-        beta2: float = _CONFIG_TRAINING["beta2"]
-        W_decay: float = _CONFIG_TRAINING["weightDecay"]
-
-        for i, param in enumerate(self._params):
-            grad = param.grad
-            if grad is None:
-                err_msg = "Parameter has no gradient."
-                raise Exception(err_msg)
-
-            # Store the pre-corrected moments.
-            self._m[i] = beta1 * self._m[i] + (1 - beta1) * grad
-            self._v[i] = beta2 * self._v[i] + (1 - beta2) * (grad**2)
-
-            # Correct bias introduced with 0-intialization.
-            m_hat: Tensor = self._m[i] / (1 - beta1**self.step_idx)
-            v_hat: Tensor = self._v[i] / (1 - beta2**self.step_idx)
-
-            param_adam = self._params[i] - LR * m_hat / (torch.sqrt(v_hat) + 1e-8)
-
-            # Apply decoupled weight decay.
-            self._params[i].copy_(param_adam - LR * W_decay * param)
-
-        self.step_idx += 1
-
-    def clear_grad(self):
-        for param in self._params:
-            param.grad = None
-
-    def get_state_dict(self) -> dict[str, int | list[Tensor]]:
-        """Return the optimizer state.
-
-        Returns:
-            Dictionary of the step count, 1st, and 2nd moments.
-        """
-        return {
-            "step_idx": self.step_idx,
-            "mean": self._m,
-            "var": self._v,
-        }
-
-    def load_state_dict(self, state_dict: dict[str, int | list[Tensor]]):
-        self.step_idx = state_dict["step_idx"]
-        self._m = state_dict["mean"]
-        self._v = state_dict["var"]
-
+# class _AdamW:
+#     """Manual implementation of the AdamW optimizer."""
+#
+#     def __init__(self, params):
+#         self._params = list(params)
+#         self._m = [torch.zeros_like(p) for p in self._params]
+#         self._v = [torch.zeros_like(p) for p in self._params]
+#         self.step_idx = 1
+#
+#     @torch.no_grad()
+#     def step(self):
+#         beta1 = _CONFIG_TRAINING["beta1"]
+#         beta2 = _CONFIG_TRAINING["beta2"]
+#         W_decay = _CONFIG_TRAINING["weightDecay"]
+#
+#         for i, param in enumerate(self._params):
+#             grad = param.grad
+#             if grad is None:
+#                 raise Exception("Parameter has no gradient.")
+#
+#             self._m[i] = beta1 * self._m[i] + (1 - beta1) * grad
+#             self._v[i] = beta2 * self._v[i] + (1 - beta2) * (grad**2)
+#
+#             m_hat = self._m[i] / (1 - beta1**self.step_idx)
+#             v_hat = self._v[i] / (1 - beta2**self.step_idx)
+#
+#             param_adam = self._params[i] - LR * m_hat / (torch.sqrt(v_hat) + 1e-8)
+#             self._params[i].copy_(param_adam - LR * W_decay * param)
+#
+#         self.step_idx += 1
+#
+#     def clear_grad(self):
+#         for param in self._params:
+#             param.grad = None
+#
+#     def get_state_dict(self):
+#         return {"step_idx": self.step_idx, "mean": self._m, "var": self._v}
+#
+#     def load_state_dict(self, state_dict):
+#         self.step_idx = state_dict["step_idx"]
+#         self._m = state_dict["mean"]
+#         self._v = state_dict["var"]
 
 
 def _train():
@@ -194,7 +174,13 @@ def _train():
 
     dataloader: DataLoader = DataLoader(_DatasetGenerator(), batch_size=None)
     model: PolicyModel = PolicyModel().to(device)
-    optimizer: _AdamW = _AdamW(model.parameters())
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        betas=(_CONFIG_TRAINING["beta1"], _CONFIG_TRAINING["beta2"]),
+        weight_decay=_CONFIG_TRAINING["weightDecay"],
+    )
 
     checkpoint_dir = (
         Path(__file__).resolve().parents[2] / _CONFIG["fileNames"]["checkpointDirName"]
@@ -278,7 +264,7 @@ def _train():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            optimizer.clear_grad()
+            optimizer.zero_grad()
 
             epoch_loss += loss.item()
 
@@ -291,7 +277,7 @@ def _train():
                 {
                     "epoch": epoch,
                     "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.get_state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
                     "loss": avg_loss,
                 },
                 checkpoint_path,
