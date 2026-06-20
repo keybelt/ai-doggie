@@ -38,7 +38,7 @@ class PolicyModel(nn.Module):
             kernel_size=shapes["conv1"]["kernelSize"],
             stride=shapes["conv1"]["stride"],
         )
-        self.bn1 = nn.BatchNorm2d(shapes["conv1"]["outChannels"])
+        self.batch_norm1 = nn.BatchNorm2d(shapes["conv1"]["outChannels"])
 
         self.conv2 = nn.Conv2d(
             shapes["conv2"]["inChannels"],
@@ -46,7 +46,7 @@ class PolicyModel(nn.Module):
             kernel_size=shapes["conv2"]["kernelSize"],
             stride=shapes["conv2"]["stride"],
         )
-        self.bn2 = nn.BatchNorm2d(shapes["conv2"]["outChannels"])
+        self.batch_norm2 = nn.BatchNorm2d(shapes["conv2"]["outChannels"])
 
         self.conv3 = nn.Conv2d(
             shapes["conv3"]["inChannels"],
@@ -54,7 +54,7 @@ class PolicyModel(nn.Module):
             kernel_size=shapes["conv3"]["kernelSize"],
             stride=shapes["conv3"]["stride"],
         )
-        self.bn3 = nn.BatchNorm2d(shapes["conv3"]["outChannels"])
+        self.batch_norm3 = nn.BatchNorm2d(shapes["conv3"]["outChannels"])
 
         self.conv4 = nn.Conv2d(
             shapes["conv4"]["inChannels"],
@@ -62,7 +62,7 @@ class PolicyModel(nn.Module):
             kernel_size=shapes["conv4"]["kernelSize"],
             stride=shapes["conv4"]["stride"],
         )
-        self.bn4 = nn.BatchNorm2d(shapes["conv4"]["outChannels"])
+        self.batch_norm4 = nn.BatchNorm2d(shapes["conv4"]["outChannels"])
 
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
@@ -89,9 +89,9 @@ class PolicyModel(nn.Module):
             nn.Linear(64, self._vocab_size),
         )
 
-        self._init_weights()
+        self._init_params()
 
-    def _init_weights(self):
+    def _init_params(self):
         """He/Kaiming init for conv+ReLU, Xavier for GRU, default for output."""
         for module in [self.conv1, self.conv2, self.conv3, self.conv4]:
             nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
@@ -115,10 +115,10 @@ class PolicyModel(nn.Module):
         X: Float32[Tensor, "N C H W"],
     ) -> Float32[Tensor, "N C H W"]:
         """4 conv layers with batch norm, ReLU, and 2 max pooling layers."""
-        X = self.pool(torch.relu(self.bn1(self.conv1(X))))
-        X = self.pool(torch.relu(self.bn2(self.conv2(X))))
-        X = torch.relu(self.bn3(self.conv3(X)))
-        X = torch.relu(self.bn4(self.conv4(X)))
+        X = self.pool(torch.relu(self.batch_norm1(self.conv1(X))))
+        X = self.pool(torch.relu(self.batch_norm2(self.conv2(X))))
+        X = torch.relu(self.batch_norm3(self.conv3(X)))
+        X = torch.relu(self.batch_norm4(self.conv4(X)))
         return X
 
     def forward(
