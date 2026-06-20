@@ -1,7 +1,7 @@
 """Contains the custom CNN + GRU model.
 
 Example:
-    >>> model = PolicyModel()
+    >>> model = Model()
     >>> model.load_state_dict(...)
 """
 
@@ -21,8 +21,8 @@ with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
 _CONFIG_MODEL = _CONFIG["model"]
 
 
-class PolicyModel(nn.Module):
-    """Lightweight 3 layer CNN with a GRU policy."""
+class Model(nn.Module):
+    """CNN + GRU policy model."""
 
     def __init__(self):
         """Initialize hidden dim, all weights and biases, and calculate flat size."""
@@ -32,39 +32,35 @@ class PolicyModel(nn.Module):
 
         shapes = _CONFIG_MODEL["weightShapes"]
 
-        self.conv1 = nn.Conv2d(
+        self._conv1 = nn.Conv2d(
             shapes["conv1"]["inChannels"],
             shapes["conv1"]["outChannels"],
             kernel_size=shapes["conv1"]["kernelSize"],
             stride=shapes["conv1"]["stride"],
         )
-        
 
-        self.conv2 = nn.Conv2d(
+        self._conv2 = nn.Conv2d(
             shapes["conv2"]["inChannels"],
             shapes["conv2"]["outChannels"],
             kernel_size=shapes["conv2"]["kernelSize"],
             stride=shapes["conv2"]["stride"],
         )
-        
 
-        self.conv3 = nn.Conv2d(
+        self._conv3 = nn.Conv2d(
             shapes["conv3"]["inChannels"],
             shapes["conv3"]["outChannels"],
             kernel_size=shapes["conv3"]["kernelSize"],
             stride=shapes["conv3"]["stride"],
         )
-        
 
-        self.conv4 = nn.Conv2d(
+        self._conv4 = nn.Conv2d(
             shapes["conv4"]["inChannels"],
             shapes["conv4"]["outChannels"],
             kernel_size=shapes["conv4"]["kernelSize"],
             stride=shapes["conv4"]["stride"],
         )
-        
 
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self._pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # Dynamically calculate flattened size.
         with torch.inference_mode():
@@ -79,11 +75,11 @@ class PolicyModel(nn.Module):
             )
             flat_size = self._conv_forward(dummy).numel()
 
-        self.fc = nn.Linear(flat_size, self._hidden_dim)
+        self._fc = nn.Linear(flat_size, self._hidden_dim)
 
-        self.gru_cell = nn.GRUCell(self._hidden_dim, self._hidden_dim)
+        self._gru = nn.GRU(self._hidden_dim, self._hidden_dim, batch_first=True)
 
-        self.policy_head = nn.Sequential(
+        self._policy_head = nn.Sequential(
             nn.Linear(self._hidden_dim, 64),
             nn.ReLU(),
             nn.Linear(64, self._vocab_size),
@@ -93,38 +89,38 @@ class PolicyModel(nn.Module):
 
     def _init_params(self):
         """He/Kaiming init for conv+ReLU, Xavier for GRU, default for output."""
-        for module in [self.conv1, self.conv2, self.conv3, self.conv4]:
+        for module in [self._conv1, self._conv2, self._conv3, self._conv4]:
             nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
             nn.init.zeros_(module.bias)
 
-        nn.init.kaiming_normal_(self.fc.weight, nonlinearity="relu")
-        nn.init.zeros_(self.fc.bias)
+        nn.init.kaiming_normal_(self._fc.weight, nonlinearity="relu")
+        nn.init.zeros_(self._fc.bias)
 
-        nn.init.xavier_uniform_(self.gru_cell.weight_ih)
-        nn.init.xavier_uniform_(self.gru_cell.weight_hh)
-        nn.init.zeros_(self.gru_cell.bias_ih)
-        nn.init.zeros_(self.gru_cell.bias_hh)
+        nn.init.xavier_uniform_(self._gru.weight_ih_l0)
+        nn.init.xavier_uniform_(self._gru.weight_hh_l0)
+        nn.init.zeros_(self._gru.bias_ih_l0)
+        nn.init.zeros_(self._gru.bias_hh_l0)
 
-        nn.init.kaiming_normal_(self.policy_head[0].weight, nonlinearity="relu")
-        nn.init.zeros_(self.policy_head[0].bias)
-        nn.init.xavier_uniform_(self.policy_head[2].weight)
-        nn.init.zeros_(self.policy_head[2].bias)
+        nn.init.kaiming_normal_(self._policy_head[0].weight, nonlinearity="relu")
+        nn.init.zeros_(self._policy_head[0].bias)
+        nn.init.xavier_uniform_(self._policy_head[2].weight)
+        nn.init.zeros_(self._policy_head[2].bias)
 
     def _conv_forward(
         self,
         X: Float32[Tensor, "N C H W"],
     ) -> Float32[Tensor, "N C H W"]:
         """4 conv layers with batch norm, ReLU, and 2 max pooling layers."""
-        X = self.pool(torch.relu(self.conv1(X)))
-        X = self.pool(torch.relu(self.conv2(X)))
-        X = torch.relu(self.conv3(X))
-        X = torch.relu(self.conv4(X))
+        X = self._pool(torch.relu(self._conv1(X)))
+        X = self._pool(torch.relu(self._conv2(X)))
+        X = torch.relu(self._conv3(X))
+        X = torch.relu(self._conv4(X))
         return X
 
     def forward(
         self,
         X: Float32[Tensor, "N T H W C"],
-        prev_hidden_state: Float32[Tensor, "N L D"],
+        prev_h: Float32[Tensor, "N L D"],
     ) -> tuple[Float32[Tensor, "N T V"], Float32[Tensor, "N L D"]]:
         """Pass inputs through CNN + GRU + policy head.
 
@@ -139,35 +135,23 @@ class PolicyModel(nn.Module):
         X_conv = self._conv_forward(X)
 
         X_flat = X_conv.reshape(N * T, -1)
-
-        X_proj: Float32[Tensor, "N_nonsequential D"] = torch.relu(self.fc(X_flat))
-
+        X_proj: Float32[Tensor, "N_nonsequential D"] = torch.relu(self._fc(X_flat))
         X_proj = X_proj.view(N, T, self._hidden_dim)
 
-        # Extract hidden_state from layer.
-        h = prev_hidden_state[:, 0, :]
-
-        h_states = []
-
-        for t in range(T):
-            # Only pass the input tensor for the current timestep.
-            h = self.gru_cell(X_proj[:, t, :], h)
-
-            # Add a time axis for sequential processing.
-            h_states.append(h.unsqueeze(1))
-
-        gru_out: Float32[Tensor, "N T D"] = torch.cat(h_states, dim=1)
-
-        gru_out = gru_out.view(N * T, self._hidden_dim)
-
-        logits_nonsequential: Float32[Tensor, "N_nonsequential V"] = self.policy_head(
-            gru_out,
+        gru_out: Float32[Tensor, "N T D"]
+        gru_out, h = self._gru(
+            X_proj,
+            # nn.GRU expects (L, N, D).
+            prev_h.transpose(0, 1).contiguous(),
         )
 
+        gru_out = gru_out.reshape(N * T, -1)
+        logits_nonsequential: Float32[Tensor, "N_nonsequential V"] = self._policy_head(
+            gru_out
+        )
         logits = logits_nonsequential.view(N, T, self._vocab_size)
 
-        # Hidden state needs the L axis back.
-        return logits, h.unsqueeze(1)
+        return logits, h.transpose(0, 1).contiguous()
 
 
 # from type_defs import ConvBias, ConvWeight

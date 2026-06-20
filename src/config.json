@@ -42,18 +42,18 @@
     },
     "fileNames": {
         "datasetDirName": "data",
-        "checkpointName": "",
+        "checkpointName": "epoch_200.pt",
         "checkpointDirName": "checkpoints"
     },
     "training": {
-        "batchSize": 8,
-        "seqLen": 256,
-        "learningRate": 3e-4,
+        "batchSize": 4,
+        "seqLen": 512,
+        "learningRate": 1e-4,
         "beta1": 0.9,
         "beta2": 0.999,
         "weightDecay": 1e-4,
-        "checkpointSaveInterval": 50,
-        "epochs": 5000
+        "checkpointSaveInterval": 100,
+        "epochs": 2500
     },
     "keys": {
         "exitKeyName": "backspace",

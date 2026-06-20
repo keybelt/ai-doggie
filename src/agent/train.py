@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from agent.model import PolicyModel
+from agent.model import Model
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
@@ -173,7 +173,7 @@ def _train():
     checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
 
     dataloader: DataLoader = DataLoader(_DatasetGenerator(), batch_size=None)
-    model: PolicyModel = PolicyModel().to(device)
+    model: Model = Model().to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -257,9 +257,11 @@ def _train():
                 -1,
             )
 
+            weights = torch.tensor([0.6897, 1.8175], device=device, dtype=torch.float32)
             loss: Tensor = F.cross_entropy(
                 logits,
                 target_actions,
+                weight=weights,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

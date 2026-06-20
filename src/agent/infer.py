@@ -6,8 +6,11 @@ Example:
 
 import json
 import sys
+import threading
 import time
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
+from struct import pack, unpack
 
 import torch
 from jaxtyping import Float32
@@ -16,7 +19,7 @@ from torch import Tensor
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from agent.model import PolicyModel
+from agent.model import Model
 from game.game_env import GameEnv
 from type_defs import Frame
 
@@ -25,6 +28,7 @@ with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
 
 _is_inferring = False
 _is_shutdown = False
+_curr_action_bin = 0
 
 
 def _on_press(key):
@@ -37,10 +41,46 @@ def _on_press(key):
         _is_inferring = True
 
 
+def _init_shm():
+    """Initialize a shared memory block between this script and the c++ mod."""
+    global _curr_action_bin
+
+    shm_name = _CONFIG["shmName"]
+    try:
+        shm = SharedMemory(name=shm_name)
+        shm.buf[0:16] = bytes(16)
+    except FileNotFoundError:
+        shm: SharedMemory = SharedMemory(
+            name=shm_name,
+            create=True,
+            size=16,
+        )
+
+    _curr_action_bin = 0
+
+    while not _is_shutdown:
+        # Extract as integer (i).
+        frame_ready_bin = unpack("i", shm.buf[8:12])[0]
+
+        if frame_ready_bin == 1:
+            # 4:8 - Current action. 12:16 - Python acknowledgement
+            shm.buf[4:8] = pack("i", _curr_action_bin)
+            shm.buf[8:12] = pack("i", 0)
+            shm.buf[12:16] = pack("i", 1)
+        else:
+            time.sleep(0)
+
+    shm.close()
+    shm.unlink()
+
+
 def _infer():
     """Load model and weights, track frame drops and latency, and process model output."""
     listener = Listener(on_press=_on_press)
     listener.start()
+
+    shm_thread = threading.Thread(target=_init_shm, daemon=True)
+    shm_thread.start()
 
     hidden_state_dim = _CONFIG["model"]["hiddenDim"]
     device: torch.device = torch.device(_CONFIG["model"]["deviceName"])
@@ -49,7 +89,7 @@ def _infer():
     checkpoint_dir: Path = base_dir / _CONFIG["fileNames"]["checkpointDirName"]
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 
-    model: PolicyModel = PolicyModel().to(device)
+    model: Model = Model().to(device)
     checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
         checkpoint_dir / checkpoint_name,
         map_location=device,
@@ -83,7 +123,15 @@ def _infer():
             i += 1
 
             frame_HWC: Frame
-            frame_HWC, _ = env.step(curr_action_bin)
+
+            global _curr_action_bin
+            _curr_action_bin = curr_action_bin
+
+            frame_HWC, is_stale = env.get_frame()
+
+            if is_stale:
+                env.capture_engine.frame_drops += 1
+                continue
 
             time_start: float = time.perf_counter()
 
