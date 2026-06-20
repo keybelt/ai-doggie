@@ -6,3 +6,4 @@ data
 __pycache__
 macro_parser
 .eclipse
+CONTEXT.md
