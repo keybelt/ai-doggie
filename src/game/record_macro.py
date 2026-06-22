@@ -40,7 +40,7 @@ def _on_press(key):
     record_key_name = _CONFIG["keys"]["recordKeyName"]
 
     if key == Key[record_key_name]:
-        time.sleep(0.5)
+        time.sleep(0.25)
         _is_recording = True
         print("Recording started.")
     elif key == Key[exit_key_name]:
@@ -146,10 +146,10 @@ def _record(macro_name: str):
     shm_thread = threading.Thread(target=_shm_bridge, args=(macro_events,), daemon=True)
     shm_thread.start()
 
-    game_env: GameEnv = GameEnv()
-
     listener = Listener(on_press=_on_press)
     listener.start()
+
+    game_env: GameEnv = GameEnv()
 
     frames_buf: UInt8[np.ndarray, "frame_buf_max frame_H frame_W frame_C"] = np.empty(  # noqa: F722
         (buf_max_frames, frame_height_px, frame_width_px, 3),
