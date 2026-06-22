@@ -18,8 +18,6 @@ from torch import Tensor
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from type_defs import Frame
-
 from agent.model import Model
 from game.game_env import GameEnv
 
@@ -89,8 +87,7 @@ def _infer():
 
     if checkpoint_name:
         checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
-            checkpoint_dir / checkpoint_name,
-            map_location=device,
+            checkpoint_dir / checkpoint_name, map_location=device
         )
 
         model.load_state_dict(checkpoint["model_state"])
@@ -122,7 +119,6 @@ def _infer():
 
             i += 1
 
-            frame_HWC: Frame
             frame_HWC, _ = env.get_frame()
 
             time_start: float = time.perf_counter()

@@ -16,7 +16,6 @@ import numpy as np
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from game.screen_capture import _CaptureEngine, start_capture_engine
-from type_defs import Frame, FramePackage
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
@@ -36,7 +35,7 @@ class GameEnv:
         self.capture_engine: _CaptureEngine = start_capture_engine()
 
         color_channel_depth = 3
-        self._last_fresh_frame: Frame = np.zeros(
+        self._last_fresh_frame = np.zeros(
             (frame_height_px, frame_width_px, color_channel_depth),
             dtype=np.uint8,
         )
@@ -54,7 +53,7 @@ class GameEnv:
         except queue.Empty:
             pass
 
-    def get_frame(self) -> FramePackage:
+    def get_frame(self) -> tuple[np.ndarray, bool]:
         """Return the latest frame, recycle a previous frame if capture_engine doesn't have a fresh one ready.
 
         Returns:
@@ -65,16 +64,16 @@ class GameEnv:
         is_stale = False
         try:
             pipeline_fps = _CONFIG_CAPTURE["fps"]
-            bgra_frame: Frame = self.capture_engine.queue_full.get(
+            bgra_frame = self.capture_engine.queue_full.get(
                 timeout=1 / pipeline_fps,
             )
-            frame_no_alpha: Frame = bgra_frame[:, :, :3]
+            frame_no_alpha = bgra_frame[:, :, :3]
 
             self.capture_engine.queue_empty.put_nowait(bgra_frame)
             self._last_fresh_frame = frame_no_alpha
 
         except queue.Empty:
-            frame_no_alpha: Frame = self._last_fresh_frame
+            frame_no_alpha = self._last_fresh_frame
             is_stale = True
 
         return frame_no_alpha, is_stale

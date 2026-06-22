@@ -148,9 +148,7 @@ class Model(nn.Module):
         )
 
         gru_out = gru_out.reshape(N * T, -1)
-        logits_nonsequential: Tensor = self._policy_head(  # [N * T, V]
-            gru_out
-        )
+        logits_nonsequential: Tensor = self._policy_head(gru_out)  # [N * T, V]
         logits = logits_nonsequential.view(N, T, self._vocab_size)
 
         return logits, h.transpose(0, 1).contiguous()

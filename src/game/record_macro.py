@@ -21,7 +21,6 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from pynput.keyboard import Key, Listener
 
 from game.game_env import GameEnv
-from type_defs import Frame, ParsedMacro
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
@@ -46,13 +45,13 @@ def _on_press(key):
         _is_shutdown = True
 
 
-def _load_macro(filepath: str) -> ParsedMacro:
+def _load_macro(filepath: str) -> list[tuple[int, int]]:
     """Unpack .gdr macro files using the C++ parser.
 
     Returns:
         actions in format (frame, action).
     """
-    macro_events: ParsedMacro = []
+    macro_events: list[tuple[int, int]] = []
 
     cli_path = Path(__file__).parent.parent.parent / "third_party" / "macro_parser"
 
@@ -81,7 +80,7 @@ def _load_macro(filepath: str) -> ParsedMacro:
     return macro_events
 
 
-def _shm_bridge(macro_events: ParsedMacro):
+def _shm_bridge(macro_events: list[tuple[int, int]]):
     """Initialize a shared memory block between this script and the c++ mod."""
     global _curr_action_bin
 
@@ -112,10 +111,7 @@ def _shm_bridge(macro_events: ParsedMacro):
                 _curr_action_bin = 0
 
             # Only passes if there are macro events left over, and if our current frame matches or is ahead of the macro event's frame.
-            while (
-                event_idx < len(macro_events)
-                and frame_idx >= macro_events[event_idx][0]
-            ):
+            while event_idx < len(macro_events) and frame_idx >= macro_events[event_idx][0]:
                 _curr_action_bin = macro_events[event_idx][1]
                 event_idx += 1
 
@@ -140,7 +136,7 @@ def _record(macro_name: str):
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
     dataset_dir: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
-    macro_events: ParsedMacro = _load_macro(macro_name)
+    macro_events: list[tuple[int, int]] = _load_macro(macro_name)
 
     shm_thread = threading.Thread(target=_shm_bridge, args=(macro_events,), daemon=True)
     shm_thread.start()
@@ -160,7 +156,6 @@ def _record(macro_name: str):
     game_env.clear_frame_queue()
 
     while not _is_shutdown:
-        frame: Frame
         frame, is_stale = game_env.get_frame()
 
         if frame_idx >= buf_max_frames:

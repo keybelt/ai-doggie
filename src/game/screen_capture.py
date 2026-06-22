@@ -26,7 +26,6 @@ from libdispatch import dispatch_queue_create
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from type_defs import Frame, FrameQueue
 
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 with _CONFIG_PATH.open() as f:
@@ -48,10 +47,10 @@ class _CaptureEngine(NSObject):
         """Initialize and populate queues, frame drop counter, frame specifications, and capture stream reference."""
         self = objc.super(_CaptureEngine, self).init()
 
-        self.queue_empty: FrameQueue = queue.Queue()
-        self.queue_full: FrameQueue = queue.Queue()
+        self.queue_empty: queue.Queue[np.ndarray] = queue.Queue()
+        self.queue_full: queue.Queue[np.ndarray] = queue.Queue()
 
-        self.frame_drops = 0
+        self.frame_drops: int = 0
 
         self.capture_stream = None
 
@@ -90,9 +89,9 @@ class _CaptureEngine(NSObject):
                 return
 
             try:
-                frame_buf: Frame = self.queue_empty.get_nowait()
+                frame_buf = self.queue_empty.get_nowait()
             except queue.Empty:
-                frame_buf: Frame = self.queue_full.get_nowait()
+                frame_buf = self.queue_full.get_nowait()
                 self.frame_drops += 1
 
             # Safe access and override prevention. 1 is read only.
@@ -149,18 +148,12 @@ def start_capture_engine() -> _CaptureEngine:
         capture_fps = _CONFIG_CAPTURE["fps"]
 
         try:
-            window_target = next(
-                w
-                for w in content.windows()
-                if "geometry dash" in (w.title() or "").lower()
-            )
+            window_target = next(w for w in content.windows() if "geometry dash" in (w.title() or "").lower())
 
             print("Geometry Dash window found.")
 
-            window_filter = (
-                Sck.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
-                    window_target,
-                )
+            window_filter = Sck.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
+                window_target,
             )
 
             config: Sck.SCStreamConfiguration = Sck.SCStreamConfiguration.alloc().init()
@@ -174,12 +167,10 @@ def start_capture_engine() -> _CaptureEngine:
             config.setQueueDepth_(_QUEUE_DEPTH)
             config.setPixelFormat_(pixel_format_bgra)
 
-            capture_stream = (
-                Sck.SCStream.alloc().initWithFilter_configuration_delegate_(
-                    window_filter,
-                    config,
-                    capture_engine,
-                )
+            capture_stream = Sck.SCStream.alloc().initWithFilter_configuration_delegate_(
+                window_filter,
+                config,
+                capture_engine,
             )
             capture_engine.capture_stream = capture_stream
 
