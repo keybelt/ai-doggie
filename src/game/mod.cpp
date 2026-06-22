@@ -111,17 +111,23 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
 
     int frameIdx = m_gameState.m_currentProgress / 2;
 
-    data->currActionBin = 0;
-    data->frameIdx = frameIdx;
-    data->frameReadyBin = 1;
-    data->actionReadyBin = 0;
+    bool isRecordingMode = (data->actionReadyBin != -1);
+    bool isValid = true;
 
-    int timeout = 50000;
-    while (data->actionReadyBin == 0 && timeout > 0) {
-      timeout--;
+    if (isRecordingMode) {
+      data->currActionBin = 0;
+      data->frameIdx = frameIdx;
+      data->frameReadyBin = 1;
+      data->actionReadyBin = 0;
+
+      int timeout = 1000000;
+      while (data->actionReadyBin == 0 && timeout > 0) {
+        timeout--;
+      }
+      isValid = (timeout > 0);
     }
 
-    if (timeout > 0) {
+    if (isValid) {
       bool shouldJump = (data->currActionBin == 1);
 
       if (shouldJump && !isJumping) {

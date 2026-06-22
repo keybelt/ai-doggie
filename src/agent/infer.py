@@ -10,7 +10,7 @@ import threading
 import time
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
-from struct import pack, unpack
+from struct import pack
 
 import torch
 from jaxtyping import Float32
@@ -58,17 +58,13 @@ def _init_shm():
 
     _curr_action_bin = 0
 
-    while not _is_shutdown:
-        # Extract as integer (i).
-        frame_ready_bin = unpack("i", shm.buf[8:12])[0]
+    # -1 means inference mode.
+    shm.buf[12:16] = pack("i", -1)
 
-        if frame_ready_bin == 1:
-            # 4:8 - Current action. 12:16 - Python acknowledgement
-            shm.buf[4:8] = pack("i", _curr_action_bin)
-            shm.buf[8:12] = pack("i", 0)
-            shm.buf[12:16] = pack("i", 1)
-        else:
-            time.sleep(0)
+    while not _is_shutdown:
+        # 4:8 - Current action.
+        shm.buf[4:8] = pack("i", _curr_action_bin)
+        time.sleep(0)
 
     shm.close()
     shm.unlink()
@@ -90,12 +86,16 @@ def _infer():
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 
     model: Model = Model().to(device)
-    checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
-        checkpoint_dir / checkpoint_name,
-        map_location=device,
-    )
 
-    model.load_state_dict(checkpoint["model_state"])
+    if checkpoint_name:
+        checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
+            checkpoint_dir / checkpoint_name,
+            map_location=device,
+        )
+
+        model.load_state_dict(checkpoint["model_state"])
+        print(f"Loading checkpoint {checkpoint_name}.")
+
     model.eval()
 
     model = torch.compile(model)
@@ -123,15 +123,7 @@ def _infer():
             i += 1
 
             frame_HWC: Frame
-
-            global _curr_action_bin
-            _curr_action_bin = curr_action_bin
-
-            frame_HWC, is_stale = env.get_frame()
-
-            if is_stale:
-                env.capture_engine.frame_drops += 1
-                continue
+            frame_HWC, _ = env.get_frame()
 
             time_start: float = time.perf_counter()
 
@@ -143,6 +135,8 @@ def _infer():
             logits, hidden_state = model(frame_NTHWC, hidden_state)
 
             curr_action_bin = torch.argmax(logits, dim=-1).item()
+            global _curr_action_bin
+            _curr_action_bin = curr_action_bin
 
             infer_time: float = (time.perf_counter() - time_start) * 1000
 
