@@ -60,8 +60,6 @@ class Model(nn.Module):
             stride=shapes["conv4"]["stride"],
         )
 
-        self._pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
         # Dynamically calculate flattened size.
         with torch.inference_mode():
             frame_H_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
@@ -79,11 +77,7 @@ class Model(nn.Module):
 
         self._gru = nn.GRU(self._hidden_dim, self._hidden_dim, batch_first=True)
 
-        self._policy_head = nn.Sequential(
-            nn.Linear(self._hidden_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, self._vocab_size),
-        )
+        self._policy_head = nn.Linear(self._hidden_dim, self._vocab_size)
 
         self._init_params()
 
@@ -101,18 +95,16 @@ class Model(nn.Module):
         nn.init.zeros_(self._gru.bias_ih_l0)
         nn.init.zeros_(self._gru.bias_hh_l0)
 
-        nn.init.kaiming_normal_(self._policy_head[0].weight, nonlinearity="relu")
-        nn.init.zeros_(self._policy_head[0].bias)
-        nn.init.xavier_uniform_(self._policy_head[2].weight)
-        nn.init.zeros_(self._policy_head[2].bias)
+        nn.init.xavier_uniform_(self._policy_head.weight)
+        nn.init.zeros_(self._policy_head.bias)
 
     def _conv_forward(
         self,
         X: Float32[Tensor, "N C H W"],
     ) -> Float32[Tensor, "N C H W"]:
-        """4 conv layers with batch norm, ReLU, and 2 max pooling layers."""
-        X = self._pool(torch.relu(self._conv1(X)))
-        X = self._pool(torch.relu(self._conv2(X)))
+        """3 conv layers with ReLU, stride-only downsampling."""
+        X = torch.relu(self._conv1(X))
+        X = torch.relu(self._conv2(X))
         X = torch.relu(self._conv3(X))
         X = torch.relu(self._conv4(X))
         return X

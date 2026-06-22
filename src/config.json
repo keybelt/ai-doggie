@@ -3,8 +3,8 @@
         "frameDims": {
             "srcHeightPx": 664,
             "srcWidthPx": 1176,
-            "pipelineHeightPx": 332,
-            "pipelineWidthPx": 588
+            "pipelineHeightPx": 664,
+            "pipelineWidthPx": 1176
         },
         "queueDepth": 3,
         "fps": 120
@@ -13,47 +13,47 @@
         "weightShapes": {
             "conv1": {
                 "inChannels": 3,
-                "outChannels": 32,
+                "outChannels": 16,
                 "kernelSize": 8,
                 "stride": 4
             },
             "conv2": {
-                "inChannels": 32,
-                "outChannels": 64,
+                "inChannels": 16,
+                "outChannels": 32,
                 "kernelSize": 4,
                 "stride": 2
             },
             "conv3": {
-                "inChannels": 64,
-                "outChannels": 128,
+                "inChannels": 32,
+                "outChannels": 32,
                 "kernelSize": 3,
                 "stride": 2
             },
             "conv4": {
-                "inChannels": 128,
-                "outChannels": 128,
+                "inChannels": 32,
+                "outChannels": 8,
                 "kernelSize": 3,
-                "stride": 1
+                "stride": 2
             }
         },
-        "hiddenDim": 256,
+        "hiddenDim": 8,
         "vocabSize": 2,
         "deviceName": "mps"
     },
     "fileNames": {
         "datasetDirName": "data",
-        "checkpointName": "epoch_200.pt",
+        "checkpointName": "",
         "checkpointDirName": "checkpoints"
     },
     "training": {
         "batchSize": 4,
         "seqLen": 512,
-        "learningRate": 1e-4,
+        "learningRate": 3e-4,
         "beta1": 0.9,
         "beta2": 0.999,
         "weightDecay": 1e-4,
         "checkpointSaveInterval": 100,
-        "epochs": 2500
+        "epochs": 5000
     },
     "keys": {
         "exitKeyName": "backspace",
