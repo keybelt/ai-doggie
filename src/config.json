@@ -46,8 +46,9 @@
         "checkpointDirName": "checkpoints"
     },
     "training": {
-        "batchSize": 4,
-        "seqLen": 512,
+        "batchSize": 1,
+        "accumulationSteps": 4,
+        "seqLen": 256,
         "learningRate": 3e-4,
         "beta1": 0.9,
         "beta2": 0.999,

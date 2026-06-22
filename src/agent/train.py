@@ -172,8 +172,11 @@ def _train():
     epochs = _CONFIG["training"]["epochs"]
     checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
 
-    dataloader: DataLoader = DataLoader(_DatasetGenerator(), batch_size=None)
+    dataloader: DataLoader = DataLoader(
+        _DatasetGenerator(), batch_size=None, num_workers=1
+    )
     model: Model = Model().to(device)
+    model.train()
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -202,7 +205,6 @@ def _train():
         start_epoch: int = 1
 
     for epoch in range(start_epoch, epochs + 1):
-        epoch_loss: float = 0
         num_batches = 0
 
         hidden_state: Float32[torch.Tensor, "N L D"] = torch.zeros(
@@ -211,6 +213,8 @@ def _train():
             hidden_state_dim,
             device=device,
         )
+
+        epoch_loss_tensor: Tensor = torch.zeros(1, device=device)
 
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
             # Note that the variables from dataloader are actually concatenated from different mini batches.
@@ -234,9 +238,9 @@ def _train():
 
             hidden_state = hidden_state * keep_hidden_mask
 
-            frame_norm: Float32[Tensor, "N H W C"] = (
-                frames.to(device, dtype=torch.float32) / 255
-            )
+            frame_norm: Float32[Tensor, "N H W C"] = frames.to(
+                device, dtype=torch.float32, non_blocking=True
+            ).div_(255.0)
             target_actions_bin: Int64[Tensor, "N seq_len"] = actions_bin[:, 1:].to(
                 device,
                 dtype=torch.long,
@@ -263,14 +267,20 @@ def _train():
                 target_actions,
                 weight=weights,
             )
+
+            accumulation_steps = _CONFIG["training"]["accumulationSteps"]
+
+            loss = loss / accumulation_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
 
-            epoch_loss += loss.item()
+            if (i + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-        avg_loss = (epoch_loss / num_batches) if num_batches > 0 else 0
+            epoch_loss_tensor += loss.detach() * accumulation_steps
+
+        avg_loss = (epoch_loss_tensor.item() / num_batches) if num_batches > 0 else 0
         print(f"Epoch {epoch} completed | Average loss: {avg_loss:.4f}")
 
         if epoch % checkpoint_save_interval == 0:
