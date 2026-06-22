@@ -14,23 +14,23 @@
             "conv1": {
                 "inChannels": 3,
                 "outChannels": 16,
-                "kernelSize": 8,
-                "stride": 4
+                "kernelSize": 5,
+                "stride": 2
             },
             "conv2": {
                 "inChannels": 16,
                 "outChannels": 32,
-                "kernelSize": 4,
+                "kernelSize": 3,
                 "stride": 2
             },
             "conv3": {
                 "inChannels": 32,
-                "outChannels": 32,
+                "outChannels": 16,
                 "kernelSize": 3,
                 "stride": 2
             },
             "conv4": {
-                "inChannels": 32,
+                "inChannels": 16,
                 "outChannels": 8,
                 "kernelSize": 3,
                 "stride": 2
