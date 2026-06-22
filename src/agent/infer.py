@@ -13,15 +13,15 @@ from pathlib import Path
 from struct import pack
 
 import torch
-from jaxtyping import Float32
 from pynput.keyboard import Key, Listener
 from torch import Tensor
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from type_defs import Frame
+
 from agent.model import Model
 from game.game_env import GameEnv
-from type_defs import Frame
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
@@ -102,7 +102,7 @@ def _infer():
 
     env: GameEnv = GameEnv()
 
-    hidden_state: Float32[Tensor, "N L D"] = torch.zeros(
+    hidden_state: Tensor = torch.zeros(  # [N, L, D]
         1,
         1,
         hidden_state_dim,
@@ -130,8 +130,8 @@ def _infer():
             frame_NTHWC = torch.from_numpy(frame_HWC).unsqueeze(0).unsqueeze(0)
             frame_NTHWC = frame_NTHWC.to(device=device, dtype=torch.float32) / 255
 
-            logits: Float32[Tensor, "N T V"]  # noqa: F722
-            hidden_state: Float32[Tensor, "N L D"]  # noqa: F722
+            logits: Tensor  # [N, T, V]
+            hidden_state: Tensor  # [N, L, D]
             logits, hidden_state = model(frame_NTHWC, hidden_state)
 
             curr_action_bin = torch.argmax(logits, dim=-1).item()

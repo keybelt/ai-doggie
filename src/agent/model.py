@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 
 import torch
-from jaxtyping import Float32
 from torch import Tensor, nn
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -100,9 +99,16 @@ class Model(nn.Module):
 
     def _conv_forward(
         self,
-        X: Float32[Tensor, "N C H W"],
-    ) -> Float32[Tensor, "N C H W"]:
-        """3 conv layers with ReLU, stride-only downsampling."""
+        X: Tensor,
+    ) -> Tensor:
+        """3 conv layers with ReLU, stride-only downsampling.
+
+        Args:
+            X: [N, C, H, W].
+
+        Returns:
+            Tensor of shape [N, C', H', W'].
+        """
         X = torch.relu(self._conv1(X))
         X = torch.relu(self._conv2(X))
         X = torch.relu(self._conv3(X))
@@ -111,26 +117,30 @@ class Model(nn.Module):
 
     def forward(
         self,
-        X: Float32[Tensor, "N T H W C"],
-        prev_h: Float32[Tensor, "N L D"],
-    ) -> tuple[Float32[Tensor, "N T V"], Float32[Tensor, "N L D"]]:
+        X: Tensor,
+        prev_h: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         """Pass inputs through CNN + GRU + policy head.
 
+        Args:
+            X: [N, T, H, W, C].
+            prev_h: [N, L, D].
+
         Returns:
-            Logits and the new hidden state.
+            Logits and the new hidden state of shapes [N, T, V] and [N, L, D].
         """
         N, T, H, W, C = X.shape
 
         # Convolve frame with combined batch size and time since convolution isn't sequential.
         # Permute from NHWC to NCHW for nn.Conv2d.
-        X = X.view(N * T, H, W, C).permute(0, 3, 1, 2)
+        X = X.view(N * T, H, W, C).permute(0, 3, 1, 2).contiguous()
         X_conv = self._conv_forward(X)
 
         X_flat = X_conv.reshape(N * T, -1)
-        X_proj: Float32[Tensor, "N_nonsequential D"] = torch.relu(self._fc(X_flat))
+        X_proj: Tensor = torch.relu(self._fc(X_flat))  # [N * T, D]
         X_proj = X_proj.view(N, T, self._hidden_dim)
 
-        gru_out: Float32[Tensor, "N T D"]
+        gru_out: Tensor  # [N, T, D]
         gru_out, h = self._gru(
             X_proj,
             # nn.GRU expects (L, N, D).
@@ -138,7 +148,7 @@ class Model(nn.Module):
         )
 
         gru_out = gru_out.reshape(N * T, -1)
-        logits_nonsequential: Float32[Tensor, "N_nonsequential V"] = self._policy_head(
+        logits_nonsequential: Tensor = self._policy_head(  # [N * T, V]
             gru_out
         )
         logits = logits_nonsequential.view(N, T, self._vocab_size)

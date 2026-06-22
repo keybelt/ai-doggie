@@ -18,7 +18,6 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from jaxtyping import UInt8
 from pynput.keyboard import Key, Listener
 
 from game.game_env import GameEnv
@@ -151,12 +150,11 @@ def _record(macro_name: str):
 
     game_env: GameEnv = GameEnv()
 
-    frames_buf: UInt8[np.ndarray, "frame_buf_max frame_H frame_W frame_C"] = np.empty(  # noqa: F722
+    frames_buf: np.ndarray = np.empty(
         (buf_max_frames, frame_height_px, frame_width_px, 3),
         dtype=np.uint8,
     )
-    # Store an extra for next action prediction.
-    actions_bin_buf = np.zeros(buf_max_frames + 1, dtype=np.uint8)
+    actions_bin_buf = np.zeros(buf_max_frames, dtype=np.uint8)
 
     frame_idx = 0
     game_env.clear_frame_queue()
@@ -188,7 +186,7 @@ def _record(macro_name: str):
     np.savez_compressed(
         save_path,
         frames=frames_buf[:frame_idx],
-        actions_bin=actions_bin_buf[: frame_idx + 1],
+        actions_bin=actions_bin_buf[:frame_idx],
     )
     print(f"\nSaved recording to {save_path}")
 

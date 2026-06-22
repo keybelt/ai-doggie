@@ -53,8 +53,8 @@
         "beta1": 0.9,
         "beta2": 0.999,
         "weightDecay": 1e-4,
-        "checkpointSaveInterval": 100,
-        "epochs": 5000
+        "checkpointSaveInterval": 10,
+        "epochs": 100
     },
     "keys": {
         "exitKeyName": "backspace",

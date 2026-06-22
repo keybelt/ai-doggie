@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from jaxtyping import Float32, Int64, UInt8
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -57,8 +56,8 @@ class _DatasetGenerator(IterableDataset):
             batch_are_first: list[bool] = []
 
             for batch_idx, curr_file_stream in enumerate(file_streams):
-                frames: UInt8[np.ndarray, "N H W C"]
-                actions_bin: UInt8[np.ndarray, "N"]
+                frames: np.ndarray
+                actions_bin: np.ndarray
                 is_first: bool
 
                 try:
@@ -207,7 +206,7 @@ def _train():
     for epoch in range(start_epoch, epochs + 1):
         num_batches = 0
 
-        hidden_state: Float32[torch.Tensor, "N L D"] = torch.zeros(
+        hidden_state: torch.Tensor = torch.zeros(  # [N, L, D]
             BATCH_SIZE,
             1,
             hidden_state_dim,
@@ -215,6 +214,9 @@ def _train():
         )
 
         epoch_loss_tensor: Tensor = torch.zeros(1, device=device)
+        class_weights = torch.tensor(
+            [0.6897, 1.8175], device=device, dtype=torch.float32
+        )
 
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
             # Note that the variables from dataloader are actually concatenated from different mini batches.
@@ -227,7 +229,7 @@ def _train():
             num_batches = i + 1
 
             keep_hidden_mask = ~are_first
-            keep_hidden_mask: Float32[Tensor, "N L D"] = (
+            keep_hidden_mask: Tensor = (
                 keep_hidden_mask.to(
                     device,
                     dtype=torch.float32,
@@ -238,34 +240,32 @@ def _train():
 
             hidden_state = hidden_state * keep_hidden_mask
 
-            frame_norm: Float32[Tensor, "N H W C"] = frames.to(
-                device, dtype=torch.float32, non_blocking=True
-            ).div_(255.0)
-            target_actions_bin: Int64[Tensor, "N seq_len"] = actions_bin[:, 1:].to(
+            frames = frames.to(device, non_blocking=True)
+            frames_norm = frames.to(dtype=torch.float32).div_(255.0)
+            target_actions_bin: Tensor = actions_bin[:, 1:].to(
                 device,
                 dtype=torch.long,
             )
 
-            logits: Float32[Tensor, "N T V"]
-            hidden_state: Float32[Tensor, "N L D"]
-            logits, hidden_state = model(frame_norm, hidden_state)
+            logits: Tensor  # [N, T, V]
+            hidden_state: Tensor  # [N, L, D]
+            logits, hidden_state = model(frames_norm, hidden_state)
 
             # Ensure hidden state doesn't effect the gradients of the entire dataset.
             hidden_state = hidden_state.detach()
 
-            logits: Float32[Tensor, "N_nonsequential V"] = logits.reshape(
+            logits: Tensor = logits.reshape(  # [N * T, V]
                 -1,
                 vocab_size,
             )
-            target_actions: Int64[Tensor, "all_actions"] = target_actions_bin.reshape(
+            target_actions: Tensor = target_actions_bin.reshape(
                 -1,
             )
 
-            weights = torch.tensor([0.6897, 1.8175], device=device, dtype=torch.float32)
             loss: Tensor = F.cross_entropy(
                 logits,
                 target_actions,
-                weight=weights,
+                weight=class_weights,
             )
 
             accumulation_steps = _CONFIG["training"]["accumulationSteps"]
