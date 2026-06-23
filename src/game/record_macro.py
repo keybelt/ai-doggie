@@ -99,8 +99,12 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
         print("Macro parsed using JSON.")
     except (json.JSONDecodeError, UnicodeDecodeError):
         # Unpack from bytes.
-        parsed_macro = msgpack.unpackb(macro_data, raw=False)
-        print("Macro parsed using msgpack.")
+        try:
+            parsed_macro = msgpack.unpackb(macro_data, raw=False)
+            print("Macro parsed using msgpack.")
+        except msgpack.exceptions.ExtraData:
+            print("Macro parsed with C++ fallback.")
+            return _load_macro_fallback(filepath)
 
     macro_fps = parsed_macro.get("framerate")
     print(f"Macro FPS: {macro_fps}.")
@@ -113,13 +117,10 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
 
         if mouse_btn == 1 and not is_player2:
             if macro_fps != _CONFIG["macroFps"]:
+                print("Converting macro fps.")
                 frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
-
-    if len(macro_events) == 0:
-        print("Using C++ fallback parser.")
-        macro_events = _load_macro_fallback(filepath)
 
     macro_events.sort(key=lambda x: x[0])
 
