@@ -95,8 +95,6 @@ def _infer():
 
     model.eval()
 
-    model = torch.compile(model)
-
     env: GameEnv = GameEnv()
 
     hidden_state: Tensor = torch.zeros(  # [N, L, D]
