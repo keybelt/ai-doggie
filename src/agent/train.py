@@ -231,7 +231,7 @@ def _train():
             hidden_state = hidden_state * keep_hidden_mask
 
             frames = frames.to(device, non_blocking=True)
-            frames_norm = frames.to(dtype=torch.float32).div_(255.0)
+            frames_norm = frames.to(dtype=torch.float32).mul_(1.0 / 255.0)
             target_actions_bin: Tensor = actions_bin[:, 1:].to(
                 device,
                 dtype=torch.long,
