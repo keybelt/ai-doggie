@@ -45,7 +45,7 @@ def _on_press(key):
         _is_shutdown = True
 
 
-def _load_macro(filepath: str) -> list[tuple[int, int]]:
+def _load_macro_fallback(filepath: str) -> list[tuple[int, int]]:
     """Unpack .gdr macro files using the C++ parser.
 
     Returns:
@@ -72,6 +72,54 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
                 frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
+
+    macro_events.sort(key=lambda x: x[0])
+
+    print(f"Macro parsed with {len(macro_events)} events.")
+
+    return macro_events
+
+
+def _load_macro(filepath: str) -> list[tuple[int, int]]:
+    """Unpack .gdr macro files with a modified version of maxnut/gdr-converter's algorithm.
+
+    Returns:
+        actions in format (frame, action).
+    """
+
+    import msgpack
+
+    macro_events: list[tuple[int, int]] = []
+
+    macro_data = Path(filepath).read_bytes()
+
+    try:
+        # Unpack with utf8 decoding.
+        parsed_macro = json.loads(macro_data.decode("utf-8-sig"))
+        print("Macro parsed using JSON.")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Unpack from bytes.
+        parsed_macro = msgpack.unpackb(macro_data, raw=False)
+        print("Macro parsed using msgpack.")
+
+    macro_fps = parsed_macro.get("framerate")
+    print(f"Macro FPS: {macro_fps}.")
+
+    for macro_input in parsed_macro.get("inputs", []):
+        frame_idx = macro_input["frame"]
+        mouse_btn: int = macro_input["btn"]
+        is_player2 = macro_input["2p"]
+        is_keydown = macro_input["down"]
+
+        if mouse_btn == 1 and not is_player2:
+            if macro_fps != _CONFIG["macroFps"]:
+                frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
+
+            macro_events.append((frame_idx, 1 if is_keydown else 0))
+
+    if len(macro_events) == 0:
+        print("Using C++ fallback parser.")
+        macro_events = _load_macro_fallback(filepath)
 
     macro_events.sort(key=lambda x: x[0])
 
