@@ -110,12 +110,8 @@ class _DatasetGenerator(IterableDataset):
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * _CONFIG_TRAINING["seqLen"]
 
-                chunk_frames: np.ndarray = frames[
-                    start_idx : start_idx + _CONFIG_TRAINING["seqLen"]
-                ]
-                chunk_actions_bin: np.ndarray = actions_bin[
-                    start_idx : start_idx + _CONFIG_TRAINING["seqLen"] + 1
-                ]
+                chunk_frames: np.ndarray = frames[start_idx : start_idx + _CONFIG_TRAINING["seqLen"]]
+                chunk_actions_bin: np.ndarray = actions_bin[start_idx : start_idx + _CONFIG_TRAINING["seqLen"] + 1]
 
                 yield chunk_frames, chunk_actions_bin, (chunk_idx == 0)
 
@@ -171,9 +167,7 @@ def _train():
     epochs = _CONFIG["training"]["epochs"]
     checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
 
-    dataloader: DataLoader = DataLoader(
-        _DatasetGenerator(), batch_size=None, num_workers=1
-    )
+    dataloader: DataLoader = DataLoader(_DatasetGenerator(), batch_size=None)
     model: Model = Model().to(device)
     model.train()
 
@@ -184,9 +178,7 @@ def _train():
         weight_decay=_CONFIG_TRAINING["weightDecay"],
     )
 
-    checkpoint_dir = (
-        Path(__file__).resolve().parents[2] / _CONFIG["fileNames"]["checkpointDirName"]
-    )
+    checkpoint_dir = Path(__file__).resolve().parents[2] / _CONFIG["fileNames"]["checkpointDirName"]
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 
     if checkpoint_name:
@@ -214,9 +206,7 @@ def _train():
         )
 
         epoch_loss_tensor: Tensor = torch.zeros(1, device=device)
-        class_weights = torch.tensor(
-            [0.6897, 1.8175], device=device, dtype=torch.float32
-        )
+        class_weights = torch.tensor([0.6897, 1.8175], device=device, dtype=torch.float32)
 
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
             # Note that the variables from dataloader are actually concatenated from different mini batches.
