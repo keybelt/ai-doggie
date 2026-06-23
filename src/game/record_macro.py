@@ -171,6 +171,7 @@ def _record(macro_name: str):
             if frame_idx % log_interval == 0:
                 print(f"\rRecord frames: {frame_idx}", end="", flush=True)
 
+    listener.stop()
     game_env.capture_engine.stop_capture_stream()
 
     should_save: str = input("\nSave this recording? (Y/n): ")
