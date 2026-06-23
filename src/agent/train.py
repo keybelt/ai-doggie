@@ -111,7 +111,7 @@ class _DatasetGenerator(IterableDataset):
                 start_idx = chunk_idx * _CONFIG_TRAINING["seqLen"]
 
                 chunk_frames: np.ndarray = frames[start_idx : start_idx + _CONFIG_TRAINING["seqLen"]]
-                chunk_actions_bin: np.ndarray = actions_bin[start_idx : start_idx + _CONFIG_TRAINING["seqLen"] + 1]
+                chunk_actions_bin: np.ndarray = actions_bin[start_idx : start_idx + _CONFIG_TRAINING["seqLen"]]
 
                 yield chunk_frames, chunk_actions_bin, (chunk_idx == 0)
 
@@ -232,7 +232,7 @@ def _train():
 
             frames = frames.to(device, non_blocking=True)
             frames_norm = frames.to(dtype=torch.float32).mul_(1.0 / 255.0)
-            target_actions_bin: Tensor = actions_bin[:, 1:].to(
+            target_actions_bin: Tensor = actions_bin.to(
                 device,
                 dtype=torch.long,
             )
