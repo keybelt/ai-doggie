@@ -31,8 +31,7 @@ void initShm() {
   fileDescriptor = shm_open(("/" + shmName).c_str(), O_RDWR, 0666);
 
   if (fileDescriptor != -1) {
-    data = (SharedData *)mmap(NULL, sizeof(SharedData), PROT_READ | PROT_WRITE,
-                              MAP_SHARED, fileDescriptor, 0);
+    data = (SharedData *)mmap(NULL, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fileDescriptor, 0);
   }
 };
 
@@ -74,8 +73,7 @@ class $modify(MyPlayLayer, PlayLayer) {
 /// Override all the jumping logic.
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
   void sendClick(PlayerButton button, bool down, bool player2) {
-    auto isClick =
-        down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
+    auto isClick = down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
 
     if (m_levelSettings->m_twoPlayerMode && m_gameState.m_isDualMode) {
       PlayerObject *plr = player2 ? m_player2 : m_player1;
