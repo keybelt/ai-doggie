@@ -253,7 +253,7 @@ def _train():
         start_epoch: int = 1
 
     for epoch in range(start_epoch, epochs + 1):
-        class_weights = torch.tensor([0.6800, 1.8888], device=device, dtype=torch.float32)
+        class_weights = torch.tensor([0.6804, 1.8856], device=device, dtype=torch.float32)
 
         model.train()
         num_train_batches = 0
@@ -282,7 +282,7 @@ def _train():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            train_loss_tensor += loss.detach() * accumulation_steps
+            train_loss_tensor += loss.detach()
 
         avg_train_loss = (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0
 
