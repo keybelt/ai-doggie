@@ -45,41 +45,6 @@ def _on_press(key):
         _is_shutdown = True
 
 
-def _load_macro_fallback(filepath: str) -> list[tuple[int, int]]:
-    """Unpack .gdr macro files using the C++ parser.
-
-    Returns:
-        actions in format (frame, action).
-    """
-    macro_events: list[tuple[int, int]] = []
-
-    cli_path = Path(__file__).parent.parent.parent / "third_party" / "macro_parser"
-
-    result = subprocess.run([str(cli_path), filepath], capture_output=True, text=True)
-    parsed_macro = json.loads(result.stdout)
-
-    macro_fps = parsed_macro.get("framerate")
-    print(f"Macro FPS: {macro_fps}.")
-
-    for macro_input in parsed_macro.get("inputs", []):
-        frame_idx = macro_input["frame"]
-        mouse_btn: int = macro_input["btn"]
-        is_keydown = macro_input["down"]
-        # is_p2 = macro_input.get("2p", False)
-
-        if mouse_btn == 1:  # and not is_p2:
-            if macro_fps != _CONFIG["macroFps"]:
-                frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
-
-            macro_events.append((frame_idx, 1 if is_keydown else 0))
-
-    macro_events.sort(key=lambda x: x[0])
-
-    print(f"Macro parsed with {len(macro_events)} events.")
-
-    return macro_events
-
-
 def _load_macro(filepath: str) -> list[tuple[int, int]]:
     """Unpack .gdr macro files with a modified version of maxnut/gdr-converter's algorithm.
 
@@ -103,8 +68,10 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
             parsed_macro = msgpack.unpackb(macro_data, raw=False)
             print("Macro parsed using msgpack.")
         except msgpack.exceptions.ExtraData:
+            cli_path = Path(__file__).parent.parent.parent / "third_party" / "macro_parser"
+            result = subprocess.run([str(cli_path), filepath], capture_output=True, text=True)
+            parsed_macro = json.loads(result.stdout)
             print("Macro parsed with C++ fallback.")
-            return _load_macro_fallback(filepath)
 
     macro_fps = parsed_macro.get("framerate")
     print(f"Macro FPS: {macro_fps}.")
@@ -112,10 +79,10 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
     for macro_input in parsed_macro.get("inputs", []):
         frame_idx = macro_input["frame"]
         mouse_btn: int = macro_input["btn"]
-        is_player2 = macro_input["2p"]
+        # is_player2 = macro_input.get("2p")
         is_keydown = macro_input["down"]
 
-        if mouse_btn == 1 and not is_player2:
+        if mouse_btn == 1:  # and not is_player2:
             if macro_fps != _CONFIG["macroFps"]:
                 print("Converting macro fps.")
                 frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
@@ -168,8 +135,6 @@ def _shm_bridge(macro_events: list[tuple[int, int]]):
             shm.buf[4:8] = pack("i", _curr_action_bin)
             shm.buf[8:12] = pack("i", 0)
             shm.buf[12:16] = pack("i", 1)
-        else:
-            time.sleep(0)
 
     shm.close()
     shm.unlink()
