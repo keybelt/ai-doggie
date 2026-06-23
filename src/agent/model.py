@@ -52,12 +52,7 @@ class Model(nn.Module):
             stride=shapes["conv3"]["stride"],
         )
 
-        self._conv4 = nn.Conv2d(
-            shapes["conv4"]["inChannels"],
-            shapes["conv4"]["outChannels"],
-            kernel_size=shapes["conv4"]["kernelSize"],
-            stride=shapes["conv4"]["stride"],
-        )
+
 
         # Dynamically calculate flattened size.
         with torch.inference_mode():
@@ -82,7 +77,7 @@ class Model(nn.Module):
 
     def _init_params(self):
         """He/Kaiming init for conv+ReLU, Xavier for GRU, default for output."""
-        for module in [self._conv1, self._conv2, self._conv3, self._conv4]:
+        for module in [self._conv1, self._conv2, self._conv3]:
             nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
             nn.init.zeros_(module.bias)
 
@@ -112,7 +107,6 @@ class Model(nn.Module):
         X = torch.relu(self._conv1(X))
         X = torch.relu(self._conv2(X))
         X = torch.relu(self._conv3(X))
-        X = torch.relu(self._conv4(X))
         return X
 
     def forward(

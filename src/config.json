@@ -1,10 +1,10 @@
 {
     "capture": {
         "frameDims": {
-            "srcHeightPx": 664,
-            "srcWidthPx": 1176,
-            "pipelineHeightPx": 664,
-            "pipelineWidthPx": 1176
+            "srcHeightPx": 480,
+            "srcWidthPx": 640,
+            "pipelineHeightPx": 480,
+            "pipelineWidthPx": 640
         },
         "queueDepth": 3,
         "fps": 120
@@ -13,23 +13,17 @@
         "weightShapes": {
             "conv1": {
                 "inChannels": 3,
-                "outChannels": 16,
+                "outChannels": 32,
                 "kernelSize": 5,
                 "stride": 2
             },
             "conv2": {
-                "inChannels": 16,
-                "outChannels": 32,
-                "kernelSize": 3,
-                "stride": 2
-            },
-            "conv3": {
                 "inChannels": 32,
                 "outChannels": 16,
                 "kernelSize": 3,
                 "stride": 2
             },
-            "conv4": {
+            "conv3": {
                 "inChannels": 16,
                 "outChannels": 8,
                 "kernelSize": 3,
@@ -53,7 +47,7 @@
         "beta1": 0.9,
         "beta2": 0.999,
         "weightDecay": 1e-4,
-        "checkpointSaveInterval": 10,
+        "checkpointSaveInterval": 5,
         "epochs": 100
     },
     "keys": {
