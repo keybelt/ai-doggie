@@ -84,7 +84,6 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
 
         if mouse_btn == 1:  # and not is_player2:
             if macro_fps != _CONFIG["macroFps"]:
-                print("Converting macro fps.")
                 frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
