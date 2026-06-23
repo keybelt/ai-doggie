@@ -139,7 +139,7 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
   }
 
   void processQueuedButtons(float dt, bool clearInputQueue) {
-    GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
     this->processClick();
+    GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
   }
 };
