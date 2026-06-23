@@ -32,17 +32,18 @@ LR = _CONFIG_TRAINING["learningRate"]
 class _DatasetGenerator(IterableDataset):
     """Yield training batches built from parallel gameplay streams."""
 
+    def __init__(self, files: list[Path]):
+        self.files = files
+
     def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch together mini batches from each file stream.
 
         Yields:
             Tuple of arrays of frames, action binaries, and is_first flags of the concatenated mini batches.
         """
-        dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-        dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
-        dataset_files: list[Path] = list(dataset_files_src.glob("*.npz"))
-        random.shuffle(dataset_files)
+        dataset_files: list[Path] = self.files.copy()
+        random.shuffle(self.files)
 
         file_streams: list[Iterator[tuple[np.ndarray, np.ndarray, bool]]] = [
             self._stream_file(dataset_files.pop(0)) for _ in range(BATCH_SIZE)
@@ -160,6 +161,56 @@ class _DatasetGenerator(IterableDataset):
 #         self._v = state_dict["var"]
 
 
+def _process_batch(
+    model: Model,
+    frames: Tensor,
+    actions_bin: Tensor,
+    are_first: Tensor,
+    hidden: Tensor,
+    class_weights: Tensor,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Process a single batch through the model and calculate loss."""
+    vocab_size: int = _CONFIG["model"]["vocabSize"]
+
+    keep_hidden_mask = ~are_first
+    keep_hidden_mask = (
+        keep_hidden_mask.to(
+            device,
+            dtype=torch.float32,
+        )
+        .unsqueeze(-1)
+        .unsqueeze(-1)
+    )
+
+    hidden_state = hidden * keep_hidden_mask
+
+    frames = frames.to(device, non_blocking=True)
+    frames_norm = frames.to(dtype=torch.float32).mul_(1.0 / 255.0)
+    target_actions_bin = actions_bin.to(
+        device,
+        dtype=torch.long,
+    )
+
+    logits: Tensor  # [N, T, V]
+    hidden_state: Tensor  # [N, L, D]
+    logits, hidden_state = model(frames_norm, hidden_state)
+
+    # Ensure hidden state doesn't effect the gradients of the entire dataset.
+    hidden_state = hidden_state.detach()
+
+    logits: Tensor = logits.reshape(-1, vocab_size)
+    target_actions: Tensor = target_actions_bin.reshape(-1)
+
+    loss: Tensor = F.cross_entropy(
+        logits,
+        target_actions,
+        weight=class_weights,
+    )
+
+    return loss, hidden_state
+
+
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
     device: torch.device = torch.device(_CONFIG["model"]["deviceName"])
@@ -167,7 +218,13 @@ def _train():
     epochs = _CONFIG["training"]["epochs"]
     checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
 
-    dataloader: DataLoader = DataLoader(_DatasetGenerator(), batch_size=None)
+    dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
+    dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
+    dataset: list[Path] = list(dataset_files_src.glob("*.npz"))[2:]
+    validation_set: list[Path] = list(dataset_files_src.glob("*.npz"))[:2]
+
+    dataloader: DataLoader = DataLoader(_DatasetGenerator(dataset), batch_size=None)
+    dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(validation_set), batch_size=None)
     model: Model = Model().to(device)
     model.train()
 
@@ -196,8 +253,11 @@ def _train():
         start_epoch: int = 1
 
     for epoch in range(start_epoch, epochs + 1):
-        num_batches = 0
+        class_weights = torch.tensor([0.6800, 1.8888], device=device, dtype=torch.float32)
 
+        model.train()
+        num_train_batches = 0
+        train_loss_tensor: Tensor = torch.zeros(1, device=device)
         hidden_state: torch.Tensor = torch.zeros(  # [N, L, D]
             BATCH_SIZE,
             1,
@@ -205,73 +265,50 @@ def _train():
             device=device,
         )
 
-        epoch_loss_tensor: Tensor = torch.zeros(1, device=device)
-        class_weights = torch.tensor([0.6897, 1.8175], device=device, dtype=torch.float32)
-
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
-            # Note that the variables from dataloader are actually concatenated from different mini batches.
-            frames: Tensor
-            actions_bin: Tensor
-            are_first: Tensor
+            num_train_batches = i + 1
 
-            vocab_size: int = _CONFIG["model"]["vocabSize"]
-
-            num_batches = i + 1
-
-            keep_hidden_mask = ~are_first
-            keep_hidden_mask: Tensor = (
-                keep_hidden_mask.to(
-                    device,
-                    dtype=torch.float32,
-                )
-                .unsqueeze(-1)
-                .unsqueeze(-1)
-            )
-
-            hidden_state = hidden_state * keep_hidden_mask
-
-            frames = frames.to(device, non_blocking=True)
-            frames_norm = frames.to(dtype=torch.float32).mul_(1.0 / 255.0)
-            target_actions_bin: Tensor = actions_bin.to(
-                device,
-                dtype=torch.long,
-            )
-
-            logits: Tensor  # [N, T, V]
-            hidden_state: Tensor  # [N, L, D]
-            logits, hidden_state = model(frames_norm, hidden_state)
-
-            # Ensure hidden state doesn't effect the gradients of the entire dataset.
-            hidden_state = hidden_state.detach()
-
-            logits: Tensor = logits.reshape(  # [N * T, V]
-                -1,
-                vocab_size,
-            )
-            target_actions: Tensor = target_actions_bin.reshape(
-                -1,
-            )
-
-            loss: Tensor = F.cross_entropy(
-                logits,
-                target_actions,
-                weight=class_weights,
+            loss, hidden_state = _process_batch(
+                model, frames, actions_bin, are_first, hidden_state, class_weights, device
             )
 
             accumulation_steps = _CONFIG["training"]["accumulationSteps"]
 
-            loss = loss / accumulation_steps
-            loss.backward()
+            scaled_loss = loss / accumulation_steps
+            scaled_loss.backward()
 
             if (i + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            epoch_loss_tensor += loss.detach() * accumulation_steps
+            train_loss_tensor += loss.detach() * accumulation_steps
 
-        avg_loss = (epoch_loss_tensor.item() / num_batches) if num_batches > 0 else 0
-        print(f"Epoch {epoch} completed | Average loss: {avg_loss:.4f}")
+        avg_train_loss = (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0
+
+        model.eval()
+        num_val_batches = 0
+        val_loss_tensor: Tensor = torch.zeros(1, device=device)
+        hidden_state: torch.Tensor = torch.zeros(  # [N, L, D]
+            BATCH_SIZE,
+            1,
+            hidden_state_dim,
+            device=device,
+        )
+
+        with torch.no_grad():
+            for i, (frames, actions_bin, are_first) in enumerate(dataloader_validation):
+                num_val_batches = i + 1
+
+                loss, hidden_state = _process_batch(
+                    model, frames, actions_bin, are_first, hidden_state, class_weights, device
+                )
+
+                val_loss_tensor += loss.detach()
+
+        avg_val_loss = (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0
+
+        print(f"Epoch {epoch} completed | Train loss: {avg_train_loss:.2f} | Validation loss: {avg_val_loss:.2f}")
 
         if epoch % checkpoint_save_interval == 0:
             checkpoint_path = checkpoint_dir / f"epoch_{epoch}.pt"
@@ -280,7 +317,8 @@ def _train():
                     "epoch": epoch,
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
-                    "loss": avg_loss,
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
                 },
                 checkpoint_path,
             )
