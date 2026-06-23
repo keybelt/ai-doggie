@@ -57,5 +57,6 @@
     "shmName": "GDMem",
     "bufMaxFrames": 50000,
     "logIntervalSec": 1,
-    "macroFps": 240
+    "macroFps": 240,
+    "recordDelaySec": 0.25
 }

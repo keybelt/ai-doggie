@@ -36,6 +36,7 @@ def _on_press(key):
     if key == Key[_CONFIG["keys"]["exitKeyName"]]:
         _is_shutdown = True
     elif key == Key[_CONFIG["keys"]["recordKeyName"]]:
+        time.sleep(_CONFIG["recordStartDelaySec"])
         _is_inferring = True
 
 

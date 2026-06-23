@@ -38,7 +38,7 @@ def _on_press(key):
     record_key_name = _CONFIG["keys"]["recordKeyName"]
 
     if key == Key[record_key_name]:
-        time.sleep(0.1)
+        time.sleep(_CONFIG["recordStartDelaySec"])
         _is_recording = True
         print("Recording started.")
     elif key == Key[exit_key_name]:
