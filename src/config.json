@@ -40,15 +40,28 @@
         "checkpointDirName": "checkpoints"
     },
     "training": {
-        "batchSize": 1,
-        "accumulationSteps": 4,
-        "seqLen": 256,
+        "batchSize": 2,
+        "accumulationSteps": 8,
+        "seqLen": 128,
         "learningRate": 3e-4,
         "beta1": 0.9,
         "beta2": 0.999,
-        "weightDecay": 1e-4,
-        "checkpointSaveInterval": 5,
-        "epochs": 100
+        "weightDecay": 0.0,
+        "checkpointSaveInterval": 10,
+        "epochs": 300,
+        "classWeights": [
+            0.6804,
+            1.8856
+        ],
+        "labelDistribution": [
+            0.02,
+            0.08,
+            0.2,
+            0.4,
+            0.2,
+            0.08,
+            0.02
+        ]
     },
     "keys": {
         "exitKeyName": "backspace",
