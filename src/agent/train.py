@@ -170,7 +170,20 @@ def _process_batch(
     class_weights: Tensor,
     device: torch.device,
 ) -> tuple[Tensor, Tensor]:
-    """Process a single batch through the model and calculate loss."""
+    """Process a single batch through the model and calculate loss.
+
+    Args:
+        model: the neural network.
+        frames: [N, T, H, W].
+        actions_bin: [N, T].
+        are_first: [N].
+        hidden: [N, L, D].
+        class_weights: [V].
+        device: The device.
+
+    Returns:
+        A tuple of the loss and new hidden state.
+    """
     vocab_size: int = _CONFIG["model"]["vocabSize"]
 
     keep_hidden_mask = ~are_first
@@ -199,8 +212,21 @@ def _process_batch(
     # Ensure hidden state doesn't effect the gradients of the entire dataset.
     hidden_state = hidden_state.detach()
 
+    target_one_hot = F.one_hot(target_actions_bin, num_classes=vocab_size).to(dtype=torch.float32)
+    kernel = (
+        torch.tensor([0.02, 0.08, 0.2, 0.4, 0.2, 0.08, 0.02], device=device, dtype=torch.float32)
+        .view(1, 1, 7)
+        .repeat(vocab_size, 1, 1)
+    )
+
+    smoothed_targets = F.conv1d(target_one_hot.transpose(1, 2), kernel, padding=3, groups=vocab_size)
+    smoothed_targets = smoothed_targets.transpose(1, 2)
+
+    # Normalize because of edge padding.
+    smoothed_targets = smoothed_targets / smoothed_targets.sum(dim=-1, keepdim=True)
+
     logits: Tensor = logits.reshape(-1, vocab_size)
-    target_actions: Tensor = target_actions_bin.reshape(-1)
+    target_actions: Tensor = smoothed_targets.reshape(-1, vocab_size)
 
     loss: Tensor = F.cross_entropy(
         logits,
@@ -253,7 +279,7 @@ def _train():
         start_epoch: int = 1
 
     for epoch in range(start_epoch, epochs + 1):
-        class_weights = torch.tensor([0.6804, 1.8856], device=device, dtype=torch.float32)
+        class_weights = torch.tensor(_CONFIG_TRAINING["classWeights"], device=device, dtype=torch.float32)
 
         model.train()
         num_train_batches = 0
