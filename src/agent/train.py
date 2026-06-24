@@ -213,13 +213,15 @@ def _process_batch(
     hidden_state = hidden_state.detach()
 
     target_one_hot = F.one_hot(target_actions_bin, num_classes=vocab_size).to(dtype=torch.float32)
+    label_distribution = _CONFIG_TRAINING["labelDistribution"]
+    kernel_size = len(label_distribution)
     kernel = (
-        torch.tensor([0.02, 0.08, 0.2, 0.4, 0.2, 0.08, 0.02], device=device, dtype=torch.float32)
-        .view(1, 1, 7)
+        torch.tensor(label_distribution, device=device, dtype=torch.float32)
+        .view(1, 1, kernel_size)
         .repeat(vocab_size, 1, 1)
     )
 
-    smoothed_targets = F.conv1d(target_one_hot.transpose(1, 2), kernel, padding=3, groups=vocab_size)
+    smoothed_targets = F.conv1d(target_one_hot.transpose(1, 2), kernel, padding=kernel_size // 2, groups=vocab_size)
     smoothed_targets = smoothed_targets.transpose(1, 2)
 
     # Normalize because of edge padding.
