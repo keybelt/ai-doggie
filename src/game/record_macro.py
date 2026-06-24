@@ -201,5 +201,8 @@ def _record(macro_name: str):
 
 
 if __name__ == "__main__":
-    macro_name = sys.argv[1]
+    downloads_dir = Path.home() / "Downloads"
+    macro_name = str(next(downloads_dir.glob("*.gdr")))
+    print(f"Using macro: {macro_name}")
+
     _record(macro_name)
