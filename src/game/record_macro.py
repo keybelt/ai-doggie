@@ -202,10 +202,12 @@ def _record(macro_name: str):
 
 if __name__ == "__main__":
     downloads_dir = Path.home() / "Downloads"
-    macro_name = str(next(downloads_dir.glob("*.json")))
 
-    # Prioritize gdr.
-    macro_name = str(next(downloads_dir.glob("*.gdr")))
+    try:
+        macro_name = str(next(downloads_dir.glob("*.gdr")))
+    except StopIteration:
+        macro_name = str(next(downloads_dir.glob("*.json")))
+
     print(f"Using macro: {macro_name}")
 
     _record(macro_name)
