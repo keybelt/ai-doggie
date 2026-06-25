@@ -115,10 +115,10 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     if (isRecordingMode) {
       data->currActionBin = 0;
       data->frameIdx = frameIdx;
-      data->frameReadyBin = 1;
       data->actionReadyBin = 0;
+      data->frameReadyBin = 1;
 
-      int timeout = 1000000;
+      int timeout = 4000000;
       while (data->actionReadyBin == 0 && timeout > 0) {
         timeout--;
       }
