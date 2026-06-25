@@ -84,7 +84,7 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
 
         if mouse_btn == 1:  # and not is_player2:
             if macro_fps != _CONFIG["macroFps"]:
-                frame_idx = round(frame_idx * _CONFIG["macroFps"] / macro_fps)
+                frame_idx = round(round(frame_idx * _CONFIG["macroFps"]) / round(macro_fps))
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
 
@@ -202,6 +202,9 @@ def _record(macro_name: str):
 
 if __name__ == "__main__":
     downloads_dir = Path.home() / "Downloads"
+    macro_name = str(next(downloads_dir.glob("*.json")))
+
+    # Prioritize gdr.
     macro_name = str(next(downloads_dir.glob("*.gdr")))
     print(f"Using macro: {macro_name}")
 
