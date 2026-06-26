@@ -32,8 +32,9 @@ LR = _CONFIG_TRAINING["learningRate"]
 class _DatasetGenerator(IterableDataset):
     """Yield training batches built from parallel gameplay streams."""
 
-    def __init__(self, files: list[Path]):
+    def __init__(self, files: list[Path], is_val: bool):
         self.files = files
+        self.is_val = is_val
 
     def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch together mini batches from each file stream.
@@ -43,7 +44,7 @@ class _DatasetGenerator(IterableDataset):
         """
 
         dataset_files: list[Path] = self.files.copy()
-        random.shuffle(self.files)
+        random.shuffle(dataset_files)
 
         file_streams: list[Iterator[tuple[np.ndarray, np.ndarray, bool]]] = [
             self._stream_file(dataset_files.pop(0)) for _ in range(BATCH_SIZE)
@@ -104,6 +105,19 @@ class _DatasetGenerator(IterableDataset):
             frames: np.ndarray
             actions_bin: np.ndarray
             frames, actions_bin = data["frames"], data["actions_bin"]
+
+            # Per-file translational invariance.
+            _, H, W, _ = frames.shape
+            input_H = _CONFIG["model"]["inputHeightPx"]
+            input_W = _CONFIG["model"]["inputWidthPx"]
+
+            if self.is_val:
+                h_offset = (H - input_H) // 2
+                w_offset = (W - input_W) // 2
+            else:
+                h_offset = random.randint(0, H - input_H)
+                w_offset = random.randint(0, W - input_W)
+            frames = frames[:, h_offset : h_offset + input_H, w_offset : w_offset + input_W, :]
 
             num_chunks = (len(frames) - 1) // _CONFIG_TRAINING["seqLen"]
 
@@ -248,11 +262,13 @@ def _train():
 
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
     dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
-    dataset: list[Path] = list(dataset_files_src.glob("*.npz"))[2:]
-    validation_set: list[Path] = list(dataset_files_src.glob("*.npz"))[:2]
 
-    dataloader: DataLoader = DataLoader(_DatasetGenerator(dataset), batch_size=None)
-    dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(validation_set), batch_size=None)
+    all_files = list(dataset_files_src.glob("*.npz"))
+    validation_set = random.sample(all_files, 3)
+    dataset = [f for f in all_files if f not in validation_set]
+
+    dataloader: DataLoader = DataLoader(_DatasetGenerator(dataset, is_val=False), batch_size=None)
+    dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(validation_set, is_val=True), batch_size=None)
     model: Model = Model().to(device)
     model.train()
 
@@ -336,7 +352,7 @@ def _train():
 
         avg_val_loss = (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0
 
-        print(f"Epoch {epoch} completed | Train loss: {avg_train_loss:.2f} | Validation loss: {avg_val_loss:.2f}")
+        print(f"Epoch {epoch} completed | Training loss: {avg_train_loss:.2f} | Validation loss: {avg_val_loss:.2f}")
 
         if epoch % checkpoint_save_interval == 0:
             checkpoint_path = checkpoint_dir / f"epoch_{epoch}.pt"
