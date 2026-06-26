@@ -31,39 +31,28 @@ class Model(nn.Module):
 
         shapes = _CONFIG_MODEL["weightShapes"]
 
-        self._conv1 = nn.Conv2d(
-            shapes["conv1"]["inChannels"],
-            shapes["conv1"]["outChannels"],
-            kernel_size=shapes["conv1"]["kernelSize"],
-            stride=shapes["conv1"]["stride"],
-        )
-
-        self._conv2 = nn.Conv2d(
-            shapes["conv2"]["inChannels"],
-            shapes["conv2"]["outChannels"],
-            kernel_size=shapes["conv2"]["kernelSize"],
-            stride=shapes["conv2"]["stride"],
-        )
-
-        self._conv3 = nn.Conv2d(
-            shapes["conv3"]["inChannels"],
-            shapes["conv3"]["outChannels"],
-            kernel_size=shapes["conv3"]["kernelSize"],
-            stride=shapes["conv3"]["stride"],
-        )
-
-
+        conv_layers = []
+        for name, shape in shapes.items():
+            in_ch = shape["inChannels"]
+            if name == "conv1":
+                in_ch += 2  # CoordConv channels.
+            conv_layers.append(
+                nn.Conv2d(
+                    in_ch,
+                    shape["outChannels"],
+                    kernel_size=shape["kernelSize"],
+                    stride=shape["stride"],
+                )
+            )
+        self._convs = nn.ModuleList(conv_layers)
 
         # Dynamically calculate flattened size.
         with torch.inference_mode():
-            frame_H_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
-            frame_W_px = _CONFIG["capture"]["frameDims"]["pipelineWidthPx"]
-
             dummy = torch.zeros(
                 1,
                 shapes["conv1"]["inChannels"],
-                frame_H_px,
-                frame_W_px,
+                _CONFIG_MODEL["inputHeightPx"],
+                _CONFIG_MODEL["inputWidthPx"],
             )
             flat_size = self._conv_forward(dummy).numel()
 
@@ -77,7 +66,7 @@ class Model(nn.Module):
 
     def _init_params(self):
         """He/Kaiming init for conv+ReLU, Xavier for GRU, default for output."""
-        for module in [self._conv1, self._conv2, self._conv3]:
+        for module in self._convs:
             nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
             nn.init.zeros_(module.bias)
 
@@ -96,7 +85,7 @@ class Model(nn.Module):
         self,
         X: Tensor,
     ) -> Tensor:
-        """3 conv layers with ReLU, stride-only downsampling.
+        """Sequential conv layers with CoordConv, ReLU, and stride-only downsampling.
 
         Args:
             X: [N, C, H, W].
@@ -104,9 +93,13 @@ class Model(nn.Module):
         Returns:
             Tensor of shape [N, C', H', W'].
         """
-        X = torch.relu(self._conv1(X))
-        X = torch.relu(self._conv2(X))
-        X = torch.relu(self._conv3(X))
+        batch_size, _, h, w = X.size()
+        y_coords = torch.linspace(-1, 1, h, device=X.device).view(1, 1, h, 1).expand(batch_size, 1, h, w)
+        x_coords = torch.linspace(-1, 1, w, device=X.device).view(1, 1, 1, w).expand(batch_size, 1, h, w)
+        X = torch.cat([X, y_coords, x_coords], dim=1)
+
+        for conv in self._convs:
+            X = torch.relu(conv(X))
         return X
 
     def forward(
