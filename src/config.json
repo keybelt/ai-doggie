@@ -10,6 +10,8 @@
         "fps": 120
     },
     "model": {
+        "inputHeightPx": 380,
+        "inputWidthPx": 540,
         "weightShapes": {
             "conv1": {
                 "inChannels": 3,
@@ -19,18 +21,30 @@
             },
             "conv2": {
                 "inChannels": 32,
-                "outChannels": 16,
+                "outChannels": 48,
+                "kernelSize": 3,
+                "stride": 4
+            },
+            "conv3": {
+                "inChannels": 48,
+                "outChannels": 64,
                 "kernelSize": 3,
                 "stride": 2
             },
-            "conv3": {
-                "inChannels": 16,
-                "outChannels": 8,
+            "conv4": {
+                "inChannels": 64,
+                "outChannels": 64,
+                "kernelSize": 3,
+                "stride": 2
+            },
+            "conv5": {
+                "inChannels": 64,
+                "outChannels": 64,
                 "kernelSize": 3,
                 "stride": 2
             }
         },
-        "hiddenDim": 8,
+        "hiddenDim": 64,
         "vocabSize": 2,
         "deviceName": "mps"
     },
@@ -46,21 +60,19 @@
         "learningRate": 3e-4,
         "beta1": 0.9,
         "beta2": 0.999,
-        "weightDecay": 0.0,
+        "weightDecay": 1e-2,
         "checkpointSaveInterval": 10,
-        "epochs": 300,
+        "epochs": 150,
         "classWeights": [
-            0.6804,
-            1.8856
+            0.8253,
+            1.3712
         ],
         "labelDistribution": [
-            0.02,
-            0.08,
-            0.2,
-            0.4,
-            0.2,
-            0.08,
-            0.02
+            0.05,
+            0.20,
+            0.50,
+            0.20,
+            0.05
         ]
     },
     "keys": {
