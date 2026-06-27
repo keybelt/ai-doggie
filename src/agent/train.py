@@ -263,7 +263,7 @@ def _train():
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
     dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
-    all_files = list(dataset_files_src.glob("*.npz"))
+    all_files = sorted(dataset_files_src.glob("*.npz"))
     validation_set = random.sample(all_files, 3)
     dataset = [f for f in all_files if f not in validation_set]
 
