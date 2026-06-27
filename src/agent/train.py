@@ -309,14 +309,14 @@ def _train():
             device=device,
         )
 
+        accumulation_steps: int = _CONFIG["training"]["accumulationSteps"]
+
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
             num_train_batches = i + 1
 
             loss, hidden_state = _process_batch(
                 model, frames, actions_bin, are_first, hidden_state, class_weights, device
             )
-
-            accumulation_steps = _CONFIG["training"]["accumulationSteps"]
 
             scaled_loss = loss / accumulation_steps
             scaled_loss.backward()
@@ -327,6 +327,11 @@ def _train():
                 optimizer.zero_grad(set_to_none=True)
 
             train_loss_tensor += loss.detach()
+
+        if num_train_batches % accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         avg_train_loss = (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0
 

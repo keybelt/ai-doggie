@@ -55,7 +55,7 @@
     },
     "training": {
         "batchSize": 1,
-        "accumulationSteps": 4,
+        "accumulationSteps": 8,
         "seqLen": 256,
         "learningRate": 3e-4,
         "beta1": 0.9,
