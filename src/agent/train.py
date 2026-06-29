@@ -181,24 +181,21 @@ def _process_batch(
     actions_bin: Tensor,
     are_first: Tensor,
     hidden: Tensor,
-    class_weights: Tensor,
-    device: torch.device,
 ) -> tuple[Tensor, Tensor]:
     """Process a single batch through the model and calculate loss.
 
     Args:
         model: the neural network.
-        frames: [N, T, H, W].
+        frames: [N, T, H, W, C].
         actions_bin: [N, T].
         are_first: [N].
         hidden: [N, L, D].
-        class_weights: [V].
-        device: The device.
 
     Returns:
         A tuple of the loss and new hidden state.
     """
-    vocab_size: int = _CONFIG["model"]["vocabSize"]
+    device = torch.device(_CONFIG["model"]["deviceName"])
+    class_weights = torch.tensor(_CONFIG_TRAINING["classWeights"], device=device, dtype=torch.float32)
 
     keep_hidden_mask = ~are_first
     keep_hidden_mask = (
@@ -226,28 +223,24 @@ def _process_batch(
     # Ensure hidden state doesn't effect the gradients of the entire dataset.
     hidden_state = hidden_state.detach()
 
-    target_one_hot = F.one_hot(target_actions_bin, num_classes=vocab_size).to(dtype=torch.float32)
-    label_distribution = _CONFIG_TRAINING["labelDistribution"]
-    kernel_size = len(label_distribution)
-    kernel = (
-        torch.tensor(label_distribution, device=device, dtype=torch.float32)
-        .view(1, 1, kernel_size)
-        .repeat(vocab_size, 1, 1)
-    )
+    probs = F.softmax(logits, dim=-1)
+    p_jump = probs[..., 1].unsqueeze(1)  # [N, 1, T]
+    p_no_jump = probs[..., 0]  # [N, T]
 
-    smoothed_targets = F.conv1d(target_one_hot.transpose(1, 2), kernel, padding=kernel_size // 2, groups=vocab_size)
-    smoothed_targets = smoothed_targets.transpose(1, 2)
+    kernel_size = _CONFIG_TRAINING["distributionSize"]
+    padding = kernel_size // 2
+    max_p_jump = F.max_pool1d(p_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1)
 
-    # Normalize because of edge padding.
-    smoothed_targets = smoothed_targets / smoothed_targets.sum(dim=-1, keepdim=True)
+    is_jump = target_actions_bin.to(dtype=torch.float32).unsqueeze(1)
 
-    logits: Tensor = logits.reshape(-1, vocab_size)
-    target_actions: Tensor = smoothed_targets.reshape(-1, vocab_size)
+    # Use > 0.5 rather than == 1 to mitigate floating point precision issues.
+    in_window = F.max_pool1d(is_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1) > 0.5
 
-    loss: Tensor = F.cross_entropy(
-        logits,
-        target_actions,
-        weight=class_weights,
+    loss_no_jump = -torch.log(p_no_jump + 1e-8) * (~in_window)
+    loss_jump = -torch.log(max_p_jump + 1e-8) * (target_actions_bin == 1)
+
+    loss = (torch.sum(loss_no_jump * class_weights[0]) + torch.sum(loss_jump * class_weights[1])) / (
+        (~in_window).sum() * class_weights[0] + (target_actions_bin == 1).sum() * class_weights[1]
     )
 
     return loss, hidden_state
@@ -264,11 +257,10 @@ def _train():
     dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
     all_files = sorted(dataset_files_src.glob("*.npz"))
-    validation_set = random.sample(all_files, 3)
-    dataset = [f for f in all_files if f not in validation_set]
+    num_val = _CONFIG["training"].get("numValidationFiles", 3)
+    dataloader: DataLoader = DataLoader(_DatasetGenerator(all_files[num_val:], is_val=False), batch_size=None)
+    dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(all_files[:num_val], is_val=True), batch_size=None)
 
-    dataloader: DataLoader = DataLoader(_DatasetGenerator(dataset, is_val=False), batch_size=None)
-    dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(validation_set, is_val=True), batch_size=None)
     model: Model = Model().to(device)
     model.train()
 
@@ -297,8 +289,6 @@ def _train():
         start_epoch: int = 1
 
     for epoch in range(start_epoch, epochs + 1):
-        class_weights = torch.tensor(_CONFIG_TRAINING["classWeights"], device=device, dtype=torch.float32)
-
         model.train()
         num_train_batches = 0
         train_loss_tensor: Tensor = torch.zeros(1, device=device)
@@ -314,9 +304,7 @@ def _train():
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
             num_train_batches = i + 1
 
-            loss, hidden_state = _process_batch(
-                model, frames, actions_bin, are_first, hidden_state, class_weights, device
-            )
+            loss, hidden_state = _process_batch(model, frames, actions_bin, are_first, hidden_state)
 
             scaled_loss = loss / accumulation_steps
             scaled_loss.backward()
@@ -349,9 +337,7 @@ def _train():
             for i, (frames, actions_bin, are_first) in enumerate(dataloader_validation):
                 num_val_batches = i + 1
 
-                loss, hidden_state = _process_batch(
-                    model, frames, actions_bin, are_first, hidden_state, class_weights, device
-                )
+                loss, hidden_state = _process_batch(model, frames, actions_bin, are_first, hidden_state)
 
                 val_loss_tensor += loss.detach()
 
