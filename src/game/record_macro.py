@@ -45,7 +45,7 @@ def _on_press(key):
         _is_shutdown = True
 
 
-def _load_macro(filepath: str) -> list[tuple[int, int]]:
+def _load_macro(filepath: Path) -> list[tuple[int, int]]:
     """Unpack .gdr macro files with a modified version of maxnut/gdr-converter's algorithm.
 
     Returns:
@@ -56,7 +56,7 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
 
     macro_events: list[tuple[int, int]] = []
 
-    macro_data = Path(filepath).read_bytes()
+    macro_data = filepath.read_bytes()
 
     try:
         # Unpack with utf8 decoding.
@@ -69,7 +69,7 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
             print("Macro parsed using msgpack.")
         except msgpack.exceptions.ExtraData:
             cli_path = Path(__file__).parent.parent.parent / "third_party" / "macro_parser"
-            result = subprocess.run([str(cli_path), filepath], capture_output=True, text=True)
+            result = subprocess.run([str(cli_path), str(filepath)], capture_output=True, text=True)
             parsed_macro = json.loads(result.stdout)
             print("Macro parsed with C++ fallback.")
 
@@ -83,7 +83,7 @@ def _load_macro(filepath: str) -> list[tuple[int, int]]:
         is_keydown = macro_input["down"]
 
         if mouse_btn == 1:  # and not is_player2:
-            if macro_fps != _CONFIG["macroFps"]:
+            if round(macro_fps) != _CONFIG["macroFps"] and macro_fps is not None:
                 frame_idx = round(round(frame_idx * _CONFIG["macroFps"]) / round(macro_fps))
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
@@ -120,11 +120,6 @@ def _shm_bridge(macro_events: list[tuple[int, int]]):
         if frame_ready_bin == 1:
             frame_idx = unpack("i", shm.buf[0:4])[0]
 
-            # Reset event index on respawn / level restart
-            if frame_idx < 5:
-                event_idx = 0
-                _curr_action_bin = 0
-
             # Only passes if there are macro events left over, and if our current frame matches or is ahead of the macro event's frame.
             while event_idx < len(macro_events) and frame_idx >= macro_events[event_idx][0]:
                 _curr_action_bin = macro_events[event_idx][1]
@@ -139,7 +134,7 @@ def _shm_bridge(macro_events: list[tuple[int, int]]):
     shm.unlink()
 
 
-def _record(macro_name: str):
+def _record(filepath: Path):
     """Initialize game environment, shared memory, run frame + action pair recording loop."""
     buf_max_frames = _CONFIG["bufMaxFrames"]
     frame_height_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
@@ -149,7 +144,7 @@ def _record(macro_name: str):
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
     dataset_dir: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
-    macro_events: list[tuple[int, int]] = _load_macro(macro_name)
+    macro_events: list[tuple[int, int]] = _load_macro(filepath)
 
     shm_thread = threading.Thread(target=_shm_bridge, args=(macro_events,), daemon=True)
     shm_thread.start()
@@ -189,9 +184,10 @@ def _record(macro_name: str):
 
     should_save: str = input("\nSave this recording? (Y/n): ")
     if should_save == "n":
+        filepath.unlink()
         return
 
-    save_path = dataset_dir / f"{Path(macro_name).name}-{time.strftime('%m%d%H%M%S')}"
+    save_path = dataset_dir / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
     np.savez_compressed(
         save_path,
         frames=frames_buf[:frame_idx],
@@ -199,15 +195,17 @@ def _record(macro_name: str):
     )
     print(f"\nSaved recording to {save_path}")
 
+    filepath.unlink()
+
 
 if __name__ == "__main__":
     downloads_dir = Path.home() / "Downloads"
 
     try:
-        macro_name = str(next(downloads_dir.glob("*.gdr")))
+        macro_path = next(downloads_dir.glob("*.gdr"))
     except StopIteration:
-        macro_name = str(next(downloads_dir.glob("*.json")))
+        macro_path = next(downloads_dir.glob("*.json"))
 
-    print(f"Using macro: {macro_name}")
+    print(f"Using macro: {macro_path}")
 
-    _record(macro_name)
+    _record(macro_path)
