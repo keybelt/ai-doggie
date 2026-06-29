@@ -164,13 +164,12 @@ def _record(filepath: Path):
     game_env.clear_frame_queue()
 
     while not _is_shutdown:
-        frame, is_stale = game_env.get_frame()
+        frame, is_stale = game_env.get_frame(clear_queue=not _is_recording)
 
         if frame_idx >= buf_max_frames:
             print("Frame buffer exceeded.")
             break
 
-        game_env.clear_frame_queue()
         if _is_recording and not is_stale:
             frames_buf[frame_idx] = frame
             actions_bin_buf[frame_idx] = _curr_action_bin

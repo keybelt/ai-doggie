@@ -53,13 +53,14 @@ class GameEnv:
         except queue.Empty:
             pass
 
-    def get_frame(self) -> tuple[np.ndarray, bool]:
+    def get_frame(self, clear_queue: bool) -> tuple[np.ndarray, bool]:
         """Return the latest frame, recycle a previous frame if capture_engine doesn't have a fresh one ready.
 
         Returns:
             The frame in RGB format, and whether the frame is fresh or reused.
         """
-        self.clear_frame_queue()
+        if clear_queue:
+            self.clear_frame_queue()
 
         is_stale = False
         try:
@@ -67,7 +68,7 @@ class GameEnv:
             bgra_frame = self.capture_engine.queue_full.get(
                 timeout=1 / pipeline_fps,
             )
-            frame_no_alpha = bgra_frame[:, :, :3]
+            frame_no_alpha = bgra_frame[:, :, :3].copy()
 
             self.capture_engine.queue_empty.put_nowait(bgra_frame)
             self._last_fresh_frame = frame_no_alpha

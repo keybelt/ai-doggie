@@ -49,12 +49,12 @@
         "beta1": 0.9,
         "beta2": 0.999,
         "weightDecay": 1e-4,
-        "numValidationFiles": 5,
-        "checkpointSaveInterval": 50,
-        "epochs": 500,
+        "numValidationFiles": 10,
+        "checkpointSaveInterval": 10,
+        "epochs": 100,
         "classWeights": [
-            0.6811,
-            1.8801
+            0.6853,
+            1.8491
         ],
         "distributionSize": 5
     },
@@ -63,7 +63,7 @@
         "recordKeyName": "space"
     },
     "shmName": "GDMem",
-    "bufMaxFrames": 50000,
+    "bufMaxFrames": 75000,
     "logIntervalSec": 1,
     "macroFps": 240,
     "recordStartDelaySec": 0.2
