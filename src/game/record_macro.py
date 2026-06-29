@@ -177,7 +177,7 @@ def _record(filepath: Path):
             frame_idx += 1
 
             if frame_idx % log_interval == 0:
-                print(f"\rRecord frames: {frame_idx}", end="", flush=True)
+                print(f"\nFrames recorded: {frame_idx}", end="", flush=True)
 
     listener.stop()
     game_env.capture_engine.stop_capture_stream()
