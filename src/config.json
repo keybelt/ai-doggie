@@ -6,7 +6,7 @@
             "pipelineHeightPx": 480,
             "pipelineWidthPx": 640
         },
-        "queueDepth": 3,
+        "queueDepth": 2,
         "fps": 120
     },
     "model": {
@@ -16,35 +16,23 @@
             "conv1": {
                 "inChannels": 3,
                 "outChannels": 32,
-                "kernelSize": 3,
-                "stride": 2
+                "kernelSize": 5,
+                "stride": 4
             },
             "conv2": {
                 "inChannels": 32,
-                "outChannels": 48,
-                "kernelSize": 3,
-                "stride": 2
+                "outChannels": 128,
+                "kernelSize": 5,
+                "stride": 4
             },
             "conv3": {
-                "inChannels": 48,
-                "outChannels": 64,
-                "kernelSize": 3,
-                "stride": 2
-            },
-            "conv4": {
-                "inChannels": 64,
-                "outChannels": 64,
-                "kernelSize": 3,
-                "stride": 2
-            },
-            "conv5": {
-                "inChannels": 64,
+                "inChannels": 128,
                 "outChannels": 64,
                 "kernelSize": 3,
                 "stride": 2
             }
         },
-        "hiddenDim": 256,
+        "hiddenDim": 512,
         "vocabSize": 2,
         "deviceName": "mps"
     },
@@ -55,25 +43,20 @@
     },
     "training": {
         "batchSize": 1,
-        "accumulationSteps": 8,
-        "seqLen": 256,
+        "accumulationSteps": 4,
+        "seqLen": 512,
         "learningRate": 3e-4,
         "beta1": 0.9,
         "beta2": 0.999,
         "weightDecay": 1e-4,
-        "checkpointSaveInterval": 10,
-        "epochs": 100,
+        "numValidationFiles": 5,
+        "checkpointSaveInterval": 50,
+        "epochs": 500,
         "classWeights": [
-            0.8253,
-            1.3712
+            0.6811,
+            1.8801
         ],
-        "labelDistribution": [
-            0.02,
-            0.08,
-            0.80,
-            0.08,
-            0.02
-        ]
+        "distributionSize": 5
     },
     "keys": {
         "exitKeyName": "backspace",
