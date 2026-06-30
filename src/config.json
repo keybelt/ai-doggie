@@ -38,6 +38,8 @@
     },
     "fileNames": {
         "datasetDirName": "data",
+        "trainingDirName": "training",
+        "validationDirName": "validation",
         "checkpointName": "",
         "checkpointDirName": "checkpoints"
     },
@@ -45,11 +47,10 @@
         "batchSize": 1,
         "accumulationSteps": 4,
         "seqLen": 512,
-        "learningRate": 3e-4,
+        "learningRate": 0.0003,
         "beta1": 0.9,
         "beta2": 0.999,
-        "weightDecay": 1e-4,
-        "numValidationFiles": 10,
+        "weightDecay": 0.0001,
         "checkpointSaveInterval": 10,
         "epochs": 100,
         "classWeights": [

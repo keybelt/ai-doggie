@@ -254,12 +254,18 @@ def _train():
     checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
 
     dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-    dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
+    training_dir_name = _CONFIG["fileNames"]["trainingDirName"]
+    validation_dir_name = _CONFIG["fileNames"]["validationDirName"]
 
-    all_files = sorted(dataset_files_src.glob("*.npz"))
-    num_val = _CONFIG["training"].get("numValidationFiles", 3)
-    dataloader: DataLoader = DataLoader(_DatasetGenerator(all_files[num_val:], is_val=False), batch_size=None)
-    dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(all_files[:num_val], is_val=True), batch_size=None)
+    dataset_files_src: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
+    train_files_src: Path = dataset_files_src / training_dir_name
+    val_files_src: Path = dataset_files_src / validation_dir_name
+
+    train_files = list(train_files_src.glob("*.npz"))
+    val_files = list(val_files_src.glob("*.npz"))
+
+    dataloader: DataLoader = DataLoader(_DatasetGenerator(train_files, is_val=False), batch_size=None)
+    dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(val_files, is_val=True), batch_size=None)
 
     model: Model = Model().to(device)
     model.train()
