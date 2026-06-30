@@ -19,7 +19,7 @@ from torch import Tensor
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from agent.model import Model
-from game.game_env import GameEnv
+from game.screen_capture import start_capture_engine
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
@@ -96,7 +96,7 @@ def _infer():
 
     model.eval()
 
-    env: GameEnv = GameEnv()
+    capture_engine = start_capture_engine()
 
     hidden_state: Tensor = torch.zeros(  # [N, L, D]
         1,
@@ -108,7 +108,7 @@ def _infer():
 
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
     now = time.perf_counter()
-    frame_drop_cache = env.capture_engine.frame_drops
+    frame_drop_cache = capture_engine.frame_drops
 
     i = 0
     with torch.inference_mode():
@@ -118,7 +118,9 @@ def _infer():
 
             i += 1
 
-            frame_HWC, _ = env.get_frame()
+            bgra_frame = capture_engine.queue_full.get()
+            frame_HWC = bgra_frame[:, :, :3].copy()
+            capture_engine.queue_empty.put_nowait(bgra_frame)
 
             time_start: float = time.perf_counter()
 
@@ -145,7 +147,7 @@ def _infer():
 
             if i % log_interval == 0:
                 elapsed = time.perf_counter() - now
-                drops = env.capture_engine.frame_drops - frame_drop_cache
+                drops = capture_engine.frame_drops - frame_drop_cache
                 print(
                     f"\rInference latency: {infer_time:.2f}ms | Frame drops: {drops / elapsed:.2f}/s",
                     end="",
@@ -153,10 +155,10 @@ def _infer():
                 )
                 now, frame_drop_cache = (
                     time.perf_counter(),
-                    env.capture_engine.frame_drops,
+                    capture_engine.frame_drops,
                 )
 
-    env.capture_engine.stop_capture_stream()
+    capture_engine.stop_capture_stream()
 
 
 if __name__ == "__main__":

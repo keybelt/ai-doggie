@@ -20,7 +20,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from pynput.keyboard import Key, Listener
 
-from game.game_env import GameEnv
+from game.screen_capture import start_capture_engine
 
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
@@ -152,7 +152,7 @@ def _record(filepath: Path):
     listener = Listener(on_press=_on_press)
     listener.start()
 
-    game_env: GameEnv = GameEnv()
+    capture_engine = start_capture_engine()
 
     frames_buf: np.ndarray = np.empty(
         (buf_max_frames, frame_height_px, frame_width_px, 3),
@@ -163,13 +163,15 @@ def _record(filepath: Path):
     frame_idx = 0
 
     while not _is_shutdown:
-        frame, is_stale = game_env.get_frame()
+        bgra_frame = capture_engine.queue_full.get()
+        frame = bgra_frame[:, :, :3].copy()
+        capture_engine.queue_empty.put_nowait(bgra_frame)
 
         if frame_idx >= buf_max_frames:
             print("Frame buffer exceeded.")
             break
 
-        if _is_recording and not is_stale:
+        if _is_recording:
             frames_buf[frame_idx] = frame
             actions_bin_buf[frame_idx] = _curr_action_bin
             frame_idx += 1
@@ -178,7 +180,7 @@ def _record(filepath: Path):
                 print(f"\rFrames recorded: {frame_idx}", end="", flush=True)
 
     listener.stop()
-    game_env.capture_engine.stop_capture_stream()
+    capture_engine.stop_capture_stream()
 
     should_save: str = input("\nSave this recording? (Y/n): ")
     if should_save == "n":
