@@ -83,7 +83,7 @@ def _load_macro(filepath: Path) -> list[tuple[int, int]]:
         is_keydown = macro_input["down"]
 
         if mouse_btn == 1:  # and not is_player2:
-            if round(macro_fps) != _CONFIG["macroFps"] and macro_fps is not None:
+            if macro_fps is not None and round(macro_fps) != _CONFIG["macroFps"]:
                 frame_idx = round(round(frame_idx * _CONFIG["macroFps"]) / round(macro_fps))
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
@@ -161,10 +161,9 @@ def _record(filepath: Path):
     actions_bin_buf = np.zeros(buf_max_frames, dtype=np.uint8)
 
     frame_idx = 0
-    game_env.clear_frame_queue()
 
     while not _is_shutdown:
-        frame, is_stale = game_env.get_frame(clear_queue=not _is_recording)
+        frame, is_stale = game_env.get_frame()
 
         if frame_idx >= buf_max_frames:
             print("Frame buffer exceeded.")
@@ -176,7 +175,7 @@ def _record(filepath: Path):
             frame_idx += 1
 
             if frame_idx % log_interval == 0:
-                print(f"\nFrames recorded: {frame_idx}", end="", flush=True)
+                print(f"\rFrames recorded: {frame_idx}", end="", flush=True)
 
     listener.stop()
     game_env.capture_engine.stop_capture_stream()

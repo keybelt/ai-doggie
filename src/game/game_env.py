@@ -44,32 +44,20 @@ class GameEnv:
         self.capture_engine.queue_empty.put(frame)
         print("Vision connected.")
 
-    def clear_frame_queue(self):
-        try:
-            while True:
-                # FIFO retrieval, dump all the oldest frames.
-                frame = self.capture_engine.queue_full.get_nowait()
-                self.capture_engine.queue_empty.put(frame)
-        except queue.Empty:
-            pass
-
-    def get_frame(self, clear_queue: bool) -> tuple[np.ndarray, bool]:
+    def get_frame(self) -> tuple[np.ndarray, bool]:
         """Return the latest frame, recycle a previous frame if capture_engine doesn't have a fresh one ready.
 
         Returns:
             The frame in RGB format, and whether the frame is fresh or reused.
         """
-        if clear_queue:
-            self.clear_frame_queue()
-
         is_stale = False
         try:
-            pipeline_fps = _CONFIG_CAPTURE["fps"]
+            # We use a 1.0s timeout so the OS wakes the thread instantly when a frame arrives, 
+            # rather than oversleeping on a tiny 8ms timeout which caps FPS to ~60.
             bgra_frame = self.capture_engine.queue_full.get(
-                timeout=1 / pipeline_fps,
+                timeout=1.0,
             )
             frame_no_alpha = bgra_frame[:, :, :3].copy()
-
             self.capture_engine.queue_empty.put_nowait(bgra_frame)
             self._last_fresh_frame = frame_no_alpha
 

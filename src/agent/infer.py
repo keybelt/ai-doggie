@@ -118,7 +118,7 @@ def _infer():
 
             i += 1
 
-            frame_HWC, _ = env.get_frame(clear_queue=True)
+            frame_HWC, _ = env.get_frame()
 
             time_start: float = time.perf_counter()
 
