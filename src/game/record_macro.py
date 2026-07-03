@@ -130,6 +130,8 @@ def _shm_bridge(macro_events: list[tuple[int, int]]):
             shm.buf[8:12] = pack("i", 0)
             shm.buf[12:16] = pack("i", 1)
 
+        time.sleep(0)  # this bypasses python GIL to allow consistent 120fps recording
+
     shm.close()
     shm.unlink()
 
