@@ -107,17 +107,17 @@ class _DatasetGenerator(IterableDataset):
             frames, actions_bin = data["frames"], data["actions_bin"]
 
             # Per-file translational invariance.
-            _, H, W, _ = frames.shape
-            input_H = _CONFIG["model"]["inputHeightPx"]
-            input_W = _CONFIG["model"]["inputWidthPx"]
+            # _, H, W, _ = frames.shape
+            # input_H = _CONFIG["model"]["inputHeightPx"]
+            # input_W = _CONFIG["model"]["inputWidthPx"]
 
-            if self.is_val:
-                h_offset = (H - input_H) // 2
-                w_offset = (W - input_W) // 2
-            else:
-                h_offset = random.randint(0, H - input_H)
-                w_offset = random.randint(0, W - input_W)
-            frames = frames[:, h_offset : h_offset + input_H, w_offset : w_offset + input_W, :]
+            # if self.is_val:
+            #     h_offset = (H - input_H) // 2
+            #     w_offset = (W - input_W) // 2
+            # else:
+            #     h_offset = random.randint(0, H - input_H)
+            #     w_offset = random.randint(0, W - input_W)
+            # frames = frames[:, h_offset : h_offset + input_H, w_offset : w_offset + input_W, :]
 
             num_chunks = (len(frames) - 1) // _CONFIG_TRAINING["seqLen"]
 
@@ -194,7 +194,7 @@ def _process_batch(
     Returns:
         A tuple of the loss and new hidden state.
     """
-    device = torch.device(_CONFIG["model"]["deviceName"])
+    device = torch.device("mps")
     class_weights = torch.tensor(_CONFIG_TRAINING["classWeights"], device=device, dtype=torch.float32)
 
     keep_hidden_mask = ~are_first
@@ -223,24 +223,24 @@ def _process_batch(
     # Ensure hidden state doesn't effect the gradients of the entire dataset.
     hidden_state = hidden_state.detach()
 
-    probs = F.softmax(logits, dim=-1)
-    p_jump = probs[..., 1].unsqueeze(1)  # [N, 1, T]
-    p_no_jump = probs[..., 0]  # [N, T]
+    log_probs = F.log_softmax(logits, dim=-1)
+    log_p_no_jump = log_probs[..., 0]  # [N, T]
+    log_p_jump = log_probs[..., 1].unsqueeze(1)  # [N, 1, T]
 
     kernel_size = _CONFIG_TRAINING["distributionSize"]
     padding = kernel_size // 2
-    max_p_jump = F.max_pool1d(p_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1)
+    max_log_p_jump = F.max_pool1d(log_p_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1)
 
     is_jump = target_actions_bin.to(dtype=torch.float32).unsqueeze(1)
 
     # Use > 0.5 rather than == 1 to mitigate floating point precision issues.
     in_window = F.max_pool1d(is_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1) > 0.5
 
-    loss_no_jump = -torch.log(p_no_jump + 1e-8) * (~in_window)
-    loss_jump = -torch.log(max_p_jump + 1e-8) * (target_actions_bin == 1)
+    loss_no_jump = -log_p_no_jump * (~in_window)
+    loss_jump = -max_log_p_jump * (target_actions_bin == 1)
 
     loss = (torch.sum(loss_no_jump * class_weights[0]) + torch.sum(loss_jump * class_weights[1])) / (
-        (~in_window).sum() * class_weights[0] + (target_actions_bin == 1).sum() * class_weights[1]
+        (~in_window).sum() * class_weights[0] + (target_actions_bin == 1).sum() * class_weights[1] + 1e-8
     )
 
     return loss, hidden_state
@@ -248,7 +248,7 @@ def _process_batch(
 
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
-    device: torch.device = torch.device(_CONFIG["model"]["deviceName"])
+    device: torch.device = torch.device("mps")
     hidden_state_dim = _CONFIG["model"]["hiddenDim"]
     epochs = _CONFIG["training"]["epochs"]
     checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
@@ -280,6 +280,8 @@ def _train():
     checkpoint_dir = Path(__file__).resolve().parents[2] / _CONFIG["fileNames"]["checkpointDirName"]
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
     if checkpoint_name:
         checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
             checkpoint_dir / checkpoint_name,
@@ -289,6 +291,7 @@ def _train():
         start_epoch: int = checkpoint["epoch"] + 1
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
 
         print(f"Loading checkpoint {checkpoint_name}.")
     else:
@@ -315,7 +318,7 @@ def _train():
             scaled_loss = loss / accumulation_steps
             scaled_loss.backward()
 
-            if (i + 1) % accumulation_steps == 0:
+            if num_train_batches % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -350,6 +353,7 @@ def _train():
         avg_val_loss = (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0
 
         print(f"Epoch {epoch} completed | Training loss: {avg_train_loss:.2f} | Validation loss: {avg_val_loss:.2f}")
+        scheduler.step()
 
         if epoch % checkpoint_save_interval == 0:
             checkpoint_path = checkpoint_dir / f"epoch_{epoch}.pt"
@@ -358,6 +362,7 @@ def _train():
                     "epoch": epoch,
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
                     "train_loss": avg_train_loss,
                     "val_loss": avg_val_loss,
                 },

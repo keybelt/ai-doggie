@@ -78,7 +78,7 @@ def _infer():
     shm_thread.start()
 
     hidden_state_dim = _CONFIG["model"]["hiddenDim"]
-    device: torch.device = torch.device(_CONFIG["model"]["deviceName"])
+    device: torch.device = torch.device("mps")
 
     base_dir = Path(__file__).resolve().parents[2]
     checkpoint_dir: Path = base_dir / _CONFIG["fileNames"]["checkpointDirName"]
@@ -124,13 +124,13 @@ def _infer():
 
             time_start: float = time.perf_counter()
 
-            H, W, _ = frame_HWC.shape
-            input_H = _CONFIG["model"]["inputHeightPx"]
-            input_W = _CONFIG["model"]["inputWidthPx"]
+            # H, W, _ = frame_HWC.shape
+            # input_H = _CONFIG["model"]["inputHeightPx"]
+            # input_W = _CONFIG["model"]["inputWidthPx"]
 
-            h_offset = (H - input_H) // 2 if H > input_H else 0
-            w_offset = (W - input_W) // 2 if W > input_W else 0
-            frame_HWC = frame_HWC[h_offset : h_offset + input_H, w_offset : w_offset + input_W, :]
+            # h_offset = (H - input_H) // 2 if H > input_H else 0
+            # w_offset = (W - input_W) // 2 if W > input_W else 0
+            # frame_HWC = frame_HWC[h_offset : h_offset + input_H, w_offset : w_offset + input_W, :]
 
             frame_NTHWC = torch.from_numpy(frame_HWC).unsqueeze(0).unsqueeze(0)
             frame_NTHWC = frame_NTHWC.to(device=device, dtype=torch.float32) / 255
