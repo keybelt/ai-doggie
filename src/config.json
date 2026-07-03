@@ -10,8 +10,8 @@
         "fps": 120
     },
     "model": {
-        "inputHeightPx": 448,
-        "inputWidthPx": 608,
+        "inputHeightPx": 480,
+        "inputWidthPx": 640,
         "weightShapes": {
             "conv1": {
                 "inChannels": 3,
@@ -32,9 +32,10 @@
                 "stride": 2
             }
         },
-        "hiddenDim": 512,
+        "hiddenDim": 32,
         "vocabSize": 2,
-        "deviceName": "mps"
+        "attnDim": 16,
+        "numAttHeads": 8
     },
     "fileNames": {
         "datasetDirName": "data",
@@ -44,20 +45,20 @@
         "checkpointDirName": "checkpoints"
     },
     "training": {
-        "batchSize": 1,
+        "batchSize": 4,
         "accumulationSteps": 4,
-        "seqLen": 512,
-        "learningRate": 0.0003,
+        "seqLen": 128,
+        "learningRate": 3e-4,
         "beta1": 0.9,
         "beta2": 0.999,
-        "weightDecay": 0.0001,
-        "checkpointSaveInterval": 10,
-        "epochs": 100,
+        "weightDecay": 0.01,
+        "checkpointSaveInterval": 5,
+        "epochs": 50,
         "classWeights": [
-            0.6853,
-            1.8491
+            0.6801,
+            1.3199
         ],
-        "distributionSize": 5
+        "distributionSize": 7
     },
     "keys": {
         "exitKeyName": "backspace",
