@@ -7,7 +7,7 @@
             "pipelineWidthPx": 640
         },
         "queueDepth": 2,
-        "fps": 120
+        "fps": 60
     },
     "model": {
         "inputHeightPx": 480,
@@ -33,7 +33,7 @@
             }
         },
         "hiddenDim": 32,
-        "vocabSize": 2,
+        "vocabSize": 8,
         "attnDim": 16,
         "numAttHeads": 8
     },

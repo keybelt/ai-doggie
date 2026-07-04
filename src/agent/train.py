@@ -168,7 +168,7 @@ def _preprocess_inputs(
 
     Args:
         frames: [N, T, H, W, C] raw frames.
-        actions_bin: [N, T] action target binaries.
+        actions_bin: [N, T, 4] action target binaries.
         are_first: [N] is_first flags.
         hidden: [N, L, D] previous hidden state.
 
@@ -193,30 +193,34 @@ def _calculate_loss(
 
     Args:
         logits: [N, T, V] model output logits.
-        target_actions_bin: [N, T] target actions on the device.
+        target_actions_bin: [N, T, 4] target actions on the device.
         class_weights: Class weights tensor.
 
     Returns:
         The calculated loss tensor.
     """
-    log_probs = F.log_softmax(logits, dim=-1)
-    log_p_no_jump = log_probs[..., 0]  # [N, T]
-    log_p_jump = log_probs[..., 1].unsqueeze(1)  # [N, 1, T]
+    N, T, _ = logits.shape
+    logits_240 = logits.view(N, T * 4, 2)
+    target_actions_bin_240 = target_actions_bin.view(N, T * 4)
+
+    log_probs = F.log_softmax(logits_240, dim=-1)
+    log_p_no_jump = log_probs[..., 0]  # [N, T * 4]
+    log_p_jump = log_probs[..., 1].unsqueeze(1)  # [N, 1, T * 4]
 
     kernel_size = _CONFIG_TRAINING["distributionSize"]
     padding = kernel_size // 2
     max_log_p_jump = F.max_pool1d(log_p_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1)
 
-    is_jump = target_actions_bin.to(dtype=torch.float32).unsqueeze(1)
+    is_jump = target_actions_bin_240.to(dtype=torch.float32).unsqueeze(1)
 
     # Use > 0.5 rather than == 1 to mitigate floating point precision issues.
     in_window = F.max_pool1d(is_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1) > 0.5
 
     loss_no_jump = -log_p_no_jump * (~in_window)
-    loss_jump = -max_log_p_jump * (target_actions_bin == 1)
+    loss_jump = -max_log_p_jump * (target_actions_bin_240 == 1)
 
     loss = (torch.sum(loss_no_jump * class_weights[0]) + torch.sum(loss_jump * class_weights[1])) / (
-        (~in_window).sum() * class_weights[0] + (target_actions_bin == 1).sum() * class_weights[1] + 1e-8
+        (~in_window).sum() * class_weights[0] + (target_actions_bin_240 == 1).sum() * class_weights[1] + 1e-8
     )
 
     return loss
@@ -234,7 +238,7 @@ def _process_batch(
     Args:
         model: the neural network.
         frames: [N, T, H, W, C].
-        actions_bin: [N, T].
+        actions_bin: [N, T, 4].
         are_first: [N].
         hidden: [N, L, D].
 

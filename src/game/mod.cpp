@@ -107,14 +107,13 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
         return;
     }
 
-    int frameIdx = m_gameState.m_currentProgress / 2;
+    int frameIdx = m_gameState.m_currentProgress / 2; // i got this from eclipse or smth idk why /2 but oh well
+    data->frameIdx = frameIdx;
 
     bool isRecordingMode = (data->actionReadyBin != -1);
     bool isValid = true;
 
-    if (isRecordingMode) {
-      data->currActionBin = 0;
-      data->frameIdx = frameIdx;
+    if (isRecordingMode && (frameIdx % 4 == 0)) {
       data->actionReadyBin = 0;
       data->frameReadyBin = 1;
 
@@ -126,7 +125,7 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     }
 
     if (isValid) {
-      bool shouldJump = (data->currActionBin == 1);
+      bool shouldJump = ((data->currActionBin >> (frameIdx % 4)) & 1);
 
       if (shouldJump && !isJumping) {
         sendClick(PlayerButton::Jump, true, false);

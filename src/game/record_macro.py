@@ -25,7 +25,7 @@ from game.screen_capture import start_capture_engine
 with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
     _CONFIG = json.load(f)
 
-_curr_action_bin = 0
+_macro_actions_240 = None
 _is_shutdown = False
 _is_recording = False
 
@@ -104,6 +104,26 @@ def _process_macro(parsed_macro: dict) -> list[tuple[int, int]]:
     return macro_events
 
 
+def _build_macro_actions_240(macro_events: list[tuple[int, int]]):
+    """Pre-populate a dense 240Hz actions array from sparse macro events.
+
+    Uses fast NumPy slice assignments to fill frame intervals with their active state.
+    """
+    global _macro_actions_240
+
+    max_frame = max(e[0] for e in macro_events) if macro_events else 0
+    # Add a generous padding buffer (100,000 ticks) to avoid index errors at the end of recording
+    _macro_actions_240 = np.zeros(max_frame + 100000, dtype=np.uint8)
+
+    prev_frame = 0
+    current_action = 0
+    for frame, action in macro_events:
+        _macro_actions_240[prev_frame:frame] = current_action
+        prev_frame = frame
+        current_action = action
+    _macro_actions_240[prev_frame:] = current_action
+
+
 def _init_shm() -> SharedMemory:
     """Initialize a shared memory block between this script and the c++ mod."""
     shm_name = _CONFIG["shmName"]
@@ -119,12 +139,9 @@ def _init_shm() -> SharedMemory:
     return shm
 
 
-def _active_shm_process(shm: SharedMemory, macro_events: list[tuple[int, int]]):
+def _active_shm_process(shm: SharedMemory):
     """Run the shared memory loop, processing macro events and updating actions."""
-    global _curr_action_bin
-
-    event_idx = 0
-    _curr_action_bin = 0
+    global _macro_actions_240
 
     while not _is_shutdown:
         # Extract as integer (i).
@@ -133,13 +150,14 @@ def _active_shm_process(shm: SharedMemory, macro_events: list[tuple[int, int]]):
         if frame_ready_bin == 1:
             frame_idx = unpack("i", shm.buf[0:4])[0]
 
-            # Only passes if there are macro events left over, and if our current frame matches or is ahead of the macro event's frame.
-            while event_idx < len(macro_events) and frame_idx >= macro_events[event_idx][0]:
-                _curr_action_bin = macro_events[event_idx][1]
-                event_idx += 1
+            # Slice the 4 actions directly from the pre-populated array
+            a = _macro_actions_240[frame_idx : frame_idx + 4]
+
+            # Pack them into the 4 lowest bits
+            action_val = int(a[0]) | (int(a[1]) << 1) | (int(a[2]) << 2) | (int(a[3]) << 3)
 
             # 4:8 - Current action. 12:16 - Python acknowledgement
-            shm.buf[4:8] = pack("i", _curr_action_bin)
+            shm.buf[4:8] = pack("i", action_val)
             shm.buf[8:12] = pack("i", 0)
             shm.buf[12:16] = pack("i", 1)
 
@@ -149,10 +167,8 @@ def _active_shm_process(shm: SharedMemory, macro_events: list[tuple[int, int]]):
     shm.unlink()
 
 
-def _run_recording_loop(capture_engine, frames_buf: np.ndarray, actions_bin_buf: np.ndarray) -> int:
+def _run_recording_loop(capture_engine, shm: SharedMemory, frames_buf: np.ndarray, actions_bin_buf: np.ndarray) -> int:
     """Run the main frame and action recording loop, returning the number of frames recorded."""
-    global _curr_action_bin
-
     buf_max_frames = len(frames_buf)
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
     frame_idx = 0
@@ -168,7 +184,12 @@ def _run_recording_loop(capture_engine, frames_buf: np.ndarray, actions_bin_buf:
 
         if _is_recording:
             frames_buf[frame_idx] = frame
-            actions_bin_buf[frame_idx] = _curr_action_bin
+
+            # Read current game tick from shared memory
+            current_tick = unpack("i", shm.buf[0:4])[0]
+
+            # Get the 4 actions directly via slicing
+            actions_bin_buf[frame_idx] = _macro_actions_240[current_tick : current_tick + 4]
             frame_idx += 1
 
             if frame_idx % log_interval == 0:
@@ -182,8 +203,10 @@ def _record(filepath: Path):
     parsed_macro = _parse_macro_file(filepath)
     macro_events = _process_macro(parsed_macro)
 
+    _build_macro_actions_240(macro_events)
+
     shm = _init_shm()
-    shm_thread = threading.Thread(target=_active_shm_process, args=(shm, macro_events), daemon=True)
+    shm_thread = threading.Thread(target=_active_shm_process, args=(shm,), daemon=True)
     shm_thread.start()
 
     listener = Listener(on_press=_on_press)
@@ -199,10 +222,10 @@ def _record(filepath: Path):
         (buf_max_frames, frame_height_px, frame_width_px, 3),
         dtype=np.uint8,
     )
-    actions_bin_buf = np.zeros(buf_max_frames, dtype=np.uint8)
+    actions_bin_buf = np.zeros((buf_max_frames, 4), dtype=np.uint8)
 
     try:
-        frame_idx = _run_recording_loop(capture_engine, frames_buf, actions_bin_buf)
+        frame_idx = _run_recording_loop(capture_engine, shm, frames_buf, actions_bin_buf)
     finally:
         listener.stop()
         capture_engine.stop_capture_stream()

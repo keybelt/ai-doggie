@@ -139,7 +139,11 @@ def _run_inference_loop(model: Model, capture_engine):
             # hidden_state: Tensor  # [N, L, D]
             logits, hidden_state = model(frame_NTHWC, hidden_state)
 
-            _curr_action_bin = torch.argmax(logits, dim=-1).item()
+            # Reshape logits to [4, 2] and take argmax for the 4 subframe ticks
+            actions = torch.argmax(logits.view(4, 2), dim=-1).cpu().tolist()
+
+            # Pack the 4 actions into a bitmask statically
+            _curr_action_bin = actions[0] | (actions[1] << 1) | (actions[2] << 2) | (actions[3] << 3)
 
             infer_time: float = (time.perf_counter() - time_start) * 1000
 
