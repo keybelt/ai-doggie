@@ -188,8 +188,11 @@ def _run_recording_loop(capture_engine, shm: SharedMemory, frames_buf: np.ndarra
             # Read current game tick from shared memory
             current_tick = unpack("i", shm.buf[0:4])[0]
 
-            # Get the 4 actions directly via slicing
-            actions_bin_buf[frame_idx] = _macro_actions_240[current_tick : current_tick + 4]
+            # Align tick to the start of the 4-tick block (rounding down) to ensure perfect 60Hz frame alignment
+            aligned_tick = (current_tick // 4) * 4
+
+            # Get the 4 actions directly via slicing (guaranteed size 4 due to pre-allocated padding)
+            actions_bin_buf[frame_idx] = _macro_actions_240[aligned_tick : aligned_tick + 4]
             frame_idx += 1
 
             if frame_idx % log_interval == 0:
