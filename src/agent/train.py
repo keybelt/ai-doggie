@@ -32,9 +32,9 @@ LR = _CONFIG_TRAINING["learningRate"]
 class _DatasetGenerator(IterableDataset):
     """Yield training batches built from parallel gameplay streams."""
 
-    def __init__(self, files: list[Path], is_val: bool):
-        self.files = files
-        self.is_val = is_val
+    def __init__(self, src_files: list[Path], is_val: bool):
+        self.src_files: list[Path] = src_files
+        self.is_val: bool = is_val
 
     def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch together mini batches from each file stream.
@@ -43,48 +43,39 @@ class _DatasetGenerator(IterableDataset):
             Tuple of arrays of frames, action binaries, and is_first flags of the concatenated mini batches.
         """
 
-        dataset_files: list[Path] = self.files.copy()
+        dataset_files: list[Path] = self.src_files.copy()
         random.shuffle(dataset_files)
 
+        def get_next_file() -> Path:
+            nonlocal dataset_files
+            if not dataset_files:
+                dataset_files = self.src_files.copy()
+                random.shuffle(dataset_files)
+            return dataset_files.pop(0)
+
         file_streams: list[Iterator[tuple[np.ndarray, np.ndarray, bool]]] = [
-            self._stream_file(dataset_files.pop(0)) for _ in range(BATCH_SIZE)
+            self._stream_file(get_next_file()) for _ in range(BATCH_SIZE)
         ]
 
         while True:
-            active_stream_count = 0
-
             batch_frames: list[np.ndarray] = []
             batch_actions_bin: list[np.ndarray] = []
             batch_are_first: list[bool] = []
 
-            for batch_idx, curr_file_stream in enumerate(file_streams):
+            for batch_idx in range(BATCH_SIZE):
                 frames: np.ndarray
                 actions_bin: np.ndarray
                 is_first: bool
 
                 try:
-                    frames, actions_bin, is_first = next(curr_file_stream)
+                    frames, actions_bin, is_first = next(file_streams[batch_idx])
                 except StopIteration:
-                    # If current file is exhausted, attempt to refill slot with a new file.
-                    if dataset_files:
-                        file_streams[batch_idx] = self._stream_file(
-                            dataset_files.pop(0),
-                        )
-
-                        frames, actions_bin, is_first = next(
-                            file_streams[batch_idx],
-                        )
-                    else:
-                        break
+                    file_streams[batch_idx] = self._stream_file(get_next_file())
+                    frames, actions_bin, is_first = next(file_streams[batch_idx])
 
                 batch_frames.append(frames)
                 batch_actions_bin.append(actions_bin)
                 batch_are_first.append(is_first)
-
-                active_stream_count += 1
-
-            if active_stream_count < BATCH_SIZE:
-                break
 
             yield (
                 np.stack(batch_frames),
@@ -119,7 +110,7 @@ class _DatasetGenerator(IterableDataset):
             #     w_offset = random.randint(0, W - input_W)
             # frames = frames[:, h_offset : h_offset + input_H, w_offset : w_offset + input_W, :]
 
-            num_chunks = (len(frames) - 1) // _CONFIG_TRAINING["seqLen"]
+            num_chunks = len(frames) // _CONFIG_TRAINING["seqLen"]
 
             # Chop up each file stream into chunks with length seq_len.
             for chunk_idx in range(num_chunks):
@@ -264,6 +255,15 @@ def _train():
     train_files = list(train_files_src.glob("*.npz"))
     val_files = list(val_files_src.glob("*.npz"))
 
+    total_train_chunks = sum(len(np.load(f)["actions_bin"]) // _CONFIG_TRAINING["seqLen"] for f in train_files)
+    train_steps_per_epoch = max(1, total_train_chunks // BATCH_SIZE)
+
+    total_val_chunks = sum(len(np.load(f)["actions_bin"]) // _CONFIG_TRAINING["seqLen"] for f in val_files)
+    val_steps_per_epoch = max(1, total_val_chunks // BATCH_SIZE)
+
+    accumulation_steps: int = _CONFIG["training"]["accumulationSteps"]
+    opt_steps_per_epoch = (train_steps_per_epoch + accumulation_steps - 1) // accumulation_steps
+
     dataloader: DataLoader = DataLoader(_DatasetGenerator(train_files, is_val=False), batch_size=None)
     dataloader_validation: DataLoader = DataLoader(_DatasetGenerator(val_files, is_val=True), batch_size=None)
 
@@ -280,7 +280,14 @@ def _train():
     checkpoint_dir = Path(__file__).resolve().parents[2] / _CONFIG["fileNames"]["checkpointDirName"]
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LR,
+        epochs=epochs,
+        steps_per_epoch=opt_steps_per_epoch,
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy="cos",
+    )
 
     if checkpoint_name:
         checkpoint: dict[str, int | float | dict[str, int | Tensor]] = torch.load(
@@ -308,9 +315,9 @@ def _train():
             device=device,
         )
 
-        accumulation_steps: int = _CONFIG["training"]["accumulationSteps"]
-
         for i, (frames, actions_bin, are_first) in enumerate(dataloader):
+            if i >= train_steps_per_epoch:
+                break
             num_train_batches = i + 1
 
             loss, hidden_state = _process_batch(model, frames, actions_bin, are_first, hidden_state)
@@ -321,6 +328,7 @@ def _train():
             if num_train_batches % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             train_loss_tensor += loss.detach()
@@ -328,6 +336,7 @@ def _train():
         if num_train_batches % accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
         avg_train_loss = (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0
@@ -344,6 +353,8 @@ def _train():
 
         with torch.no_grad():
             for i, (frames, actions_bin, are_first) in enumerate(dataloader_validation):
+                if i >= val_steps_per_epoch:
+                    break
                 num_val_batches = i + 1
 
                 loss, hidden_state = _process_batch(model, frames, actions_bin, are_first, hidden_state)
@@ -353,7 +364,6 @@ def _train():
         avg_val_loss = (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0
 
         print(f"Epoch {epoch} completed | Training loss: {avg_train_loss:.2f} | Validation loss: {avg_val_loss:.2f}")
-        scheduler.step()
 
         if epoch % checkpoint_save_interval == 0:
             checkpoint_path = checkpoint_dir / f"epoch_{epoch}.pt"
