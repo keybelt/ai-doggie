@@ -52,8 +52,8 @@
         "beta1": 0.9,
         "beta2": 0.999,
         "weightDecay": 0.01,
-        "checkpointSaveInterval": 5,
-        "epochs": 50,
+        "checkpointSaveInterval": 10,
+        "epochs": 100,
         "classWeights": [
             0.6801,
             1.3199

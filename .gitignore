@@ -7,3 +7,4 @@ __pycache__
 macro_parser
 .eclipse
 CONTEXT.md
+count_frames.py
