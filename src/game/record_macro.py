@@ -45,16 +45,13 @@ def _on_press(key):
         _is_shutdown = True
 
 
-def _load_macro(filepath: Path) -> list[tuple[int, int]]:
-    """Unpack .gdr macro files with a modified version of maxnut/gdr-converter's algorithm.
+def _parse_macro_file(filepath: Path) -> dict:
+    """Parse raw .gdr macro file using JSON, msgpack, or C++ fallback.
 
     Returns:
-        actions in format (frame, action).
+        The parsed macro dictionary structure.
     """
-
     import msgpack
-
-    macro_events: list[tuple[int, int]] = []
 
     macro_data = filepath.read_bytes()
 
@@ -73,6 +70,18 @@ def _load_macro(filepath: Path) -> list[tuple[int, int]]:
             parsed_macro = json.loads(result.stdout)
             print("Macro parsed with C++ fallback.")
 
+    return parsed_macro
+
+
+def _process_macro(parsed_macro: dict) -> list[tuple[int, int]]:
+    """Interpret the parsed macro structure, normalizing frame rate and sorting events.
+
+    Inspired by maxnut/gdr-converter.
+
+    Returns:
+        List of events as (frame_idx, action).
+    """
+    macro_events: list[tuple[int, int]] = []
     macro_fps = parsed_macro.get("framerate")
     print(f"Macro FPS: {macro_fps}.")
 
@@ -90,25 +99,29 @@ def _load_macro(filepath: Path) -> list[tuple[int, int]]:
 
     macro_events.sort(key=lambda x: x[0])
 
-    print(f"Macro parsed with {len(macro_events)} events.")
+    print(f"Macro processed with {len(macro_events)} events.")
 
     return macro_events
 
 
-def _shm_bridge(macro_events: list[tuple[int, int]]):
+def _init_shm() -> SharedMemory:
     """Initialize a shared memory block between this script and the c++ mod."""
-    global _curr_action_bin
-
     shm_name = _CONFIG["shmName"]
     try:
         shm = SharedMemory(name=shm_name)
         shm.buf[0:16] = bytes(16)
     except FileNotFoundError:
-        shm: SharedMemory = SharedMemory(
+        shm = SharedMemory(
             name=shm_name,
             create=True,
             size=16,
         )
+    return shm
+
+
+def _active_shm_process(shm: SharedMemory, macro_events: list[tuple[int, int]]):
+    """Run the shared memory loop, processing macro events and updating actions."""
+    global _curr_action_bin
 
     event_idx = 0
     _curr_action_bin = 0
@@ -136,32 +149,12 @@ def _shm_bridge(macro_events: list[tuple[int, int]]):
     shm.unlink()
 
 
-def _record(filepath: Path):
-    """Initialize game environment, shared memory, run frame + action pair recording loop."""
-    buf_max_frames = _CONFIG["bufMaxFrames"]
-    frame_height_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
-    frame_width_px = _CONFIG["capture"]["frameDims"]["pipelineWidthPx"]
+def _run_recording_loop(capture_engine, frames_buf: np.ndarray, actions_bin_buf: np.ndarray) -> int:
+    """Run the main frame and action recording loop, returning the number of frames recorded."""
+    global _curr_action_bin
+
+    buf_max_frames = len(frames_buf)
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
-
-    dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-    dataset_dir: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
-
-    macro_events: list[tuple[int, int]] = _load_macro(filepath)
-
-    shm_thread = threading.Thread(target=_shm_bridge, args=(macro_events,), daemon=True)
-    shm_thread.start()
-
-    listener = Listener(on_press=_on_press)
-    listener.start()
-
-    capture_engine = start_capture_engine()
-
-    frames_buf: np.ndarray = np.empty(
-        (buf_max_frames, frame_height_px, frame_width_px, 3),
-        dtype=np.uint8,
-    )
-    actions_bin_buf = np.zeros(buf_max_frames, dtype=np.uint8)
-
     frame_idx = 0
 
     while not _is_shutdown:
@@ -181,13 +174,46 @@ def _record(filepath: Path):
             if frame_idx % log_interval == 0:
                 print(f"\rFrames recorded: {frame_idx}", end="", flush=True)
 
-    listener.stop()
-    capture_engine.stop_capture_stream()
+    return frame_idx
+
+
+def _record(filepath: Path):
+    """Initialize game environment, shared memory, run frame + action pair recording loop."""
+    parsed_macro = _parse_macro_file(filepath)
+    macro_events = _process_macro(parsed_macro)
+
+    shm = _init_shm()
+    shm_thread = threading.Thread(target=_active_shm_process, args=(shm, macro_events), daemon=True)
+    shm_thread.start()
+
+    listener = Listener(on_press=_on_press)
+    listener.start()
+
+    capture_engine = start_capture_engine()
+
+    buf_max_frames = _CONFIG["bufMaxFrames"]
+    frame_height_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
+    frame_width_px = _CONFIG["capture"]["frameDims"]["pipelineWidthPx"]
+
+    frames_buf: np.ndarray = np.empty(
+        (buf_max_frames, frame_height_px, frame_width_px, 3),
+        dtype=np.uint8,
+    )
+    actions_bin_buf = np.zeros(buf_max_frames, dtype=np.uint8)
+
+    try:
+        frame_idx = _run_recording_loop(capture_engine, frames_buf, actions_bin_buf)
+    finally:
+        listener.stop()
+        capture_engine.stop_capture_stream()
 
     should_save: str = input("\nSave this recording? (Y/n): ")
     if should_save == "n":
         filepath.unlink()
         return
+
+    dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
+    dataset_dir: Path = Path(__file__).resolve().parents[2] / dataset_dir_name
 
     save_path = dataset_dir / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
     np.savez_compressed(
