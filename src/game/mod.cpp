@@ -2,6 +2,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
+#include <chrono>
 #include <fcntl.h>
 #include <string>
 #include <sys/mman.h>
@@ -11,10 +12,10 @@
 using namespace geode::prelude;
 
 struct SharedData {
-  int32_t frameIdx;
-  int32_t currActionBin;
-  int32_t frameReadyBin;
-  int32_t actionReadyBin;
+  volatile int32_t frameIdx;
+  volatile int32_t currActionBin;
+  volatile int32_t frameReadyBin;
+  volatile int32_t actionReadyBin;
 };
 
 SharedData *data = nullptr;
@@ -117,11 +118,15 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
       data->actionReadyBin = 0;
       data->frameReadyBin = 1;
 
-      int timeout = 4000000;
-      while (data->actionReadyBin == 0 && timeout > 0) {
-        timeout--;
+      auto start = std::chrono::steady_clock::now();
+      bool timedOut = true;
+      while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(10)) {
+        if (data->actionReadyBin != 0) {
+          timedOut = false;
+          break;
+        }
       }
-      isValid = (timeout > 0);
+      isValid = !timedOut;
     }
 
     if (isValid) {
