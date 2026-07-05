@@ -32,7 +32,7 @@
                 "stride": 2
             }
         },
-        "hiddenDim": 32,
+        "hiddenDim": 64,
         "vocabSize": 8,
         "attnDim": 16,
         "numAttHeads": 8
@@ -65,7 +65,7 @@
         "recordKeyName": "space"
     },
     "shmName": "GDMem",
-    "bufMaxFrames": 75000,
+    "bufMaxFrames": 50000,
     "logIntervalSec": 1,
     "macroFps": 240,
     "recordStartDelaySec": 0.2
