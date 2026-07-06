@@ -349,7 +349,7 @@ def _load_checkpoint(
 
 def _run_train_epoch(
     model: Model,
-    dataloader: DataLoader,
+    train_iter: Iterator,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.OneCycleLR,
     steps: int,
@@ -369,8 +369,10 @@ def _run_train_epoch(
 
     accumulation_steps = _CONFIG["training"]["accumulationSteps"]
 
-    for i, (frames, actions_bin, are_first) in enumerate(dataloader):
-        if i >= steps:
+    for i in range(steps):
+        try:
+            frames, actions_bin, are_first = next(train_iter)
+        except StopIteration:
             break
         num_train_batches = i + 1
 
@@ -404,7 +406,7 @@ def _run_train_epoch(
 
 def _run_val_epoch(
     model: Model,
-    dataloader: DataLoader,
+    val_iter: Iterator,
     steps: int,
 ) -> float:
     """Run a single validation epoch and return the average loss."""
@@ -421,8 +423,10 @@ def _run_val_epoch(
     )
 
     with torch.no_grad():
-        for i, (frames, actions_bin, are_first) in enumerate(dataloader):
-            if i >= steps:
+        for i in range(steps):
+            try:
+                frames, actions_bin, are_first = next(val_iter)
+            except StopIteration:
                 break
             num_val_batches = i + 1
 
@@ -473,6 +477,9 @@ def _train():
     dataloader = DataLoader(_DatasetGenerator(train_files, is_val=False), batch_size=None)
     dataloader_validation = DataLoader(_DatasetGenerator(val_files, is_val=True), batch_size=None)
 
+    train_iter = iter(dataloader)
+    val_iter = iter(dataloader_validation)
+
     model, optimizer, scheduler = _init_model_and_optimizer(
         opt_steps_per_epoch=opt_steps_per_epoch,
     )
@@ -491,7 +498,7 @@ def _train():
     for epoch in range(start_epoch, _CONFIG["training"]["epochs"] + 1):
         avg_train_loss = _run_train_epoch(
             model=model,
-            dataloader=dataloader,
+            train_iter=train_iter,
             optimizer=optimizer,
             scheduler=scheduler,
             steps=train_steps_per_epoch,
@@ -499,7 +506,7 @@ def _train():
 
         avg_val_loss = _run_val_epoch(
             model=model,
-            dataloader=dataloader_validation,
+            val_iter=val_iter,
             steps=val_steps_per_epoch,
         )
 
