@@ -24,8 +24,8 @@ class Model(nn.Module):
             config = json.load(f)
         self._hidden_dim = config["model"]["hiddenDim"]
         self._action_dim = 8
-        self._attn_dim = 8
-        self._num_heads = 4
+        self._attn_dim = 16
+        self._num_heads = 8
 
         # 3-layer CNN backbone with CoordConv on first layer.
         self._conv1 = nn.Conv2d(3 + 2, 32, kernel_size=5, stride=4)
