@@ -32,10 +32,10 @@
                 "stride": 2
             }
         },
-        "hiddenDim": 64,
+        "hiddenDim": 32,
         "vocabSize": 8,
-        "attnDim": 16,
-        "numAttHeads": 8
+        "attnDim": 8,
+        "numAttHeads": 4
     },
     "fileNames": {
         "datasetDirName": "data",

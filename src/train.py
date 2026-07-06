@@ -16,11 +16,11 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parent))
 
-from agent.model import Model
+from model import Model
 
-with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
+with (Path(__file__).resolve().parent / "config.json").open() as f:
     _CONFIG = json.load(f)
 
 _CONFIG_TRAINING = _CONFIG["training"]
@@ -278,7 +278,7 @@ def _prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
     training_dir_name = _CONFIG["fileNames"]["trainingDirName"]
     validation_dir_name = _CONFIG["fileNames"]["validationDirName"]
 
-    dataset_files_src = Path(__file__).resolve().parents[2] / dataset_dir_name
+    dataset_files_src = Path(__file__).resolve().parents[1] / dataset_dir_name
     train_files = list((dataset_files_src / training_dir_name).glob("*.npz"))
     val_files = list((dataset_files_src / validation_dir_name).glob("*.npz"))
 
@@ -484,7 +484,7 @@ def _train():
         opt_steps_per_epoch=opt_steps_per_epoch,
     )
 
-    checkpoint_dir = Path(__file__).resolve().parents[2] / _CONFIG["fileNames"]["checkpointDirName"]
+    checkpoint_dir = Path(__file__).resolve().parents[1] / _CONFIG["fileNames"]["checkpointDirName"]
     checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
 
     start_epoch = _load_checkpoint(

@@ -16,6 +16,9 @@ struct SharedData {
   volatile int32_t currActionBin;
   volatile int32_t frameReadyBin;
   volatile int32_t actionReadyBin;
+  volatile int32_t width;
+  volatile int32_t height;
+  uint8_t frameBuffer[1920 * 1200 * 3]; // 6,912,000 bytes
 };
 
 SharedData *data = nullptr;
@@ -111,16 +114,32 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     int frameIdx = m_gameState.m_currentProgress / 2; // i got this from eclipse or smth idk why /2 but oh well
     data->frameIdx = frameIdx;
 
-    bool isRecordingMode = (data->actionReadyBin != -1);
     bool isValid = true;
 
-    if (isRecordingMode && (frameIdx % 4 == 0)) {
+    if (frameIdx % 4 == 0) {
+      GLint viewport[4];
+      glGetIntegerv(GL_VIEWPORT, viewport);
+      int width = viewport[2];
+      int height = viewport[3];
+
+      if (width > 1920)
+        width = 1920;
+      if (height > 1200)
+        height = 1200;
+
+      data->width = width;
+      data->height = height;
+
+      // Capture screen pixels from Cocos2d-x frame buffer
+      glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
+
       data->actionReadyBin = 0;
       data->frameReadyBin = 1;
 
       auto start = std::chrono::steady_clock::now();
       bool timedOut = true;
-      while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(10)) {
+      // 16ms timeout to prevent game freeze if Python crashes/stops
+      while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(16)) {
         if (data->actionReadyBin != 0) {
           timedOut = false;
           break;

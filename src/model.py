@@ -12,9 +12,9 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parent))
 
-with (Path(__file__).resolve().parents[1] / "config.json").open() as f:
+with (Path(__file__).resolve().parent / "config.json").open() as f:
     _CONFIG = json.load(f)
 
 _CONFIG_MODEL = _CONFIG["model"]
