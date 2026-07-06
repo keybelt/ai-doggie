@@ -93,7 +93,7 @@ def _run_inference_loop(model: Model, shm: SharedMemory):
 
             # Wait for C++ to set frameReadyBin == 1
             if unpack("i", shm.buf[8:12])[0] != 1:
-                time.sleep(0.001)
+                time.sleep(0)
                 continue
 
             i += 1
@@ -101,6 +101,11 @@ def _run_inference_loop(model: Model, shm: SharedMemory):
 
             # Read current game tick and dimensions
             current_tick = unpack("i", shm.buf[0:4])[0]
+            if current_tick == last_tick:
+                shm.buf[12:16] = pack("i", 1)
+                shm.buf[8:12] = pack("i", 0)
+                continue
+
             if current_tick < last_tick:
                 print(f"\nDeath detected (tick: {last_tick} -> {current_tick})! Resetting hidden state.")
                 hidden_state = torch.zeros(
@@ -153,6 +158,7 @@ def _infer():
         _run_inference_loop(_init_model(), shm)
     finally:
         shm.close()
+        shm.unlink()
 
 
 if __name__ == "__main__":

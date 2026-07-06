@@ -146,16 +146,22 @@ def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_b
     buf_max_frames = len(frames_buf)
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["fps"]
     frame_idx = 0
+    last_tick = -1
 
     while not _is_shutdown:
         # Wait for C++ to signal frameReadyBin == 1
         frame_ready = unpack("i", shm.buf[8:12])[0]
         if frame_ready != 1:
-            time.sleep(0.001)
+            time.sleep(0)
             continue
 
         # Read current game tick from shared memory
         current_tick = unpack("i", shm.buf[0:4])[0]
+        if current_tick == last_tick:
+            shm.buf[12:16] = pack("i", 1)
+            shm.buf[8:12] = pack("i", 0)
+            continue
+        last_tick = current_tick
 
         frame_w = _CONFIG["frame"]["width"]
         frame_h = _CONFIG["frame"]["height"]
@@ -202,36 +208,42 @@ def _record(filepath: Path):
 
     shm = _init_shm()
 
-    listener = Listener(on_press=_on_press)
-    listener.start()
-
-    frames_buf: np.ndarray = np.empty(
-        (50000, 480, 640, 3),
-        dtype=np.uint8,
-    )
-    actions_bin_buf = np.zeros((50000, 4), dtype=np.uint8)
-
     try:
-        frame_idx = _run_recording_loop(shm, frames_buf, actions_bin_buf)
-    finally:
-        listener.stop()
+        listener = Listener(on_press=_on_press)
+        listener.start()
 
-    should_save: str = input("\nSave this recording? (Y/n): ")
-    if should_save == "n":
+        buffer_size = 50000
+        frame_h = _CONFIG["frame"]["height"]
+        frame_w = _CONFIG["frame"]["width"]
+
+        frames_buf: np.ndarray = np.empty((buffer_size, frame_h, frame_w, 3), dtype=np.uint8)
+        actions_bin_buf = np.zeros((buffer_size, 4), dtype=np.uint8)
+
+        try:
+            frame_idx = _run_recording_loop(shm, frames_buf, actions_bin_buf)
+        finally:
+            listener.stop()
+
+        should_save: str = input("\nSave this recording? (Y/n): ")
+        if should_save == "n":
+            filepath.unlink()
+            return
+
+        dataset_dir_path: Path = Path(__file__).resolve().parents[1] / "data"
+        dataset_dir_path.mkdir(parents=True, exist_ok=True)
+
+        save_path = dataset_dir_path / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
+        np.savez_compressed(
+            save_path,
+            frames=frames_buf[:frame_idx],
+            actions_bin=actions_bin_buf[:frame_idx],
+        )
+        print(f"\nSaved recording to {save_path}")
+
         filepath.unlink()
-        return
-
-    dataset_dir_path: Path = Path(__file__).resolve().parents[1] / "data"
-
-    save_path = dataset_dir_path / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
-    np.savez_compressed(
-        save_path,
-        frames=frames_buf[:frame_idx],
-        actions_bin=actions_bin_buf[:frame_idx],
-    )
-    print(f"\nSaved recording to {save_path}")
-
-    filepath.unlink()
+    finally:
+        shm.close()
+        shm.unlink()
 
 
 if __name__ == "__main__":
