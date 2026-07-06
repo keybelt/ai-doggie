@@ -152,7 +152,7 @@ def _calculate_loss(
     kernel_size = 7  # distribution size
     padding = kernel_size // 2
 
-    # manually pad with -1e-9 cuz we're in log softmax space
+    # manually pad with -1e9 cuz we're in log softmax space
     log_p_jump_padded = F.pad(log_p_jump, (padding, padding), mode="constant", value=-1e9)
     max_log_p_jump = F.max_pool1d(log_p_jump_padded, kernel_size=kernel_size, stride=1, padding=0).squeeze(1)
 
@@ -229,10 +229,14 @@ def _prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
     train_files = list((repo_dir / "data" / "training").glob("*.npz"))
     val_files = list((repo_dir / "data" / "validation").glob("*.npz"))
 
-    total_train_chunks = sum(len(np.load(f)["actions_bin"]) // _SEQ_LEN for f in train_files)
+    def get_chunks(f: Path) -> int:
+        with np.load(f) as data:
+            return len(data["actions_bin"]) // _SEQ_LEN
+
+    total_train_chunks = sum(get_chunks(f) for f in train_files)
     train_steps_per_epoch = max(1, total_train_chunks // _BATCH_SIZE)
 
-    total_val_chunks = sum(len(np.load(f)["actions_bin"]) // _SEQ_LEN for f in val_files)
+    total_val_chunks = sum(get_chunks(f) for f in val_files)
     val_steps_per_epoch = max(1, total_val_chunks // _BATCH_SIZE)
 
     opt_steps_per_epoch = (train_steps_per_epoch + _ACCUMULATION_STEPS - 1) // _ACCUMULATION_STEPS
