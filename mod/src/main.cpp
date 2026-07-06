@@ -16,9 +16,7 @@ struct SharedData {
   volatile int32_t currActionBin;
   volatile int32_t frameReadyBin;
   volatile int32_t actionReadyBin;
-  volatile int32_t width;
-  volatile int32_t height;
-  uint8_t frameBuffer[1920 * 1200 * 3]; // 6,912,000 bytes
+  uint8_t frameBuffer[640 * 480 * 3]; // 921,600 bytes
 };
 
 SharedData *data = nullptr;
@@ -76,7 +74,7 @@ class $modify(MyPlayLayer, PlayLayer) {
 
 /// Override all the jumping logic.
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
-  void sendClick(PlayerButton button, bool down, bool player2) {
+  void simulateClick(PlayerButton button, bool down, bool player2) {
     auto isClick = down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
 
     if (m_levelSettings->m_twoPlayerMode && m_gameState.m_isDualMode) {
@@ -111,35 +109,23 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
         return;
     }
 
-    int frameIdx = m_gameState.m_currentProgress / 2; // i got this from eclipse or smth idk why /2 but oh well
+    // 2.208 made m_currentProgress count twice as fast, for now we just divide it by 2
+    int frameIdx = m_gameState.m_currentProgress / 2;
     data->frameIdx = frameIdx;
 
     bool isValid = true;
 
     if (frameIdx % 4 == 0) {
-      GLint viewport[4];
-      glGetIntegerv(GL_VIEWPORT, viewport);
-      int width = viewport[2];
-      int height = viewport[3];
-
-      if (width > 1920)
-        width = 1920;
-      if (height > 1200)
-        height = 1200;
-
-      data->width = width;
-      data->height = height;
-
-      // Capture screen pixels from Cocos2d-x frame buffer
-      glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
+      // Capture 640x480 screen pixels from Cocos2d-x frame buffer
+      glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
 
       data->actionReadyBin = 0;
       data->frameReadyBin = 1;
 
       auto start = std::chrono::steady_clock::now();
       bool timedOut = true;
-      // 16ms timeout to prevent game freeze if Python crashes/stops
-      while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(16)) {
+
+      while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(8)) {
         if (data->actionReadyBin != 0) {
           timedOut = false;
           break;
@@ -152,10 +138,10 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
       bool shouldJump = ((data->currActionBin >> (frameIdx % 4)) & 1);
 
       if (shouldJump && !isJumping) {
-        sendClick(PlayerButton::Jump, true, false);
+        simulateClick(PlayerButton::Jump, true, false);
         isJumping = true;
       } else if (!shouldJump && isJumping) {
-        sendClick(PlayerButton::Jump, false, false);
+        simulateClick(PlayerButton::Jump, false, false);
         isJumping = false;
       }
     }

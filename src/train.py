@@ -23,11 +23,12 @@ from model import Model
 with (Path(__file__).resolve().parent / "config.json").open() as f:
     _CONFIG = json.load(f)
 
-_CONFIG_TRAINING = _CONFIG["training"]
+_BATCH_SIZE = 4
+_SEQ_LEN = 128
+_ACCUMULATION_STEPS = 4
+_EPOCHS = 100
 
-BATCH_SIZE: int = _CONFIG_TRAINING["batchSize"]
-LR = _CONFIG_TRAINING["learningRate"]
-DEVICE = torch.device("mps")
+_DEVICE = torch.device("mps")
 
 
 class _DatasetGenerator(IterableDataset):
@@ -53,14 +54,14 @@ class _DatasetGenerator(IterableDataset):
         """
         self._dataset_files = []
 
-        file_streams = [self._stream_file(self._get_next_file()) for _ in range(BATCH_SIZE)]
+        file_streams = [self._stream_file(self._get_next_file()) for _ in range(_BATCH_SIZE)]
 
         while True:
             batch_frames = []
             batch_actions_bin = []
             batch_are_first = []
 
-            for batch_idx in range(BATCH_SIZE):
+            for batch_idx in range(_BATCH_SIZE):
                 try:
                     frames, actions_bin, is_first = next(file_streams[batch_idx])
                 except StopIteration:
@@ -90,72 +91,15 @@ class _DatasetGenerator(IterableDataset):
             frames: np.ndarray = data["frames"]
             actions_bin: np.ndarray = data["actions_bin"]
 
-            num_chunks = len(frames) // _CONFIG_TRAINING["seqLen"]
-
-            # Per-file translational invariance.
-            # _, H, W, _ = frames.shape
-            # input_H = _CONFIG["model"]["inputHeightPx"]
-            # input_W = _CONFIG["model"]["inputWidthPx"]
-
-            # if self.is_val:
-            #     h_offset = (H - input_H) // 2
-            #     w_offset = (W - input_W) // 2
-            # else:
-            #     h_offset = random.randint(0, H - input_H)
-            #     w_offset = random.randint(0, W - input_W)
-            # frames = frames[:, h_offset : h_offset + input_H, w_offset : w_offset + input_W, :]
+            num_chunks = len(frames) // _SEQ_LEN
 
             # Chop up each file stream into chunks with length seq_len.
             for chunk_idx in range(num_chunks):
-                start_idx = chunk_idx * _CONFIG_TRAINING["seqLen"]
-                chunk_frames = frames[start_idx : start_idx + _CONFIG_TRAINING["seqLen"]]
-                chunk_actions_bin = actions_bin[start_idx : start_idx + _CONFIG_TRAINING["seqLen"]]
+                start_idx = chunk_idx * _SEQ_LEN
+                chunk_frames = frames[start_idx : start_idx + _SEQ_LEN]
+                chunk_actions_bin = actions_bin[start_idx : start_idx + _SEQ_LEN]
 
                 yield chunk_frames, chunk_actions_bin, (chunk_idx == 0)
-
-
-# class _AdamW:
-#     """Manual implementation of the AdamW optimizer."""
-#
-#     def __init__(self, params):
-#         self._params = list(params)
-#         self._m = [torch.zeros_like(p) for p in self._params]
-#         self._v = [torch.zeros_like(p) for p in self._params]
-#         self.step_idx = 1
-#
-#     @torch.no_grad()
-#     def step(self):
-#         beta1 = _CONFIG_TRAINING["beta1"]
-#         beta2 = _CONFIG_TRAINING["beta2"]
-#         W_decay = _CONFIG_TRAINING["weightDecay"]
-#
-#         for i, param in enumerate(self._params):
-#             grad = param.grad
-#             if grad is None:
-#                 raise Exception("Parameter has no gradient.")
-#
-#             self._m[i] = beta1 * self._m[i] + (1 - beta1) * grad
-#             self._v[i] = beta2 * self._v[i] + (1 - beta2) * (grad**2)
-#
-#             m_hat = self._m[i] / (1 - beta1**self.step_idx)
-#             v_hat = self._v[i] / (1 - beta2**self.step_idx)
-#
-#             param_adam = self._params[i] - LR * m_hat / (torch.sqrt(v_hat) + 1e-8)
-#             self._params[i].copy_(param_adam - LR * W_decay * param)
-#
-#         self.step_idx += 1
-#
-#     def clear_grad(self):
-#         for param in self._params:
-#             param.grad = None
-#
-#     def get_state_dict(self):
-#         return {"step_idx": self.step_idx, "mean": self._m, "var": self._v}
-#
-#     def load_state_dict(self, state_dict):
-#         self.step_idx = state_dict["step_idx"]
-#         self._m = state_dict["mean"]
-#         self._v = state_dict["var"]
 
 
 def _preprocess_inputs(
@@ -175,11 +119,11 @@ def _preprocess_inputs(
     Returns:
         Normalized frames, action targets, and masked hidden state.
     """
-    keep_hidden_mask = (~are_first).to(DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
+    keep_hidden_mask = (~are_first).to(_DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
     hidden_state = hidden * keep_hidden_mask
 
-    frames_norm = frames.to(DEVICE, non_blocking=True).to(dtype=torch.float32).mul_(1.0 / 255.0)
-    target_actions_bin = actions_bin.to(DEVICE, dtype=torch.long)
+    frames_norm = frames.to(_DEVICE, non_blocking=True).to(dtype=torch.float32).mul_(1.0 / 255.0)
+    target_actions_bin = actions_bin.to(_DEVICE, dtype=torch.long)
 
     return frames_norm, target_actions_bin, hidden_state
 
@@ -187,14 +131,12 @@ def _preprocess_inputs(
 def _calculate_loss(
     logits: Tensor,
     target_actions_bin: Tensor,
-    class_weights: Tensor,
 ) -> Tensor:
     """Calculate the loss given model logits and target actions.
 
     Args:
         logits: [N, T, V] model output logits.
         target_actions_bin: [N, T, 4] target actions on the device.
-        class_weights: Class weights tensor.
 
     Returns:
         The calculated loss tensor.
@@ -207,9 +149,12 @@ def _calculate_loss(
     log_p_no_jump = log_probs[..., 0]  # [N, T * 4]
     log_p_jump = log_probs[..., 1].unsqueeze(1)  # [N, 1, T * 4]
 
-    kernel_size = _CONFIG_TRAINING["distributionSize"]
+    kernel_size = 7  # distribution size
     padding = kernel_size // 2
-    max_log_p_jump = F.max_pool1d(log_p_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1)
+
+    # manually pad with -1e-9 cuz we're in log softmax space
+    log_p_jump_padded = F.pad(log_p_jump, (padding, padding), mode="constant", value=-1e9)
+    max_log_p_jump = F.max_pool1d(log_p_jump_padded, kernel_size=kernel_size, stride=1, padding=0).squeeze(1)
 
     is_jump = target_actions_bin_240.to(dtype=torch.float32).unsqueeze(1)
 
@@ -219,9 +164,18 @@ def _calculate_loss(
     loss_no_jump = -log_p_no_jump * (~in_window)
     loss_jump = -max_log_p_jump * (target_actions_bin_240 == 1)
 
-    loss = (torch.sum(loss_no_jump * class_weights[0]) + torch.sum(loss_jump * class_weights[1])) / (
-        (~in_window).sum() * class_weights[0] + (target_actions_bin_240 == 1).sum() * class_weights[1] + 1e-8
-    )
+    # Calculate average loss for each class dynamically to balance the gradients 50/50.
+    num_no_jump = (~in_window).sum().to(dtype=torch.float32)
+    num_jump = (target_actions_bin_240 == 1).sum().to(dtype=torch.float32)
+
+    has_no_jump = (num_no_jump > 0).to(dtype=torch.float32)
+    has_jump = (num_jump > 0).to(dtype=torch.float32)
+
+    avg_loss_no_jump = torch.sum(loss_no_jump) / (num_no_jump + 1e-8)
+    avg_loss_jump = torch.sum(loss_jump) / (num_jump + 1e-8)
+
+    total_classes = has_no_jump + has_jump + 1e-8
+    loss = (has_no_jump * avg_loss_no_jump + has_jump * avg_loss_jump) / total_classes
 
     return loss
 
@@ -245,8 +199,6 @@ def _process_batch(
     Returns:
         A tuple of the loss and new hidden state.
     """
-    class_weights = torch.tensor(_CONFIG_TRAINING["classWeights"], device=DEVICE, dtype=torch.float32)
-
     frames_norm, target_actions_bin, hidden_state = _preprocess_inputs(
         frames=frames,
         actions_bin=actions_bin,
@@ -262,7 +214,6 @@ def _process_batch(
     loss = _calculate_loss(
         logits=logits,
         target_actions_bin=target_actions_bin,
-        class_weights=class_weights,
     )
 
     return loss, hidden_state
@@ -274,22 +225,17 @@ def _prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
     Returns:
         A tuple containing (train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch).
     """
-    dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-    training_dir_name = _CONFIG["fileNames"]["trainingDirName"]
-    validation_dir_name = _CONFIG["fileNames"]["validationDirName"]
+    repo_dir = Path(__file__).resolve().parents[1]
+    train_files = list((repo_dir / "data" / "training").glob("*.npz"))
+    val_files = list((repo_dir / "data" / "validation").glob("*.npz"))
 
-    dataset_files_src = Path(__file__).resolve().parents[1] / dataset_dir_name
-    train_files = list((dataset_files_src / training_dir_name).glob("*.npz"))
-    val_files = list((dataset_files_src / validation_dir_name).glob("*.npz"))
+    total_train_chunks = sum(len(np.load(f)["actions_bin"]) // _SEQ_LEN for f in train_files)
+    train_steps_per_epoch = max(1, total_train_chunks // _BATCH_SIZE)
 
-    total_train_chunks = sum(len(np.load(f)["actions_bin"]) // _CONFIG_TRAINING["seqLen"] for f in train_files)
-    train_steps_per_epoch = max(1, total_train_chunks // BATCH_SIZE)
+    total_val_chunks = sum(len(np.load(f)["actions_bin"]) // _SEQ_LEN for f in val_files)
+    val_steps_per_epoch = max(1, total_val_chunks // _BATCH_SIZE)
 
-    total_val_chunks = sum(len(np.load(f)["actions_bin"]) // _CONFIG_TRAINING["seqLen"] for f in val_files)
-    val_steps_per_epoch = max(1, total_val_chunks // BATCH_SIZE)
-
-    accumulation_steps: int = _CONFIG["training"]["accumulationSteps"]
-    opt_steps_per_epoch = (train_steps_per_epoch + accumulation_steps - 1) // accumulation_steps
+    opt_steps_per_epoch = (train_steps_per_epoch + _ACCUMULATION_STEPS - 1) // _ACCUMULATION_STEPS
 
     return train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch
 
@@ -298,19 +244,20 @@ def _init_model_and_optimizer(
     opt_steps_per_epoch: int,
 ) -> tuple[Model, torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
     """Initialize Model, Optimizer, and LR Scheduler on the specified device."""
-    model = Model().to(DEVICE)
+    model = Model().to(_DEVICE)
 
+    lr = 3e-4
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LR,
-        betas=(_CONFIG_TRAINING["beta1"], _CONFIG_TRAINING["beta2"]),
-        weight_decay=_CONFIG_TRAINING["weightDecay"],
+        lr=lr,
+        betas=(0.9, 0.999),
+        weight_decay=0.01,
     )
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=LR,
-        epochs=_CONFIG["training"]["epochs"],
+        max_lr=lr,
+        epochs=_EPOCHS,
         steps_per_epoch=opt_steps_per_epoch,
         pct_start=0.1,  # 10% warmup
         anneal_strategy="cos",
@@ -321,29 +268,29 @@ def _init_model_and_optimizer(
 
 def _load_checkpoint(
     checkpoint_dir: Path,
-    checkpoint_name: str,
+    checkpoint_file: str,
     model: Model,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.OneCycleLR,
 ) -> int:
-    """Load checkpoint state if a checkpoint name is specified.
+    """Load checkpoint state if a checkpoint file is specified.
 
     Returns:
         The starting epoch number (defaults to 1 if no checkpoint is loaded).
     """
-    if not checkpoint_name:
+    if not checkpoint_file:
         return 1
 
     checkpoint = torch.load(
-        checkpoint_dir / checkpoint_name,
-        map_location=DEVICE,
+        checkpoint_dir / checkpoint_file,
+        map_location=_DEVICE,
     )
 
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
 
-    print(f"Loading checkpoint {checkpoint_name}.")
+    print(f"Loading checkpoint {checkpoint_file}.")
     return checkpoint["epoch"] + 1
 
 
@@ -353,21 +300,12 @@ def _run_train_epoch(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.OneCycleLR,
     steps: int,
-) -> float:
-    """Run a single training epoch and return the average loss."""
+    hidden_state: Tensor,
+) -> tuple[float, Tensor]:
+    """Run a single training epoch and return the average loss and final hidden state."""
     model.train()
     num_train_batches = 0
-    train_loss_tensor = torch.zeros(1, device=DEVICE)
-
-    hidden_state_dim = _CONFIG["model"]["hiddenDim"]
-    hidden_state = torch.zeros(  # [N, L, D]
-        BATCH_SIZE,
-        1,
-        hidden_state_dim,
-        device=DEVICE,
-    )
-
-    accumulation_steps = _CONFIG["training"]["accumulationSteps"]
+    train_loss_tensor = torch.zeros(1, device=_DEVICE)
 
     for i in range(steps):
         try:
@@ -384,10 +322,10 @@ def _run_train_epoch(
             hidden=hidden_state,
         )
 
-        scaled_loss = loss / accumulation_steps
+        scaled_loss = loss / _ACCUMULATION_STEPS
         scaled_loss.backward()
 
-        if num_train_batches % accumulation_steps == 0:
+        if num_train_batches % _ACCUMULATION_STEPS == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
@@ -395,32 +333,25 @@ def _run_train_epoch(
 
         train_loss_tensor += loss.detach()
 
-    if num_train_batches % accumulation_steps != 0:
+    if num_train_batches % _ACCUMULATION_STEPS != 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
-    return (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0.0
+    return ((train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0.0), hidden_state
 
 
 def _run_val_epoch(
     model: Model,
     val_iter: Iterator,
     steps: int,
-) -> float:
-    """Run a single validation epoch and return the average loss."""
+    hidden_state: Tensor,
+) -> tuple[float, Tensor]:
+    """Run a single validation epoch and return the average loss and final hidden state."""
     model.eval()
     num_val_batches = 0
-    val_loss_tensor = torch.zeros(1, device=DEVICE)
-
-    hidden_state_dim = _CONFIG["model"]["hiddenDim"]
-    hidden_state = torch.zeros(  # [N, L, D]
-        BATCH_SIZE,
-        1,
-        hidden_state_dim,
-        device=DEVICE,
-    )
+    val_loss_tensor = torch.zeros(1, device=_DEVICE)
 
     with torch.no_grad():
         for i in range(steps):
@@ -440,7 +371,7 @@ def _run_val_epoch(
 
             val_loss_tensor += loss.detach()
 
-    return (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0
+    return ((val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0), hidden_state
 
 
 def _save_checkpoint(
@@ -470,7 +401,7 @@ def _save_checkpoint(
 
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
-    checkpoint_save_interval: int = _CONFIG["training"]["checkpointSaveInterval"]
+    epochs = 100
 
     train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch = _prepare_data_files()
 
@@ -484,35 +415,53 @@ def _train():
         opt_steps_per_epoch=opt_steps_per_epoch,
     )
 
-    checkpoint_dir = Path(__file__).resolve().parents[1] / _CONFIG["fileNames"]["checkpointDirName"]
-    checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
+    checkpoint_file = _CONFIG["checkpointFile"]
+    checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints"
 
     start_epoch = _load_checkpoint(
         checkpoint_dir=checkpoint_dir,
-        checkpoint_name=checkpoint_name,
+        checkpoint_file=checkpoint_file,
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
     )
 
-    for epoch in range(start_epoch, _CONFIG["training"]["epochs"] + 1):
-        avg_train_loss = _run_train_epoch(
+    hidden_state_dim = _CONFIG["model"]["hiddenDim"]
+
+    # keep the 2 hiddens separate
+    train_hidden_state = torch.zeros(
+        _BATCH_SIZE,
+        1,
+        hidden_state_dim,
+        device=_DEVICE,
+    )
+    val_hidden_state = torch.zeros(
+        _BATCH_SIZE,
+        1,
+        hidden_state_dim,
+        device=_DEVICE,
+    )
+
+    for epoch in range(start_epoch, epochs + 1):
+        avg_train_loss, train_hidden_state = _run_train_epoch(
             model=model,
             train_iter=train_iter,
             optimizer=optimizer,
             scheduler=scheduler,
             steps=train_steps_per_epoch,
+            hidden_state=train_hidden_state,
         )
 
-        avg_val_loss = _run_val_epoch(
+        avg_val_loss, val_hidden_state = _run_val_epoch(
             model=model,
             val_iter=val_iter,
             steps=val_steps_per_epoch,
+            hidden_state=val_hidden_state,
         )
 
         print(f"Epoch {epoch} completed | Training loss: {avg_train_loss:.2f} | Validation loss: {avg_val_loss:.2f}")
 
-        if epoch % checkpoint_save_interval == 0:
+        if epoch % 10 == 0:
             _save_checkpoint(
                 checkpoint_dir=checkpoint_dir,
                 epoch=epoch,

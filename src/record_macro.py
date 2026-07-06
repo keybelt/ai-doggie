@@ -22,6 +22,7 @@ from pynput.keyboard import Key, Listener
 with (Path(__file__).resolve().parent / "config.json").open() as f:
     _CONFIG = json.load(f)
 
+
 _macro_actions_240 = None
 _is_shutdown = False
 _is_recording = False
@@ -89,8 +90,8 @@ def _process_macro(parsed_macro: dict) -> list[tuple[int, int]]:
         is_keydown = macro_input["down"]
 
         if mouse_btn == 1:  # and not is_player2:
-            if macro_fps is not None and round(macro_fps) != _CONFIG["macroFps"]:
-                frame_idx = round(round(frame_idx * _CONFIG["macroFps"]) / round(macro_fps))
+            if macro_fps is not None and round(macro_fps) != 240:
+                frame_idx = round(round(frame_idx * 240) / round(macro_fps))
 
             macro_events.append((frame_idx, 1 if is_keydown else 0))
 
@@ -123,7 +124,7 @@ def _build_macro_actions_240(macro_events: list[tuple[int, int]]):
 
 def _init_shm() -> SharedMemory:
     """Initialize a shared memory block between this script and the c++ mod."""
-    shm_name = _CONFIG["shmName"]
+    shm_name = "GDMem"
     try:
         shm = SharedMemory(name=shm_name)
         shm.close()
@@ -134,16 +135,16 @@ def _init_shm() -> SharedMemory:
     shm = SharedMemory(
         name=shm_name,
         create=True,
-        size=6912024,
+        size=921616,
     )
-    shm.buf[0:24] = bytes(24)
+    shm.buf[0:16] = bytes(16)
     return shm
 
 
 def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_buf: np.ndarray) -> int:
     """Run the main frame and action recording loop, returning the number of frames recorded."""
     buf_max_frames = len(frames_buf)
-    log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
+    log_interval = _CONFIG["logIntervalSec"] * _CONFIG["fps"]
     frame_idx = 0
 
     while not _is_shutdown:
@@ -153,14 +154,15 @@ def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_b
             time.sleep(0.001)
             continue
 
-        # Read current game tick and dimensions from shared memory
+        # Read current game tick from shared memory
         current_tick = unpack("i", shm.buf[0:4])[0]
-        width = unpack("i", shm.buf[16:20])[0]
-        height = unpack("i", shm.buf[20:24])[0]
 
-        # Read frame buffer
-        frame_size = width * height * 3
-        raw_frame = np.frombuffer(shm.buf[24 : 24 + frame_size], dtype=np.uint8).reshape((height, width, 3))
+        frame_w = _CONFIG["frame"]["width"]
+        frame_h = _CONFIG["frame"]["height"]
+
+        # Read frame buffer (fixed 640x480 resolution starting at offset 16)
+        frame_size = frame_w * frame_h * 3
+        raw_frame = np.frombuffer(shm.buf[16 : 16 + frame_size], dtype=np.uint8).reshape((frame_h, frame_w, 3))
 
         # Get the 4 actions directly via slicing and pack them
         aligned_tick = (current_tick // 4) * 4
@@ -203,15 +205,11 @@ def _record(filepath: Path):
     listener = Listener(on_press=_on_press)
     listener.start()
 
-    buf_max_frames = _CONFIG["bufMaxFrames"]
-    frame_height_px = _CONFIG["capture"]["frameDims"]["pipelineHeightPx"]
-    frame_width_px = _CONFIG["capture"]["frameDims"]["pipelineWidthPx"]
-
     frames_buf: np.ndarray = np.empty(
-        (buf_max_frames, frame_height_px, frame_width_px, 3),
+        (50000, 480, 640, 3),
         dtype=np.uint8,
     )
-    actions_bin_buf = np.zeros((buf_max_frames, 4), dtype=np.uint8)
+    actions_bin_buf = np.zeros((50000, 4), dtype=np.uint8)
 
     try:
         frame_idx = _run_recording_loop(shm, frames_buf, actions_bin_buf)
@@ -223,10 +221,9 @@ def _record(filepath: Path):
         filepath.unlink()
         return
 
-    dataset_dir_name = _CONFIG["fileNames"]["datasetDirName"]
-    dataset_dir: Path = Path(__file__).resolve().parents[1] / dataset_dir_name
+    dataset_dir_path: Path = Path(__file__).resolve().parents[1] / "data"
 
-    save_path = dataset_dir / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
+    save_path = dataset_dir_path / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
     np.savez_compressed(
         save_path,
         frames=frames_buf[:frame_idx],

@@ -1,72 +1,13 @@
 {
-    "capture": {
-        "frameDims": {
-            "srcHeightPx": 480,
-            "srcWidthPx": 640,
-            "pipelineHeightPx": 480,
-            "pipelineWidthPx": 640
-        },
-        "queueDepth": 2,
-        "fps": 60
-    },
     "model": {
-        "inputHeightPx": 480,
-        "inputWidthPx": 640,
-        "weightShapes": {
-            "conv1": {
-                "inChannels": 3,
-                "outChannels": 32,
-                "kernelSize": 5,
-                "stride": 4
-            },
-            "conv2": {
-                "inChannels": 32,
-                "outChannels": 128,
-                "kernelSize": 5,
-                "stride": 4
-            },
-            "conv3": {
-                "inChannels": 128,
-                "outChannels": 64,
-                "kernelSize": 3,
-                "stride": 2
-            }
-        },
-        "hiddenDim": 32,
-        "vocabSize": 8,
-        "attnDim": 8,
-        "numAttHeads": 4
+        "hiddenDim": 32
     },
-    "fileNames": {
-        "datasetDirName": "data",
-        "trainingDirName": "training",
-        "validationDirName": "validation",
-        "checkpointName": "",
-        "checkpointDirName": "checkpoints"
-    },
-    "training": {
-        "batchSize": 4,
-        "accumulationSteps": 4,
-        "seqLen": 128,
-        "learningRate": 3e-4,
-        "beta1": 0.9,
-        "beta2": 0.999,
-        "weightDecay": 0.01,
-        "checkpointSaveInterval": 10,
-        "epochs": 100,
-        "classWeights": [
-            0.6801,
-            1.3199
-        ],
-        "distributionSize": 7
-    },
+    "checkpointFile": "",
     "keys": {
         "exitKeyName": "backspace",
         "recordKeyName": "space"
     },
-    "shmName": "GDMem",
-    "bufMaxFrames": 50000,
+    "fps": 60,
     "logIntervalSec": 1,
-    "macroFps": 240,
     "recordStartDelaySec": 0.2
 }

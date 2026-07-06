@@ -23,6 +23,8 @@ from model import Model
 with (Path(__file__).resolve().parent / "config.json").open() as f:
     _CONFIG = json.load(f)
 
+_DEVICE = torch.device("mps")
+
 _is_inferring = False
 _is_shutdown = False
 
@@ -40,34 +42,33 @@ def _on_press(key):
 
 def _init_shm() -> SharedMemory:
     """Initialize a shared memory block between this script and the c++ mod."""
-    shm_name = _CONFIG["shmName"]
     try:
-        shm = SharedMemory(name=shm_name)
+        shm = SharedMemory(name="GDMem")
         shm.close()
         shm.unlink()
     except FileNotFoundError:
         pass
 
     shm = SharedMemory(
-        name=shm_name,
+        name="GDMem",
         create=True,
-        size=6912024,
+        size=921616,
     )
-    shm.buf[0:24] = bytes(24)
+    shm.buf[0:16] = bytes(16)
     return shm
 
 
 def _init_model() -> Model:
     """Load model and weights, placing it on the MPS device in evaluation mode."""
-    device = torch.device("mps")
-    model = Model().to(device)
+    model = Model().to(_DEVICE)
 
-    checkpoint_name = _CONFIG["fileNames"]["checkpointName"]
-    if checkpoint_name:
-        checkpoint_dir = Path(__file__).resolve().parents[1] / _CONFIG["fileNames"]["checkpointDirName"]
-        checkpoint = torch.load(checkpoint_dir / checkpoint_name, map_location=device)
+    checkpoint_file = _CONFIG["checkpointFile"]
+    if checkpoint_file:
+        checkpoint = torch.load(
+            (Path(__file__).resolve().parents[1] / "checkpoints") / checkpoint_file, map_location=_DEVICE
+        )
         model.load_state_dict(checkpoint["model_state"])
-        print(f"Loading checkpoint {checkpoint_name}.")
+        print(f"Loading checkpoint {checkpoint_file}.")
 
     model.eval()
     return model
@@ -75,16 +76,15 @@ def _init_model() -> Model:
 
 def _run_inference_loop(model: Model, shm: SharedMemory):
     """Run the main loop retrieving frames, performing inference, and logging stats."""
-    device = torch.device("mps")
     hidden_state: Tensor = torch.zeros(  # [N, L, D]
         1,
         1,
         _CONFIG["model"]["hiddenDim"],
-        device=device,
+        device=_DEVICE,
     )
 
-    log_interval = _CONFIG["logIntervalSec"] * _CONFIG["capture"]["fps"]
     i = 0
+    last_tick = -1
 
     with torch.inference_mode():
         while not _is_shutdown:
@@ -92,63 +92,65 @@ def _run_inference_loop(model: Model, shm: SharedMemory):
                 continue
 
             # Wait for C++ to set frameReadyBin == 1
-            frame_ready = unpack("i", shm.buf[8:12])[0]
-            if frame_ready != 1:
+            if unpack("i", shm.buf[8:12])[0] != 1:
                 time.sleep(0.001)
                 continue
 
             i += 1
             time_start: float = time.perf_counter()
 
-            # Read current game dimensions
-            width = unpack("i", shm.buf[16:20])[0]
-            height = unpack("i", shm.buf[20:24])[0]
+            # Read current game tick and dimensions
+            current_tick = unpack("i", shm.buf[0:4])[0]
+            if current_tick < last_tick:
+                print(f"\nDeath detected (tick: {last_tick} -> {current_tick})! Resetting hidden state.")
+                hidden_state = torch.zeros(
+                    1,
+                    1,
+                    _CONFIG["model"]["hiddenDim"],
+                    device=_DEVICE,
+                )
+            last_tick = current_tick
 
-            # Extract raw frame from shared memory
-            frame_size = width * height * 3
-            raw_frame_rgb = np.frombuffer(shm.buf[24 : 24 + frame_size], dtype=np.uint8).reshape((height, width, 3))
-
-            # Convert to [1, 1, H, W, C] RGB tensor on MPS
-            frame_NTHWC = (
-                torch.from_numpy(raw_frame_rgb)
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .to(device=torch.device("mps"), dtype=torch.float32)
-                / 255.0
-            )
+            frame_w = _CONFIG["frame"]["width"]
+            frame_h = _CONFIG["frame"]["height"]
 
             # logits: [N, T, V]
             # hidden_state: [N, L, D]
-            logits, hidden_state = model(frame_NTHWC, hidden_state)
+            logits, hidden_state = model(
+                torch.from_numpy(
+                    np.frombuffer(
+                        shm.buf[16 : 16 + frame_w * frame_h * 3],
+                        dtype=np.uint8,
+                    ).reshape((frame_h, frame_w, 3))
+                )
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(device=_DEVICE, dtype=torch.float32)
+                / 255.0,
+                hidden_state,
+            )
 
             actions = torch.argmax(logits.view(4, 2), dim=-1).cpu().tolist()
 
-            # Pack the 4 actions into a bitmask
-            curr_action_bin = actions[0] | (actions[1] << 1) | (actions[2] << 2) | (actions[3] << 3)
-
             # Write actions to currActionBin
-            shm.buf[4:8] = pack("i", curr_action_bin)
-
-            infer_time: float = (time.perf_counter() - time_start) * 1000
+            shm.buf[4:8] = pack("i", actions[0] | (actions[1] << 1) | (actions[2] << 2) | (actions[3] << 3))
 
             # Handshake acknowledgement: set actionReadyBin = 1, frameReadyBin = 0
             shm.buf[12:16] = pack("i", 1)
             shm.buf[8:12] = pack("i", 0)
 
-            if i % log_interval == 0:
-                print(f"\rInference latency: {infer_time:.2f}ms", end="", flush=True)
+            if i % (_CONFIG["logIntervalSec"] * _CONFIG["fps"]) == 0:
+                print(f"\rInference latency: {(time.perf_counter() - time_start) * 1000:.2f}ms", end="", flush=True)
 
 
 def _infer():
     """Coordinate resource initialization, launch background threads, and start loop."""
-    listener = Listener(on_press=_on_press)
-    listener.start()
+    Listener(on_press=_on_press).start()
 
     shm = _init_shm()
-    model = _init_model()
 
     try:
-        _run_inference_loop(model, shm)
+        _run_inference_loop(_init_model(), shm)
     finally:
         shm.close()
 
