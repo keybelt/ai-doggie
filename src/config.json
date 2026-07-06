@@ -2,6 +2,10 @@
     "model": {
         "hiddenDim": 32
     },
+    "frame": {
+        "width": 640,
+        "height": 480
+    },
     "checkpointFile": "",
     "keys": {
         "exitKeyName": "backspace",
