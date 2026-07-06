@@ -2,11 +2,13 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <fcntl.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace geode::prelude;
@@ -21,6 +23,7 @@ struct SharedData {
 
 SharedData *data = nullptr;
 bool isJumping = false;
+int lastFrameIdx = -1;
 std::string shmName = "GDMem";
 int fileDescriptor = -1;
 
@@ -34,6 +37,11 @@ void initShm() {
 
   if (fileDescriptor != -1) {
     data = (SharedData *)mmap(NULL, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fileDescriptor, 0);
+    if (data == MAP_FAILED) {
+      data = nullptr;
+      close(fileDescriptor);
+      fileDescriptor = -1;
+    }
   }
 };
 
@@ -58,12 +66,14 @@ class $modify(MyPlayLayer, PlayLayer) {
 
     initShm();
     isJumping = false;
+    lastFrameIdx = -1;
     return true;
   }
 
   void resetLevel() {
     PlayLayer::resetLevel();
     isJumping = false;
+    lastFrameIdx = -1;
   }
 
   void onQuit() {
@@ -111,39 +121,37 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
 
     // 2.208 made m_currentProgress count twice as fast, for now we just divide it by 2
     int frameIdx = m_gameState.m_currentProgress / 2;
+    if (frameIdx == lastFrameIdx)
+      return;
+    lastFrameIdx = frameIdx;
     data->frameIdx = frameIdx;
-
-    bool isValid = true;
 
     if (frameIdx % 4 == 0) {
       // Capture 640x480 screen pixels from Cocos2d-x frame buffer
       glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
 
       data->actionReadyBin = 0;
+      std::atomic_thread_fence(std::memory_order_release);
       data->frameReadyBin = 1;
 
       auto start = std::chrono::steady_clock::now();
-      bool timedOut = true;
 
       while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(8)) {
         if (data->actionReadyBin != 0) {
-          timedOut = false;
           break;
         }
+        std::this_thread::yield();
       }
-      isValid = !timedOut;
     }
 
-    if (isValid) {
-      bool shouldJump = ((data->currActionBin >> (frameIdx % 4)) & 1);
+    bool shouldJump = ((data->currActionBin >> (frameIdx % 4)) & 1);
 
-      if (shouldJump && !isJumping) {
-        simulateClick(PlayerButton::Jump, true, false);
-        isJumping = true;
-      } else if (!shouldJump && isJumping) {
-        simulateClick(PlayerButton::Jump, false, false);
-        isJumping = false;
-      }
+    if (shouldJump && !isJumping) {
+      simulateClick(PlayerButton::Jump, true, false);
+      isJumping = true;
+    } else if (!shouldJump && isJumping) {
+      simulateClick(PlayerButton::Jump, false, false);
+      isJumping = false;
     }
   }
 
