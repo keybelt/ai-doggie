@@ -41,6 +41,7 @@ def _on_press(key):
         print("Recording started.")
     elif key == Key[exit_key_name]:
         _is_shutdown = True
+        print("\nSaving...")
 
 
 def _parse_macro_file(filepath: Path) -> dict:
@@ -141,8 +142,8 @@ def _init_shm() -> SharedMemory:
     return shm
 
 
-def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_buf: np.ndarray) -> int:
-    """Run the main frame and action recording loop, returning the number of frames recorded."""
+def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_buf: np.ndarray) -> (int, bool):
+    """Run the main frame and action recording loop, returning the number of frames recorded and whether to save."""
     buf_max_frames = len(frames_buf)
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["fps"]
     frame_idx = 0
@@ -161,6 +162,17 @@ def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_b
             shm.buf[12:16] = pack("i", 1)
             shm.buf[8:12] = pack("i", 0)
             continue
+
+        is_dead = False
+        if current_tick < last_tick:
+            print("\nDeath detected! Stopping recording...")
+            is_dead = True
+
+            # Handshake acknowledgement: set actionReadyBin = 1, frameReadyBin = 0
+            shm.buf[12:16] = pack("i", 1)
+            shm.buf[8:12] = pack("i", 0)
+            break
+
         last_tick = current_tick
 
         frame_w = _CONFIG["frame"]["width"]
@@ -196,7 +208,7 @@ def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_b
         shm.buf[12:16] = pack("i", 1)
         shm.buf[8:12] = pack("i", 0)
 
-    return frame_idx
+    return frame_idx, is_dead
 
 
 def _record(filepath: Path):
@@ -220,12 +232,11 @@ def _record(filepath: Path):
         actions_bin_buf = np.zeros((buffer_size, 4), dtype=np.uint8)
 
         try:
-            frame_idx = _run_recording_loop(shm, frames_buf, actions_bin_buf)
+            frame_idx, is_dead = _run_recording_loop(shm, frames_buf, actions_bin_buf)
         finally:
             listener.stop()
 
-        should_save: str = input("\nSave this recording? (Y/n): ")
-        if should_save == "n":
+        if is_dead:
             filepath.unlink()
             return
 
