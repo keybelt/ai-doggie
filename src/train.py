@@ -145,37 +145,17 @@ def _calculate_loss(
     logits_240 = logits.view(N, T * 4, 2)
     target_actions_bin_240 = target_actions_bin.view(N, T * 4)
 
-    log_probs = F.log_softmax(logits_240, dim=-1)
-    log_p_no_jump = log_probs[..., 0]  # [N, T * 4]
-    log_p_jump = log_probs[..., 1].unsqueeze(1)  # [N, 1, T * 4]
+    num_no_jump = (target_actions_bin_240 == 0).sum()
+    num_jump = (target_actions_bin_240 == 1).sum()
 
-    kernel_size = 7  # distribution size
-    padding = kernel_size // 2
+    # Avoid division by zero if a class is entirely missing in the batch
+    w_no_jump = 1.0 / (num_no_jump.clamp(min=1).to(dtype=torch.float32))
+    w_jump = 1.0 / (num_jump.clamp(min=1).to(dtype=torch.float32))
 
-    # manually pad with -1e9 cuz we're in log softmax space
-    log_p_jump_padded = F.pad(log_p_jump, (padding, padding), mode="constant", value=-1e9)
-    max_log_p_jump = F.max_pool1d(log_p_jump_padded, kernel_size=kernel_size, stride=1, padding=0).squeeze(1)
+    # If a class is missing, set its weight to 0.0
+    weight = torch.stack([w_no_jump * (num_no_jump > 0), w_jump * (num_jump > 0)])
 
-    is_jump = target_actions_bin_240.to(dtype=torch.float32).unsqueeze(1)
-
-    # Use > 0.5 rather than == 1 to mitigate floating point precision issues.
-    in_window = F.max_pool1d(is_jump, kernel_size=kernel_size, stride=1, padding=padding).squeeze(1) > 0.5
-
-    loss_no_jump = -log_p_no_jump * (~in_window)
-    loss_jump = -max_log_p_jump * (target_actions_bin_240 == 1)
-
-    # Calculate average loss for each class dynamically to balance the gradients 50/50.
-    num_no_jump = (~in_window).sum().to(dtype=torch.float32)
-    num_jump = (target_actions_bin_240 == 1).sum().to(dtype=torch.float32)
-
-    has_no_jump = (num_no_jump > 0).to(dtype=torch.float32)
-    has_jump = (num_jump > 0).to(dtype=torch.float32)
-
-    avg_loss_no_jump = torch.sum(loss_no_jump) / (num_no_jump + 1e-8)
-    avg_loss_jump = torch.sum(loss_jump) / (num_jump + 1e-8)
-
-    total_classes = has_no_jump + has_jump + 1e-8
-    loss = (has_no_jump * avg_loss_no_jump + has_jump * avg_loss_jump) / total_classes
+    loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weight)
 
     return loss
 
