@@ -12,6 +12,5 @@
         "recordKeyName": "space"
     },
     "fps": 60,
-    "logIntervalSec": 1,
-    "recordStartDelaySec": 0
+    "logIntervalSec": 1
 }
