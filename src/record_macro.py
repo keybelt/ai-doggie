@@ -141,14 +141,15 @@ def _run_recording_loop(shm: SharedMemory, macro_events: list[tuple[int, int]]) 
             time.sleep(0)
             continue
 
-        print("Recording started")
-
         # Read current game tick from shared memory
         current_tick = unpack("i", shm.buf[0:4])[0]
         if current_tick == last_tick:
             shm.buf[12:16] = pack("i", 1)
             shm.buf[8:12] = pack("i", 0)
             continue
+
+        if frame_idx == 0:
+            print("Recording started.")
 
         is_dead = False
         if current_tick < last_tick:
@@ -241,6 +242,6 @@ if __name__ == "__main__":
     except StopIteration:
         macro_path = next(downloads_dir.glob("*.json"))
 
-    print(f"Using macro: {macro_path}")
+    print(f"Using macro: {macro_path.name}")
 
     _record(macro_path)
