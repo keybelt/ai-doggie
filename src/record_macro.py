@@ -13,34 +13,13 @@ from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from struct import pack, unpack
 
+import msgpack
 import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
-from pynput.keyboard import Key, Listener
-
 with (Path(__file__).resolve().parent / "config.json").open() as f:
     _CONFIG = json.load(f)
-
-
-_macro_actions_240 = None
-_is_shutdown = False
-_is_recording = False
-
-
-def _on_press(key):
-    """Activate shutdown state upon keypress."""
-    global _is_shutdown, _is_recording
-
-    exit_key_name = _CONFIG["keys"]["exitKeyName"]
-    record_key_name = _CONFIG["keys"]["recordKeyName"]
-
-    if key == Key[record_key_name]:
-        _is_recording = True
-        print("Recording started.")
-    elif key == Key[exit_key_name]:
-        _is_shutdown = True
-        print("\nSaving...")
 
 
 def _parse_macro_file(filepath: Path) -> dict:
@@ -49,8 +28,6 @@ def _parse_macro_file(filepath: Path) -> dict:
     Returns:
         The parsed macro dictionary structure.
     """
-    import msgpack
-
     macro_data = filepath.read_bytes()
 
     try:
@@ -102,24 +79,24 @@ def _process_macro(parsed_macro: dict) -> list[tuple[int, int]]:
     return macro_events
 
 
-def _build_macro_actions_240(macro_events: list[tuple[int, int]]):
+def _build_macro_actions_240(macro_events: list[tuple[int, int]]) -> tuple[np.ndarray, int]:
     """Pre-populate a dense 240Hz actions array from sparse macro events.
 
     Uses fast NumPy slice assignments to fill frame intervals with their active state.
     """
-    global _macro_actions_240
-
     max_frame = max(e[0] for e in macro_events) if macro_events else 0
-    # Add a generous padding buffer (100,000 ticks) to avoid index errors at the end of recording
-    _macro_actions_240 = np.zeros(max_frame + 100000, dtype=np.uint8)
+    # Add a small padding buffer (4 ticks) to avoid index errors at the end of recording
+    macro_actions_240 = np.zeros(max_frame + 4, dtype=np.uint8)
 
     prev_frame = 0
     current_action = 0
     for frame, action in macro_events:
-        _macro_actions_240[prev_frame:frame] = current_action
+        macro_actions_240[prev_frame:frame] = current_action
         prev_frame = frame
         current_action = action
-    _macro_actions_240[prev_frame:] = current_action
+    macro_actions_240[prev_frame:] = current_action
+
+    return macro_actions_240, max_frame
 
 
 def _init_shm() -> SharedMemory:
@@ -141,19 +118,30 @@ def _init_shm() -> SharedMemory:
     return shm
 
 
-def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_buf: np.ndarray) -> (int, bool):
-    """Run the main frame and action recording loop, returning the number of frames recorded and whether to save."""
-    buf_max_frames = len(frames_buf)
+def _run_recording_loop(shm: SharedMemory, macro_events: list[tuple[int, int]]) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Run the main frame and action recording loop, returning the recorded frames, actions, and whether the player died."""
+    macro_actions_240, max_tick = _build_macro_actions_240(macro_events)
+
+    buffer_size = 50000
+    frame_h = _CONFIG["frame"]["height"]
+    frame_w = _CONFIG["frame"]["width"]
+
+    frames_buf = np.empty((buffer_size, frame_h, frame_w, 3), dtype=np.uint8)
+    actions_bin_buf = np.zeros((buffer_size, 4), dtype=np.uint8)
+
+    buf_max_frames = buffer_size
     log_interval = _CONFIG["logIntervalSec"] * _CONFIG["fps"]
     frame_idx = 0
     last_tick = -1
 
-    while not _is_shutdown:
+    while True:
         # Wait for C++ to signal frameReadyBin == 1
         frame_ready = unpack("i", shm.buf[8:12])[0]
         if frame_ready != 1:
             time.sleep(0)
             continue
+
+        print("Recording started")
 
         # Read current game tick from shared memory
         current_tick = unpack("i", shm.buf[0:4])[0]
@@ -172,10 +160,15 @@ def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_b
             shm.buf[8:12] = pack("i", 0)
             break
 
-        last_tick = current_tick
+        if current_tick > max_tick:
+            print("\nMacro finished! Stopping recording...")
 
-        frame_w = _CONFIG["frame"]["width"]
-        frame_h = _CONFIG["frame"]["height"]
+            # Handshake acknowledgement: set actionReadyBin = 1, frameReadyBin = 0
+            shm.buf[12:16] = pack("i", 1)
+            shm.buf[8:12] = pack("i", 0)
+            break
+
+        last_tick = current_tick
 
         # Read frame buffer (fixed 640x480 resolution starting at offset 16)
         frame_size = frame_w * frame_h * 3
@@ -183,7 +176,7 @@ def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_b
 
         # Get the 4 actions directly via slicing and pack them
         aligned_tick = (current_tick // 4) * 4
-        a = _macro_actions_240[aligned_tick : aligned_tick + 4]
+        a = macro_actions_240[aligned_tick : aligned_tick + 4]
         action_val = int(a[0]) | (int(a[1]) << 1) | (int(a[2]) << 2) | (int(a[3]) << 3)
 
         # Write current action to shared memory
@@ -195,19 +188,18 @@ def _run_recording_loop(shm: SharedMemory, frames_buf: np.ndarray, actions_bin_b
             shm.buf[8:12] = pack("i", 0)
             break
 
-        if _is_recording:
-            frames_buf[frame_idx] = raw_frame
-            actions_bin_buf[frame_idx] = a
-            frame_idx += 1
+        frames_buf[frame_idx] = raw_frame
+        actions_bin_buf[frame_idx] = a
+        frame_idx += 1
 
-            if frame_idx % log_interval == 0:
-                print(f"\rFrames recorded: {frame_idx}", end="", flush=True)
+        if frame_idx % log_interval == 0:
+            print(f"\rFrames recorded: {frame_idx}", end="", flush=True)
 
         # Handshake acknowledgement: set actionReadyBin = 1, frameReadyBin = 0
         shm.buf[12:16] = pack("i", 1)
         shm.buf[8:12] = pack("i", 0)
 
-    return frame_idx, is_dead
+    return frames_buf[:frame_idx], actions_bin_buf[:frame_idx], is_dead
 
 
 def _record(filepath: Path):
@@ -215,25 +207,10 @@ def _record(filepath: Path):
     parsed_macro = _parse_macro_file(filepath)
     macro_events = _process_macro(parsed_macro)
 
-    _build_macro_actions_240(macro_events)
-
     shm = _init_shm()
 
     try:
-        listener = Listener(on_press=_on_press)
-        listener.start()
-
-        buffer_size = 50000
-        frame_h = _CONFIG["frame"]["height"]
-        frame_w = _CONFIG["frame"]["width"]
-
-        frames_buf: np.ndarray = np.empty((buffer_size, frame_h, frame_w, 3), dtype=np.uint8)
-        actions_bin_buf = np.zeros((buffer_size, 4), dtype=np.uint8)
-
-        try:
-            frame_idx, is_dead = _run_recording_loop(shm, frames_buf, actions_bin_buf)
-        finally:
-            listener.stop()
+        frames, actions_bin, is_dead = _run_recording_loop(shm, macro_events)
 
         if is_dead:
             filepath.unlink()
@@ -245,8 +222,8 @@ def _record(filepath: Path):
         save_path = dataset_dir_path / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
         np.savez_compressed(
             save_path,
-            frames=frames_buf[:frame_idx],
-            actions_bin=actions_bin_buf[:frame_idx],
+            frames=frames,
+            actions_bin=actions_bin,
         )
         print(f"\nSaved recording to {save_path}")
 
