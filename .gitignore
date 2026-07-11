@@ -1,4 +1,4 @@
-checkpoints
+wandb
 data
 .venv
 .src_old
