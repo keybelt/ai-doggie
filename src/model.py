@@ -22,6 +22,7 @@ class Model(nn.Module):
         super().__init__()
         with (Path(__file__).resolve().parent / "config.json").open() as f:
             config = json.load(f)
+
         self._hidden_dim = config["model"]["hiddenDim"]
         self._action_dim = 8
         self._attn_dim = 16
@@ -30,17 +31,21 @@ class Model(nn.Module):
         # 3-layer CNN backbone with CoordConv on first layer.
         self._conv1 = nn.Conv2d(3 + 2, 32, kernel_size=5, stride=4)
         self._conv2 = nn.Conv2d(32, 128, kernel_size=5, stride=4)
-        self._conv3 = nn.Conv2d(128, 64, kernel_size=3, stride=2)
+        cnn_out_channels = 64
+        self._conv3 = nn.Conv2d(128, cnn_out_channels, kernel_size=3, stride=2)
 
         # Player-centric cross-attention pooling.
-        in_channels = 64
-        self._plr_selector = nn.Conv2d(in_channels, 1, kernel_size=1, bias=False)
-        self._q_proj = nn.Linear(in_channels, self._attn_dim * self._num_heads, bias=False)
-        self._k_proj = nn.Linear(in_channels, self._attn_dim * self._num_heads, bias=False)
-        self._out_proj = nn.Linear((self._num_heads + 1) * in_channels, self._hidden_dim)
+        self._plr_selector = nn.Conv2d(cnn_out_channels, 1, kernel_size=1, bias=False)
+        self._q_proj = nn.Linear(cnn_out_channels, self._attn_dim * self._num_heads, bias=False)
+        self._k_proj = nn.Linear(cnn_out_channels, self._attn_dim * self._num_heads, bias=False)
+        self._v_proj = nn.Linear(cnn_out_channels, self._attn_dim * self._num_heads, bias=False)
+        self._plr_proj = nn.Linear(cnn_out_channels, self._hidden_dim)
+        self._out_proj = nn.Linear(self._num_heads * self._attn_dim, self._hidden_dim)
+        self._ln = nn.LayerNorm(self._hidden_dim)
 
         # Temporal processing and output.
         self._gru = nn.GRU(self._hidden_dim, self._hidden_dim, batch_first=True)
+        self._dropout = nn.Dropout(0.1)
         self._policy_head = nn.Linear(self._hidden_dim, self._action_dim)
 
         self._init_params()
@@ -54,6 +59,9 @@ class Model(nn.Module):
         nn.init.xavier_uniform_(self._plr_selector.weight)
         nn.init.xavier_uniform_(self._q_proj.weight)
         nn.init.xavier_uniform_(self._k_proj.weight)
+        nn.init.xavier_uniform_(self._v_proj.weight)
+        nn.init.kaiming_normal_(self._plr_proj.weight, nonlinearity="relu")
+        nn.init.zeros_(self._plr_proj.bias)
         nn.init.kaiming_normal_(self._out_proj.weight, nonlinearity="relu")
         nn.init.zeros_(self._out_proj.bias)
 
@@ -119,20 +127,23 @@ class Model(nn.Module):
 
         q = self._q_proj(plr_feat)  # [B, 1, H_heads * D_attn]
         k = self._k_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
+        v = self._v_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
 
         q = q.view(B, 1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, 1, D_attn]
         k = k.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
+        v = v.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
 
         scores = torch.matmul(q, k.transpose(-1, -2)) * self._attn_dim**-0.5  # [B, H_heads, 1, H_conv*W_conv]
         attn_probs = torch.softmax(scores, dim=-1)  # [B, H_heads, 1, H_conv*W_conv]
 
-        X_flat_with_head = X_flat.unsqueeze(1).expand(-1, self._num_heads, -1, -1)  # [B, H_heads, H_conv*W_conv, C_in]
-        context = attn_probs @ X_flat_with_head  # [B, H_heads, 1, C_in]
-        context = context.reshape(B, -1)  # [B, H_heads * C_in]
+        context = attn_probs @ v  # [B, H_heads, 1, D_attn]
+        context = context.reshape(B, -1)  # [B, H_heads * D_attn]
 
-        combined = torch.cat([plr_feat.squeeze(1), context], dim=-1)  # [B, (H_heads + 1) * C_in]
-
-        X_proj = torch.relu(self._out_proj(combined))  # [B, D]
+        # Residual skip connection: project attention context and add projected player features.
+        X_proj = self._out_proj(context) + self._plr_proj(plr_feat.squeeze(1))  # [B, D]
+        X_proj = torch.relu(X_proj)
+        X_proj = self._ln(X_proj)
+        X_proj = self._dropout(X_proj)
         X_proj = X_proj.view(N, T, self._hidden_dim)
 
         gru_out, h = self._gru(
@@ -140,6 +151,10 @@ class Model(nn.Module):
             # nn.GRU expects (L, N, D).
             prev_h.transpose(0, 1).contiguous(),
         )  # [N, T, D]
+
+        # Residual skip connection around the GRU.
+        gru_out = gru_out + X_proj
+        gru_out = self._dropout(gru_out)
 
         gru_out = gru_out.reshape(N * T, -1)
         logits_nonsequential = self._policy_head(gru_out)
