@@ -136,6 +136,7 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
 
       auto start = std::chrono::steady_clock::now();
 
+      // TODO: make timeout indefinite for macro recording, only enforce 60hz for inference
       while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(8)) {
         if (data->actionReadyBin != 0) {
           break;

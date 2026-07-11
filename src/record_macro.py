@@ -153,7 +153,7 @@ def _run_recording_loop(shm: SharedMemory, macro_events: list[tuple[int, int]]) 
 
         is_dead = False
         if current_tick < last_tick:
-            print("\nDeath detected! Stopping recording...")
+            print("\nDeath detected! Stopping recording...\n")
             is_dead = True
 
             # Handshake acknowledgement: set actionReadyBin = 1, frameReadyBin = 0
@@ -226,7 +226,7 @@ def _record(filepath: Path):
             frames=frames,
             actions_bin=actions_bin,
         )
-        print(f"\nSaved recording to {save_path}")
+        print(f"Saved recording to {save_path}\n")
 
         filepath.unlink()
     finally:
@@ -242,6 +242,6 @@ if __name__ == "__main__":
     except StopIteration:
         macro_path = next(downloads_dir.glob("*.json"))
 
-    print(f"Using macro: {macro_path.name}")
+    print(f"\nUsing macro: {macro_path.name}")
 
     _record(macro_path)
