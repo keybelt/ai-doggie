@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
+import wandb
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
@@ -23,9 +24,9 @@ from model import Model
 with (Path(__file__).resolve().parent / "config.json").open() as f:
     _CONFIG = json.load(f)
 
-_BATCH_SIZE = 4
+_BATCH_SIZE = 2
 _SEQ_LEN = 128
-_ACCUMULATION_STEPS = 4
+_ACCUMULATION_STEPS = 32
 _EPOCHS = 100
 
 _DEVICE = torch.device("mps")
@@ -128,38 +129,6 @@ def _preprocess_inputs(
     return frames_norm, target_actions_bin, hidden_state
 
 
-def _calculate_loss(
-    logits: Tensor,
-    target_actions_bin: Tensor,
-) -> Tensor:
-    """Calculate the loss given model logits and target actions.
-
-    Args:
-        logits: [N, T, V] model output logits.
-        target_actions_bin: [N, T, 4] target actions on the device.
-
-    Returns:
-        The calculated loss tensor.
-    """
-    N, T, _ = logits.shape
-    logits_240 = logits.view(N, T * 4, 2)
-    target_actions_bin_240 = target_actions_bin.view(N, T * 4)
-
-    num_no_jump = (target_actions_bin_240 == 0).sum()
-    num_jump = (target_actions_bin_240 == 1).sum()
-
-    # Avoid division by zero if a class is entirely missing in the batch
-    w_no_jump = 1.0 / (num_no_jump.clamp(min=1).to(dtype=torch.float32))
-    w_jump = 1.0 / (num_jump.clamp(min=1).to(dtype=torch.float32))
-
-    # If a class is missing, set its weight to 0.0
-    weight = torch.stack([w_no_jump * (num_no_jump > 0), w_jump * (num_jump > 0)])
-
-    loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weight)
-
-    return loss
-
-
 def _process_batch(
     model: Model,
     frames: Tensor,
@@ -190,11 +159,12 @@ def _process_batch(
 
     # Ensure hidden state doesn't effect the gradients of the entire dataset.
     hidden_state = hidden_state.detach()
+    N, T, _ = logits.shape
+    logits_240 = logits.view(N, T * 4, 2)
+    target_actions_bin_240 = target_actions_bin.view(N, T * 4)
 
-    loss = _calculate_loss(
-        logits=logits,
-        target_actions_bin=target_actions_bin,
-    )
+    weight = torch.tensor([1.0, 2.6281], device=logits.device)
+    loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weight)
 
     return loss, hidden_state
 
@@ -234,8 +204,8 @@ def _init_model_and_optimizer(
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
+        betas=(0.9, 0.98),
+        weight_decay=0.001,
     )
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -243,7 +213,7 @@ def _init_model_and_optimizer(
         max_lr=lr,
         epochs=_EPOCHS,
         steps_per_epoch=opt_steps_per_epoch,
-        pct_start=0.1,  # 10% warmup
+        pct_start=0.3,
         anneal_strategy="cos",
     )
 
@@ -314,6 +284,10 @@ def _run_train_epoch(
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            wandb.log({
+                "train/step_loss": loss.item(),
+                "train/learning_rate": scheduler.get_last_lr()[0],
+            })
 
         train_loss_tensor += loss.detach()
 
@@ -322,6 +296,10 @@ def _run_train_epoch(
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+        wandb.log({
+            "train/step_loss": loss.item(),
+            "train/learning_rate": scheduler.get_last_lr()[0],
+        })
 
     return ((train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0.0), hidden_state
 
@@ -368,25 +346,27 @@ def _save_checkpoint(
     val_loss: float,
 ) -> None:
     """Save the model checkpoint."""
-    checkpoint_path = checkpoint_dir / f"epoch_{epoch}.pt"
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-        },
-        checkpoint_path,
-    )
-    print(f"Checkpoint saved to {checkpoint_path}")
+    checkpoint_data = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+    }
+
+    # Save epoch-specific checkpoint inside WandB run directory for automatic cloud upload
+    if wandb.run is not None:
+        wandb_checkpoint_path = Path(wandb.run.dir) / f"epoch_{epoch}.pt"
+        torch.save(checkpoint_data, wandb_checkpoint_path)
+
+    # Save latest checkpoint locally for easy resuming
+    latest_path = checkpoint_dir / "latest.pt"
+    torch.save(checkpoint_data, latest_path)
 
 
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
-    epochs = 100
-
     train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch = _prepare_data_files()
 
     dataloader = DataLoader(_DatasetGenerator(train_files, is_val=False), batch_size=None)
@@ -412,6 +392,23 @@ def _train():
 
     hidden_state_dim = _CONFIG["model"]["hiddenDim"]
 
+    # Initialize Weights & Biases
+    wandb.init(
+        project="ai-doggie",
+        config={
+            "batch_size": _BATCH_SIZE,
+            "seq_len": _SEQ_LEN,
+            "accumulation_steps": _ACCUMULATION_STEPS,
+            "epochs": _EPOCHS,
+            "learning_rate": 3e-4,
+            "weight_decay": 0.001,
+            "hidden_dim": hidden_state_dim,
+            "device": str(_DEVICE),
+            "checkpoint_file": checkpoint_file,
+        }
+    )
+    wandb.watch(model, log="all", log_freq=100)
+
     # keep the 2 hiddens separate
     train_hidden_state = torch.zeros(
         _BATCH_SIZE,
@@ -426,7 +423,7 @@ def _train():
         device=_DEVICE,
     )
 
-    for epoch in range(start_epoch, epochs + 1):
+    for epoch in range(start_epoch, _EPOCHS + 1):
         avg_train_loss, train_hidden_state = _run_train_epoch(
             model=model,
             train_iter=train_iter,
@@ -443,7 +440,11 @@ def _train():
             hidden_state=val_hidden_state,
         )
 
-        print(f"Epoch {epoch} completed | Training loss: {avg_train_loss:.2f} | Validation loss: {avg_val_loss:.2f}")
+        wandb.log({
+            "epoch": epoch,
+            "train/epoch_loss": avg_train_loss,
+            "val/epoch_loss": avg_val_loss,
+        })
 
         if epoch % 10 == 0:
             _save_checkpoint(
@@ -455,6 +456,8 @@ def _train():
                 train_loss=avg_train_loss,
                 val_loss=avg_val_loss,
             )
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
