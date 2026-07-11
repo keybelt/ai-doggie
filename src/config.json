@@ -1,6 +1,6 @@
 {
     "model": {
-        "hiddenDim": 32
+        "hiddenDim": 256
     },
     "frame": {
         "width": 640,
