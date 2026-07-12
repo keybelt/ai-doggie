@@ -24,22 +24,24 @@ class Model(nn.Module):
             config = json.load(f)
 
         self._hidden_dim = config["model"]["hiddenDim"]
-        self._action_dim = 8
+
         self._attn_dim = 16
         self._num_heads = 8
+
+        self._action_dim = 8
 
         # 3-layer CNN backbone with CoordConv on first layer.
         self._conv1 = nn.Conv2d(3 + 2, 32, kernel_size=5, stride=4)
         self._conv2 = nn.Conv2d(32, 128, kernel_size=5, stride=4)
-        cnn_out_channels = 64
-        self._conv3 = nn.Conv2d(128, cnn_out_channels, kernel_size=3, stride=2)
+        CNN_OUT_CHANNELS = 64
+        self._conv3 = nn.Conv2d(128, CNN_OUT_CHANNELS, kernel_size=3, stride=2)
 
         # Player-centric cross-attention pooling.
-        self._plr_selector = nn.Conv2d(cnn_out_channels, 1, kernel_size=1, bias=False)
-        self._q_proj = nn.Linear(cnn_out_channels, self._attn_dim * self._num_heads, bias=False)
-        self._k_proj = nn.Linear(cnn_out_channels, self._attn_dim * self._num_heads, bias=False)
-        self._v_proj = nn.Linear(cnn_out_channels, self._attn_dim * self._num_heads, bias=False)
-        self._plr_proj = nn.Linear(cnn_out_channels, self._hidden_dim)
+        self._plr_selector = nn.Conv2d(CNN_OUT_CHANNELS, 1, kernel_size=1, bias=False)
+        self._q_proj = nn.Linear(CNN_OUT_CHANNELS, self._attn_dim * self._num_heads, bias=False)
+        self._k_proj = nn.Linear(CNN_OUT_CHANNELS, self._attn_dim * self._num_heads, bias=False)
+        self._v_proj = nn.Linear(CNN_OUT_CHANNELS, self._attn_dim * self._num_heads, bias=False)
+        self._plr_proj = nn.Linear(CNN_OUT_CHANNELS, self._hidden_dim)
         self._out_proj = nn.Linear(self._num_heads * self._attn_dim, self._hidden_dim)
         self._ln = nn.LayerNorm(self._hidden_dim)
 
@@ -95,6 +97,45 @@ class Model(nn.Module):
         X = torch.relu(self._conv3(X))
         return X
 
+    def _player_centric_attention(self, X_conv: Tensor) -> Tensor:
+        """Applies player-centric cross-attention pooling over CNN features.
+
+        Args:
+            X_conv: [B, C_in, H_conv, W_conv] features from the CNN.
+
+        Returns:
+            Projected attention context tensor of shape [B, D].
+        """
+        B, C_in, _, _ = X_conv.shape
+
+        plr_channel = self._plr_selector(X_conv)  # [B, 1, H_conv, W_conv]
+        plr_channel = plr_channel.view(B, -1)  # [B, H_conv*W_conv]
+        plr_weights = torch.softmax(plr_channel, dim=-1)  # [B, H_conv*W_conv]
+
+        X_flat = X_conv.view(B, C_in, -1).transpose(1, 2)  # [B, H_conv*W_conv, C_in]
+        plr_feat = torch.bmm(plr_weights.unsqueeze(1), X_flat)  # [B, 1, C_in]
+
+        q = self._q_proj(plr_feat)  # [B, 1, H_heads * D_attn]
+        k = self._k_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
+        v = self._v_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
+
+        q = q.view(B, 1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, 1, D_attn]
+        k = k.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
+        v = v.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
+
+        scores = q @ k.transpose(-1, -2) * self._attn_dim**-0.5  # [B, H_heads, 1, H_conv*W_conv]
+        attn_probs = torch.softmax(scores, dim=-1)  # [B, H_heads, 1, H_conv*W_conv]
+
+        context = attn_probs @ v  # [B, H_heads, 1, D_attn]
+        context = context.reshape(B, -1)  # [B, H_heads * D_attn]
+
+        # Residual skip connection: project attention context and add projected player features.
+        X_proj = self._out_proj(context) + self._plr_proj(plr_feat.squeeze(1))  # [B, D]
+        X_proj = torch.relu(X_proj)
+        X_proj = self._ln(X_proj)
+        X_proj = self._dropout(X_proj)
+        return X_proj
+
     def forward(
         self,
         X: Tensor,
@@ -116,34 +157,7 @@ class Model(nn.Module):
         X = X.view(N * T, H, W, C).permute(0, 3, 1, 2).contiguous()
         X_conv = self._conv_forward(X)
 
-        B, C_in, _, _ = X_conv.shape
-
-        plr_channel = self._plr_selector(X_conv)  # [B, 1, H_conv, W_conv]
-        plr_channel = plr_channel.view(B, -1)  # [B, H_conv*W_conv]
-        plr_weights = torch.softmax(plr_channel, dim=-1)  # [B, H_conv*W_conv]
-
-        X_flat = X_conv.view(B, C_in, -1).transpose(1, 2)  # [B, H_conv*W_conv, C_in]
-        plr_feat = torch.bmm(plr_weights.unsqueeze(1), X_flat)  # [B, 1, C_in]
-
-        q = self._q_proj(plr_feat)  # [B, 1, H_heads * D_attn]
-        k = self._k_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
-        v = self._v_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
-
-        q = q.view(B, 1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, 1, D_attn]
-        k = k.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
-        v = v.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
-
-        scores = torch.matmul(q, k.transpose(-1, -2)) * self._attn_dim**-0.5  # [B, H_heads, 1, H_conv*W_conv]
-        attn_probs = torch.softmax(scores, dim=-1)  # [B, H_heads, 1, H_conv*W_conv]
-
-        context = attn_probs @ v  # [B, H_heads, 1, D_attn]
-        context = context.reshape(B, -1)  # [B, H_heads * D_attn]
-
-        # Residual skip connection: project attention context and add projected player features.
-        X_proj = self._out_proj(context) + self._plr_proj(plr_feat.squeeze(1))  # [B, D]
-        X_proj = torch.relu(X_proj)
-        X_proj = self._ln(X_proj)
-        X_proj = self._dropout(X_proj)
+        X_proj = self._player_centric_attention(X_conv)
         X_proj = X_proj.view(N, T, self._hidden_dim)
 
         gru_out, h = self._gru(

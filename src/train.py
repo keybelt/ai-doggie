@@ -12,23 +12,21 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
-import wandb
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
 from model import Model
 
-with (Path(__file__).resolve().parent / "config.json").open() as f:
-    _CONFIG = json.load(f)
-
+# Shared configuration constants
 _BATCH_SIZE = 2
 _SEQ_LEN = 128
-_ACCUMULATION_STEPS = 32
-_EPOCHS = 100
-
+_ACCUMULATION_STEPS = 16
+_EPOCHS = 10
 _DEVICE = torch.device("mps")
 
 
@@ -148,6 +146,8 @@ def _process_batch(
     Returns:
         A tuple of the loss and new hidden state.
     """
+    CLASS_WEIGHTS = [1.0, 2.6281]
+
     frames_norm, target_actions_bin, hidden_state = _preprocess_inputs(
         frames=frames,
         actions_bin=actions_bin,
@@ -163,7 +163,7 @@ def _process_batch(
     logits_240 = logits.view(N, T * 4, 2)
     target_actions_bin_240 = target_actions_bin.view(N, T * 4)
 
-    weight = torch.tensor([1.0, 2.6281], device=logits.device)
+    weight = torch.tensor(CLASS_WEIGHTS, device=logits.device)
     loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weight)
 
     return loss, hidden_state
@@ -175,9 +175,12 @@ def _prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
     Returns:
         A tuple containing (train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch).
     """
-    repo_dir = Path(__file__).resolve().parents[1]
-    train_files = list((repo_dir / "data" / "training").glob("*.npz"))
-    val_files = list((repo_dir / "data" / "validation").glob("*.npz"))
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    TRAINING_DATA_DIR = PROJECT_ROOT / "data" / "training"
+    VALIDATION_DATA_DIR = PROJECT_ROOT / "data" / "validation"
+
+    train_files = list(TRAINING_DATA_DIR.glob("*.npz"))
+    val_files = list(VALIDATION_DATA_DIR.glob("*.npz"))
 
     def get_chunks(f: Path) -> int:
         with np.load(f) as data:
@@ -198,35 +201,33 @@ def _init_model_and_optimizer(
     opt_steps_per_epoch: int,
 ) -> tuple[Model, torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
     """Initialize Model, Optimizer, and LR Scheduler on the specified device."""
+    LR = 1e-3
+    ADAM_BETAS = (0.9, 0.98)
+    WEIGHT_DECAY = 0.001
+    SCHEDULER_PCT_START = 0.15
+
     model = Model().to(_DEVICE)
 
-    lr = 3e-4
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=lr,
-        betas=(0.9, 0.98),
-        weight_decay=0.001,
+        lr=LR,
+        betas=ADAM_BETAS,
+        weight_decay=WEIGHT_DECAY,
     )
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=lr,
+        max_lr=LR,
         epochs=_EPOCHS,
         steps_per_epoch=opt_steps_per_epoch,
-        pct_start=0.3,
+        pct_start=SCHEDULER_PCT_START,
         anneal_strategy="cos",
     )
 
     return model, optimizer, scheduler
 
 
-def _load_checkpoint(
-    checkpoint_dir: Path,
-    checkpoint_file: str,
-    model: Model,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.OneCycleLR,
-) -> int:
+def _load_checkpoint(checkpoint_file: str, state: dict) -> int:
     """Load checkpoint state if a checkpoint file is specified.
 
     Returns:
@@ -236,30 +237,75 @@ def _load_checkpoint(
         return 1
 
     checkpoint = torch.load(
-        checkpoint_dir / checkpoint_file,
+        Path(checkpoint_file),
         map_location=_DEVICE,
     )
 
-    model.load_state_dict(checkpoint["model_state"])
-    optimizer.load_state_dict(checkpoint["optimizer_state"])
-    scheduler.load_state_dict(checkpoint["scheduler_state"])
+    state["model"].load_state_dict(checkpoint["model_state"])
+    state["optimizer"].load_state_dict(checkpoint["optimizer_state"])
+    state["scheduler"].load_state_dict(checkpoint["scheduler_state"])
 
     print(f"Loading checkpoint {checkpoint_file}.")
     return checkpoint["epoch"] + 1
 
 
-def _run_train_epoch(
-    model: Model,
-    train_iter: Iterator,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.OneCycleLR,
-    steps: int,
-    hidden_state: Tensor,
-) -> tuple[float, Tensor]:
-    """Run a single training epoch and return the average loss and final hidden state."""
+def _log_diagnostics(
+    loss: float,
+    lr: float,
+    val_loss: float,
+    global_step: int,
+    model: nn.Module,
+):
+    """Log training metrics, validation loss, and parameter statistics to WandB."""
+    stats = {
+        "trainer/global_step": global_step,
+        "run/train_step_loss": loss,
+        "run/learning_rate": lr,
+        "run/val_step_loss": val_loss,
+    }
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            stats[f"mean/{name}"] = param.mean().item()
+            stats[f"var/{name}"] = param.var().item()
+    wandb.log(stats)
+
+
+def _optimize_and_evaluate(state: dict, loss: Tensor) -> None:
+    """Perform optimizer step, learning rate scheduler update, grad norm clipping, and validation."""
+    EVAL_FREQ_STEPS = 100
+    MAX_GRAD_NORM = 1.0
+
+    model = state["model"]
+    optimizer = state["optimizer"]
+    scheduler = state["scheduler"]
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    state["global_step"] += 1
+
+    if state["global_step"] % EVAL_FREQ_STEPS == 0:
+        val_loss = _run_val(state)
+        _log_diagnostics(
+            loss=loss.item(),
+            lr=scheduler.get_last_lr()[0],
+            val_loss=val_loss,
+            global_step=state["global_step"],
+            model=model,
+        )
+        model.train()
+
+
+def _run_train_epoch(state: dict, steps: int) -> float:
+    """Run a single training epoch and return training loss."""
+    model = state["model"]
+    train_iter = state["train_iter"]
+
     model.train()
     num_train_batches = 0
     train_loss_tensor = torch.zeros(1, device=_DEVICE)
+    loss = None
 
     for i in range(steps):
         try:
@@ -268,89 +314,68 @@ def _run_train_epoch(
             break
         num_train_batches = i + 1
 
-        loss, hidden_state = _process_batch(
+        loss, state["train_hidden"] = _process_batch(
             model=model,
             frames=frames,
             actions_bin=actions_bin,
             are_first=are_first,
-            hidden=hidden_state,
+            hidden=state["train_hidden"],
         )
 
         scaled_loss = loss / _ACCUMULATION_STEPS
         scaled_loss.backward()
 
         if num_train_batches % _ACCUMULATION_STEPS == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            wandb.log({
-                "train/step_loss": loss.item(),
-                "train/learning_rate": scheduler.get_last_lr()[0],
-            })
+            _optimize_and_evaluate(state, loss)
 
         train_loss_tensor += loss.detach()
 
-    if num_train_batches % _ACCUMULATION_STEPS != 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
-        wandb.log({
-            "train/step_loss": loss.item(),
-            "train/learning_rate": scheduler.get_last_lr()[0],
-        })
+    if num_train_batches % _ACCUMULATION_STEPS != 0 and loss is not None:
+        _optimize_and_evaluate(state, loss)
 
-    return ((train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0.0), hidden_state
+    avg_train_loss = (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0.0
+    return avg_train_loss
 
 
-def _run_val_epoch(
-    model: Model,
-    val_iter: Iterator,
-    steps: int,
-    hidden_state: Tensor,
-) -> tuple[float, Tensor]:
-    """Run a single validation epoch and return the average loss and final hidden state."""
+def _run_val(state: dict) -> float:
+    """Run a fixed number of validation steps and return the average loss."""
+    VAL_STEPS = 50
+
+    model = state["model"]
+    val_iter = state["val_iter"]
+
     model.eval()
     num_val_batches = 0
     val_loss_tensor = torch.zeros(1, device=_DEVICE)
 
     with torch.no_grad():
-        for i in range(steps):
+        for i in range(VAL_STEPS):
             try:
                 frames, actions_bin, are_first = next(val_iter)
             except StopIteration:
                 break
             num_val_batches = i + 1
 
-            loss, hidden_state = _process_batch(
+            loss, state["val_hidden"] = _process_batch(
                 model=model,
                 frames=frames,
                 actions_bin=actions_bin,
                 are_first=are_first,
-                hidden=hidden_state,
+                hidden=state["val_hidden"],
             )
 
             val_loss_tensor += loss.detach()
 
-    return ((val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0), hidden_state
+    return (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0
 
 
-def _save_checkpoint(
-    checkpoint_dir: Path,
-    epoch: int,
-    model: Model,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.OneCycleLR,
-    train_loss: float,
-    val_loss: float,
-) -> None:
+def _save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None) -> None:
     """Save the model checkpoint."""
     checkpoint_data = {
         "epoch": epoch,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
+        "model_state": state["model"].state_dict(),
+        "optimizer_state": state["optimizer"].state_dict(),
+        "scheduler_state": state["scheduler"].state_dict(),
         "train_loss": train_loss,
         "val_loss": val_loss,
     }
@@ -360,101 +385,74 @@ def _save_checkpoint(
         wandb_checkpoint_path = Path(wandb.run.dir) / f"epoch_{epoch}.pt"
         torch.save(checkpoint_data, wandb_checkpoint_path)
 
-    # Save latest checkpoint locally for easy resuming
-    latest_path = checkpoint_dir / "latest.pt"
-    torch.save(checkpoint_data, latest_path)
-
 
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
-    train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch = _prepare_data_files()
+    WANDB_CONFIG_LR = 3e-4
+    WEIGHT_DECAY = 0.001
 
-    dataloader = DataLoader(_DatasetGenerator(train_files, is_val=False), batch_size=None)
-    dataloader_validation = DataLoader(_DatasetGenerator(val_files, is_val=True), batch_size=None)
+    train_files, val_files, train_steps_per_epoch, _, opt_steps_per_epoch = _prepare_data_files()
 
-    train_iter = iter(dataloader)
-    val_iter = iter(dataloader_validation)
+    train_loader = DataLoader(_DatasetGenerator(train_files, is_val=False), batch_size=None)
+    val_loader = DataLoader(_DatasetGenerator(val_files, is_val=True), batch_size=None)
+
+    train_iter = iter(train_loader)
+    val_iter = iter(val_loader)
 
     model, optimizer, scheduler = _init_model_and_optimizer(
         opt_steps_per_epoch=opt_steps_per_epoch,
     )
 
-    checkpoint_file = _CONFIG["checkpointFile"]
-    checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints"
+    with (Path(__file__).resolve().parent / "config.json").open() as f:
+        config = json.load(f)
+
+    hidden_state_dim = config["model"]["hiddenDim"]
+
+    # Initialize state context to reduce argument passing
+    state = {
+        "model": model,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "train_iter": train_iter,
+        "val_iter": val_iter,
+        "global_step": 0,
+        "train_hidden": torch.zeros(_BATCH_SIZE, 1, hidden_state_dim, device=_DEVICE),
+        "val_hidden": torch.zeros(_BATCH_SIZE, 1, hidden_state_dim, device=_DEVICE),
+    }
 
     start_epoch = _load_checkpoint(
-        checkpoint_dir=checkpoint_dir,
-        checkpoint_file=checkpoint_file,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
+        checkpoint_file=config["checkpointFile"],
+        state=state,
     )
 
-    hidden_state_dim = _CONFIG["model"]["hiddenDim"]
+    state["global_step"] = (start_epoch - 1) * opt_steps_per_epoch
 
     # Initialize Weights & Biases
     wandb.init(
         project="ai-doggie",
+        name="baseline",
         config={
             "batch_size": _BATCH_SIZE,
             "seq_len": _SEQ_LEN,
             "accumulation_steps": _ACCUMULATION_STEPS,
             "epochs": _EPOCHS,
-            "learning_rate": 3e-4,
-            "weight_decay": 0.001,
+            "learning_rate": WANDB_CONFIG_LR,
+            "weight_decay": WEIGHT_DECAY,
             "hidden_dim": hidden_state_dim,
-            "device": str(_DEVICE),
-            "checkpoint_file": checkpoint_file,
-        }
-    )
-    wandb.watch(model, log="all", log_freq=100)
-
-    # keep the 2 hiddens separate
-    train_hidden_state = torch.zeros(
-        _BATCH_SIZE,
-        1,
-        hidden_state_dim,
-        device=_DEVICE,
-    )
-    val_hidden_state = torch.zeros(
-        _BATCH_SIZE,
-        1,
-        hidden_state_dim,
-        device=_DEVICE,
+        },
     )
 
     for epoch in range(start_epoch, _EPOCHS + 1):
-        avg_train_loss, train_hidden_state = _run_train_epoch(
-            model=model,
-            train_iter=train_iter,
-            optimizer=optimizer,
-            scheduler=scheduler,
+        avg_train_loss = _run_train_epoch(
+            state=state,
             steps=train_steps_per_epoch,
-            hidden_state=train_hidden_state,
         )
-
-        avg_val_loss, val_hidden_state = _run_val_epoch(
-            model=model,
-            val_iter=val_iter,
-            steps=val_steps_per_epoch,
-            hidden_state=val_hidden_state,
-        )
-
-        wandb.log({
-            "epoch": epoch,
-            "train/epoch_loss": avg_train_loss,
-            "val/epoch_loss": avg_val_loss,
-        })
 
         if epoch % 10 == 0:
             _save_checkpoint(
-                checkpoint_dir=checkpoint_dir,
                 epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
+                state=state,
                 train_loss=avg_train_loss,
-                val_loss=avg_val_loss,
             )
 
     wandb.finish()
