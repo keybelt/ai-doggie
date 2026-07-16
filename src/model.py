@@ -6,6 +6,7 @@ Example:
 """
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -28,7 +29,7 @@ class Model(nn.Module):
         self._attn_dim = 16
         self._num_heads = 8
 
-        self._action_dim = 8
+        self._action_dim = 2
 
         # 3-layer CNN backbone with CoordConv on first layer.
         self._conv1 = nn.Conv2d(3 + 2, 32, kernel_size=5, stride=4)
@@ -44,6 +45,9 @@ class Model(nn.Module):
         self._plr_proj = nn.Linear(CNN_OUT_CHANNELS, self._hidden_dim)
         self._out_proj = nn.Linear(self._num_heads * self._attn_dim, self._hidden_dim)
         self._ln = nn.LayerNorm(self._hidden_dim)
+
+        # Per-head learnable logit scale for cosine similarity attention, initialized to 1/0.1 = 10.0 (log scale = 2.3026)
+        self._logit_scale = nn.Parameter(torch.ones(1, self._num_heads, 1, 1) * math.log(1.0 / 0.1))
 
         # Temporal processing and output.
         self._gru = nn.GRU(self._hidden_dim, self._hidden_dim, batch_first=True)
@@ -123,7 +127,13 @@ class Model(nn.Module):
         k = k.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
         v = v.view(B, -1, self._num_heads, self._attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
 
-        scores = q @ k.transpose(-1, -2) * self._attn_dim**-0.5  # [B, H_heads, 1, H_conv*W_conv]
+        # Apply QK-normalization (Cosine Similarity Attention) to prevent softmax saturation
+        q = torch.nn.functional.normalize(q, p=2, dim=-1)
+        k = torch.nn.functional.normalize(k, p=2, dim=-1)
+
+        # Scale by per-head learnable logit scale, clamped to prevent extreme values (analogous to CLIP/Swin V2)
+        logit_scale = torch.clamp(self._logit_scale.exp(), max=100.0)
+        scores = q @ k.transpose(-1, -2) * logit_scale  # [B, H_heads, 1, H_conv*W_conv]
         attn_probs = torch.softmax(scores, dim=-1)  # [B, H_heads, 1, H_conv*W_conv]
 
         context = attn_probs @ v  # [B, H_heads, 1, D_attn]

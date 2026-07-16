@@ -7,12 +7,12 @@ Example:
 import json
 import random
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch import Tensor
@@ -28,6 +28,8 @@ _SEQ_LEN = 128
 _ACCUMULATION_STEPS = 16
 _EPOCHS = 10
 _DEVICE = torch.device("mps")
+_LR = 1e-3
+_WEIGHT_DECAY = 0.01
 
 
 class _DatasetGenerator(IterableDataset):
@@ -133,7 +135,7 @@ def _process_batch(
     actions_bin: Tensor,
     are_first: Tensor,
     hidden: Tensor,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     """Process a single batch through the model and calculate loss.
 
     Args:
@@ -144,7 +146,7 @@ def _process_batch(
         hidden: [N, L, D].
 
     Returns:
-        A tuple of the loss and new hidden state.
+        A tuple of the loss, new hidden state, and prediction entropy.
     """
     CLASS_WEIGHTS = [1.0, 2.6281]
 
@@ -160,13 +162,26 @@ def _process_batch(
     # Ensure hidden state doesn't effect the gradients of the entire dataset.
     hidden_state = hidden_state.detach()
     N, T, _ = logits.shape
-    logits_240 = logits.view(N, T * 4, 2)
-    target_actions_bin_240 = target_actions_bin.view(N, T * 4)
 
+    # --- 60Hz Coarse Mode (Phase 1a) ---
+    target_60 = target_actions_bin.max(dim=-1)[0]  # Max pool 240Hz labels to 60Hz
     weight = torch.tensor(CLASS_WEIGHTS, device=logits.device)
-    loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weight)
+    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=weight)
 
-    return loss, hidden_state
+    # Calculate prediction entropy
+    probs = F.softmax(logits, dim=-1)
+    entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
+
+    # --- 240Hz Subtick Mode (Phase 1b / Original) ---
+    # logits_240 = logits.view(N, T * 4, 2)
+    # target_actions_bin_240 = target_actions_bin.view(N, T * 4)
+    # weight = torch.tensor(CLASS_WEIGHTS, device=logits.device)
+    # loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weight)
+    # # Calculate prediction entropy
+    # probs = F.softmax(logits_240, dim=-1)
+    # entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
+
+    return loss, hidden_state, entropy
 
 
 def _prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
@@ -201,23 +216,21 @@ def _init_model_and_optimizer(
     opt_steps_per_epoch: int,
 ) -> tuple[Model, torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
     """Initialize Model, Optimizer, and LR Scheduler on the specified device."""
-    LR = 1e-3
     ADAM_BETAS = (0.9, 0.98)
-    WEIGHT_DECAY = 0.001
     SCHEDULER_PCT_START = 0.15
 
     model = Model().to(_DEVICE)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LR,
+        lr=_LR,
         betas=ADAM_BETAS,
-        weight_decay=WEIGHT_DECAY,
+        weight_decay=_WEIGHT_DECAY,
     )
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=LR,
+        max_lr=_LR,
         epochs=_EPOCHS,
         steps_per_epoch=opt_steps_per_epoch,
         pct_start=SCHEDULER_PCT_START,
@@ -250,27 +263,30 @@ def _load_checkpoint(checkpoint_file: str, state: dict) -> int:
 
 
 def _log_diagnostics(
-    loss: float,
-    lr: float,
-    val_loss: float,
-    global_step: int,
-    model: nn.Module,
+    state: dict,
+    stats: dict,
+    grad_rms: dict[str, float],
 ):
-    """Log training metrics, validation loss, and parameter statistics to WandB."""
-    stats = {
-        "trainer/global_step": global_step,
-        "run/train_step_loss": loss,
-        "run/learning_rate": lr,
-        "run/val_step_loss": val_loss,
-    }
+    """Log training metrics, validation loss, and parameter/gradient RMS values to WandB."""
+    stats["global_step"] = state["global_step"]
+    model = state["model"]
+
     with torch.no_grad():
         for name, param in model.named_parameters():
-            stats[f"mean/{name}"] = param.mean().item()
-            stats[f"var/{name}"] = param.var().item()
+            if "bias" in name:
+                # biases have small rms
+                continue
+
+            parts = name.rsplit(".", 1)
+            layer = parts[0] if len(parts) == 2 else name
+            stats[f"weight_rms/{layer}"] = (param.norm() / (param.numel() ** 0.5)).item()
+
+            if name in grad_rms:
+                stats[f"grad_rms/{layer}"] = grad_rms[name]
     wandb.log(stats)
 
 
-def _optimize_and_evaluate(state: dict, loss: Tensor) -> None:
+def _optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor) -> None:
     """Perform optimizer step, learning rate scheduler update, grad norm clipping, and validation."""
     EVAL_FREQ_STEPS = 100
     MAX_GRAD_NORM = 1.0
@@ -279,20 +295,45 @@ def _optimize_and_evaluate(state: dict, loss: Tensor) -> None:
     optimizer = state["optimizer"]
     scheduler = state["scheduler"]
 
+    is_eval_step = (state["global_step"] + 1) % EVAL_FREQ_STEPS == 0
+    grad_rms = {}
+    if is_eval_step:
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_rms[name] = (param.grad.norm() / (param.grad.numel() ** 0.5)).item()
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
     optimizer.step()
     scheduler.step()
+
     optimizer.zero_grad(set_to_none=True)
     state["global_step"] += 1
 
-    if state["global_step"] % EVAL_FREQ_STEPS == 0:
-        val_loss = _run_val(state)
+    if is_eval_step:
+        val_loss, val_entropy, val_latency = _run_val(state)
+
         _log_diagnostics(
-            loss=loss.item(),
-            lr=scheduler.get_last_lr()[0],
-            val_loss=val_loss,
-            global_step=state["global_step"],
-            model=model,
+            state=state,
+            stats={
+                "loss/train": loss.item(),
+                "entropy/train": entropy.item(),
+                "lr": scheduler.get_last_lr()[0],
+                "loss/val": val_loss,
+                "entropy/val": val_entropy,
+                "inf_latency_ms": val_latency,
+                "loss/upper": 0.2,
+                "loss/lower": 0.05,
+                "grad_rms/upper": 0.1,
+                "grad_rms/lower": 1e-4,
+                "weight_rms/upper": 1,
+                "weight_rms/lower": 0.01,
+                "entropy/upper": 0.35,
+                "entropy/lower": 0.10,
+                "inf_latency_ms/upper": 10,
+                "inf_latency_ms/lower": 0,
+            },
+            grad_rms=grad_rms,
         )
         model.train()
 
@@ -306,6 +347,7 @@ def _run_train_epoch(state: dict, steps: int) -> float:
     num_train_batches = 0
     train_loss_tensor = torch.zeros(1, device=_DEVICE)
     loss = None
+    entropy = None
 
     for i in range(steps):
         try:
@@ -314,7 +356,7 @@ def _run_train_epoch(state: dict, steps: int) -> float:
             break
         num_train_batches = i + 1
 
-        loss, state["train_hidden"] = _process_batch(
+        loss, state["train_hidden"], entropy = _process_batch(
             model=model,
             frames=frames,
             actions_bin=actions_bin,
@@ -326,19 +368,19 @@ def _run_train_epoch(state: dict, steps: int) -> float:
         scaled_loss.backward()
 
         if num_train_batches % _ACCUMULATION_STEPS == 0:
-            _optimize_and_evaluate(state, loss)
+            _optimize_and_evaluate(state, loss, entropy)
 
         train_loss_tensor += loss.detach()
 
-    if num_train_batches % _ACCUMULATION_STEPS != 0 and loss is not None:
-        _optimize_and_evaluate(state, loss)
+    if num_train_batches % _ACCUMULATION_STEPS != 0 and loss is not None and entropy is not None:
+        _optimize_and_evaluate(state, loss, entropy)
 
     avg_train_loss = (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0.0
     return avg_train_loss
 
 
-def _run_val(state: dict) -> float:
-    """Run a fixed number of validation steps and return the average loss."""
+def _run_val(state: dict) -> tuple[float, float, float | None]:
+    """Run a fixed number of validation steps and return the average loss, average entropy, and validation latency."""
     VAL_STEPS = 50
 
     model = state["model"]
@@ -347,6 +389,7 @@ def _run_val(state: dict) -> float:
     model.eval()
     num_val_batches = 0
     val_loss_tensor = torch.zeros(1, device=_DEVICE)
+    val_entropy_tensor = torch.zeros(1, device=_DEVICE)
 
     with torch.no_grad():
         for i in range(VAL_STEPS):
@@ -356,7 +399,7 @@ def _run_val(state: dict) -> float:
                 break
             num_val_batches = i + 1
 
-            loss, state["val_hidden"] = _process_batch(
+            loss, state["val_hidden"], entropy = _process_batch(
                 model=model,
                 frames=frames,
                 actions_bin=actions_bin,
@@ -365,8 +408,24 @@ def _run_val(state: dict) -> float:
             )
 
             val_loss_tensor += loss.detach()
+            val_entropy_tensor += entropy.detach()
 
-    return (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0
+        # inf measuring
+        dummy_x = torch.zeros(1, 1, 480, 640, 3, device=_DEVICE)
+        dummy_h = torch.zeros(1, 1, model._hidden_dim, device=_DEVICE)
+        # Warmup and synchronization
+        model(dummy_x, dummy_h)
+        torch.mps.synchronize()
+
+        t0 = time.perf_counter()
+        model(dummy_x, dummy_h)
+        torch.mps.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    avg_val_loss = (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0
+    avg_val_entropy = (val_entropy_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0
+
+    return avg_val_loss, avg_val_entropy, elapsed_ms
 
 
 def _save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None) -> None:
@@ -388,8 +447,6 @@ def _save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float
 
 def _train():
     """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
-    WANDB_CONFIG_LR = 3e-4
-    WEIGHT_DECAY = 0.001
 
     train_files, val_files, train_steps_per_epoch, _, opt_steps_per_epoch = _prepare_data_files()
 
@@ -430,17 +487,18 @@ def _train():
     # Initialize Weights & Biases
     wandb.init(
         project="ai-doggie",
-        name="baseline",
+        name="60hz output to help converge",
         config={
             "batch_size": _BATCH_SIZE,
             "seq_len": _SEQ_LEN,
             "accumulation_steps": _ACCUMULATION_STEPS,
             "epochs": _EPOCHS,
-            "learning_rate": WANDB_CONFIG_LR,
-            "weight_decay": WEIGHT_DECAY,
-            "hidden_dim": hidden_state_dim,
+            "learning_rate": _LR,
+            "weight_decay": _WEIGHT_DECAY,
         },
     )
+    wandb.define_metric("global_step", hidden=True)
+    wandb.define_metric("*", step_metric="global_step")
 
     for epoch in range(start_epoch, _EPOCHS + 1):
         avg_train_loss = _run_train_epoch(
