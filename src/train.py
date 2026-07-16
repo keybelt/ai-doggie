@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
+import h5py
 import torch
 import torch.nn.functional as F
 import wandb
@@ -23,10 +24,10 @@ sys.path.append(str(Path(__file__).resolve().parent))
 from model import Model
 
 # Shared configuration constants
-_BATCH_SIZE = 2
-_SEQ_LEN = 128
-_ACCUMULATION_STEPS = 16
-_EPOCHS = 10
+_BATCH_SIZE = 8
+_SEQ_LEN = 64
+_ACCUMULATION_STEPS = 4
+_EPOCHS = 100
 _DEVICE = torch.device("mps")
 _LR = 1e-3
 _WEIGHT_DECAY = 0.01
@@ -83,22 +84,23 @@ class _DatasetGenerator(IterableDataset):
         self,
         filepath: Path,
     ) -> Iterator[tuple[np.ndarray, np.ndarray, bool]]:
-        """Extract all frames and actions from the entire file, then chop them up into chunks to pass back.
+        """Stream chunks from the HDF5 file directly, without loading the whole file into RAM.
 
         Yields:
             The frames, action binaries, and whether the chunk is the first of the file.
         """
-        with np.load(filepath) as data:
-            frames: np.ndarray = data["frames"]
-            actions_bin: np.ndarray = data["actions_bin"]
+        with h5py.File(filepath, "r") as f:
+            frames_ds = f["frames"]
+            actions_ds = f["actions_bin"]
 
-            num_chunks = len(frames) // _SEQ_LEN
+            num_chunks = len(frames_ds) // _SEQ_LEN
 
             # Chop up each file stream into chunks with length seq_len.
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * _SEQ_LEN
-                chunk_frames = frames[start_idx : start_idx + _SEQ_LEN]
-                chunk_actions_bin = actions_bin[start_idx : start_idx + _SEQ_LEN]
+                end_idx = start_idx + _SEQ_LEN
+                chunk_frames = frames_ds[start_idx:end_idx]
+                chunk_actions_bin = actions_ds[start_idx:end_idx]
 
                 yield chunk_frames, chunk_actions_bin, (chunk_idx == 0)
 
@@ -148,7 +150,7 @@ def _process_batch(
     Returns:
         A tuple of the loss, new hidden state, and prediction entropy.
     """
-    CLASS_WEIGHTS = [1.0, 2.6281]
+    CLASS_WEIGHTS = [1.0, 2.2759]
 
     frames_norm, target_actions_bin, hidden_state = _preprocess_inputs(
         frames=frames,
@@ -194,11 +196,11 @@ def _prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
     TRAINING_DATA_DIR = PROJECT_ROOT / "data" / "training"
     VALIDATION_DATA_DIR = PROJECT_ROOT / "data" / "validation"
 
-    train_files = list(TRAINING_DATA_DIR.glob("*.npz"))
-    val_files = list(VALIDATION_DATA_DIR.glob("*.npz"))
+    train_files = list(TRAINING_DATA_DIR.glob("*.h5"))
+    val_files = list(VALIDATION_DATA_DIR.glob("*.h5"))
 
     def get_chunks(f: Path) -> int:
-        with np.load(f) as data:
+        with h5py.File(f, "r") as data:
             return len(data["actions_bin"]) // _SEQ_LEN
 
     total_train_chunks = sum(get_chunks(f) for f in train_files)
@@ -216,24 +218,17 @@ def _init_model_and_optimizer(
     opt_steps_per_epoch: int,
 ) -> tuple[Model, torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
     """Initialize Model, Optimizer, and LR Scheduler on the specified device."""
-    ADAM_BETAS = (0.9, 0.98)
-    SCHEDULER_PCT_START = 0.15
 
     model = Model().to(_DEVICE)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=_LR,
-        betas=ADAM_BETAS,
-        weight_decay=_WEIGHT_DECAY,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=_LR, weight_decay=_WEIGHT_DECAY)
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=_LR,
         epochs=_EPOCHS,
         steps_per_epoch=opt_steps_per_epoch,
-        pct_start=SCHEDULER_PCT_START,
+        pct_start=0.05,
         anneal_strategy="cos",
     )
 
@@ -485,20 +480,20 @@ def _train():
     state["global_step"] = (start_epoch - 1) * opt_steps_per_epoch
 
     # Initialize Weights & Biases
-    wandb.init(
-        project="ai-doggie",
-        name="60hz output to help converge",
-        config={
-            "batch_size": _BATCH_SIZE,
-            "seq_len": _SEQ_LEN,
-            "accumulation_steps": _ACCUMULATION_STEPS,
-            "epochs": _EPOCHS,
-            "learning_rate": _LR,
-            "weight_decay": _WEIGHT_DECAY,
-        },
-    )
-    wandb.define_metric("global_step", hidden=True)
-    wandb.define_metric("*", step_metric="global_step")
+    # wandb.init(
+    #    project="ai-doggie",
+    #    name="more epochs and accurate cls weights",
+    #    config={
+    #        "batch_size": _BATCH_SIZE,
+    #        "seq_len": _SEQ_LEN,
+    #        "accumulation_steps": _ACCUMULATION_STEPS,
+    #        "epochs": _EPOCHS,
+    #        "learning_rate": _LR,
+    #        "weight_decay": _WEIGHT_DECAY,
+    #    },
+    # )
+    # wandb.define_metric("global_step", hidden=True)
+    # wandb.define_metric("*", step_metric="global_step")
 
     for epoch in range(start_epoch, _EPOCHS + 1):
         avg_train_loss = _run_train_epoch(

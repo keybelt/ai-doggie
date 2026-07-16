@@ -11,12 +11,13 @@ import sys
 import time
 from pathlib import Path
 
+import h5py
 import msgpack
 import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
-from shm_utils import init_shm, get_frame, acknowledge_handshake, wait_for_next_frame
+from shm_utils import acknowledge_handshake, get_frame, init_shm, wait_for_next_frame
 
 
 def _parse_macro_file(filepath: Path) -> dict:
@@ -187,12 +188,10 @@ def _record(filepath: Path):
         DATA_DIR = PROJECT_ROOT / "data"
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-        save_path = DATA_DIR / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}"
-        np.savez_compressed(
-            save_path,
-            frames=frames,
-            actions_bin=actions_bin,
-        )
+        save_path = DATA_DIR / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}.h5"
+        with h5py.File(save_path, "w") as f:
+            f.create_dataset("frames", data=frames, compression="gzip", compression_opts=4, chunks=(64, 480, 640, 3))
+            f.create_dataset("actions_bin", data=actions_bin, compression="lzf", compression_opts=4)
         print(f"Saved recording to {save_path}\n")
 
         filepath.unlink()
