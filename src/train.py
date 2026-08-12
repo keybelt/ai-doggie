@@ -96,13 +96,19 @@ def preprocess_inputs(
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Normalize frames to [0, 1] and zero out hidden states on episode reset.
 
+    Args:
+        frames: [N, T, H, W, C]
+        actions_bin: [N, T, 4]
+        are_first: [N]
+        hidden: [N, 1, D]
+
     Returns:
-        Tuple of (frames_norm, target_actions_bin, masked_hidden_state).
+        Tuple of (frames_norm [N, T, H, W, C], target_actions_bin [N, T, 4], masked_hidden [N, 1, D]).
     """
-    keep_hidden = (~are_first).to(DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
-    hidden_state = hidden * keep_hidden
-    frames_norm = frames.to(DEVICE, non_blocking=True).to(dtype=torch.float32).mul_(1.0 / 255.0)
-    target_actions_bin = actions_bin.to(DEVICE, dtype=torch.long)
+    keep_hidden = (~are_first).to(DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)  # [N, 1, 1]
+    hidden_state = hidden * keep_hidden  # [N, 1, D]
+    frames_norm = frames.to(DEVICE, non_blocking=True).to(dtype=torch.float32).mul_(1.0 / 255.0)  # [N, T, H, W, C]
+    target_actions_bin = actions_bin.to(DEVICE, dtype=torch.long)  # [N, T, 4]
     return frames_norm, target_actions_bin, hidden_state
 
 
@@ -112,11 +118,17 @@ def process_batch(
     actions_bin: Tensor,
     are_first: Tensor,
     hidden: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Pass batch through model and compute loss + entropy.
 
+    Args:
+        frames: [N, T, H, W, C]
+        actions_bin: [N, T, 4]
+        are_first: [N]
+        hidden: [N, 1, D]
+
     Returns:
-        Tuple of (loss, detached_hidden_state, entropy).
+        Tuple of (loss, hidden [N, 1, D], entropy, logits [N, T, 2], target_60 [N, T]).
     """
     frames_norm, target_actions_bin, hidden_state = preprocess_inputs(
         frames=frames,
@@ -124,15 +136,15 @@ def process_batch(
         are_first=are_first,
         hidden=hidden,
     )
-    logits, hidden_state = model(frames_norm, hidden_state)
+    logits, hidden_state = model(frames_norm, hidden_state)  # logits: [N, T, 2], hidden_state: [N, 1, D]
     hidden_state = hidden_state.detach()
 
     # --- Phase 1a: 60Hz Coarse Mode ---
-    target_60 = target_actions_bin.max(dim=-1)[0]
+    target_60 = target_actions_bin.max(dim=-1)[0]  # [N, T]
     weights_tensor = torch.tensor(CONFIG["training"]["classWeights"], device=logits.device)
-    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=weights_tensor)
+    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=weights_tensor)  # logits.transpose: [N, 2, T]
 
-    probs = F.softmax(logits, dim=-1)
+    probs = F.softmax(logits, dim=-1)  # [N, T, 2]
     entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
     # --- Phase 1b: 240Hz Subtick Control Mode ---
@@ -144,7 +156,7 @@ def process_batch(
     # probs = F.softmax(logits_240, dim=-1)
     # entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
-    return loss, hidden_state, entropy
+    return loss, hidden_state, entropy, logits, target_60
 
 
 def prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
@@ -220,9 +232,10 @@ def load_checkpoint(checkpoint_file: str, state: dict) -> int:
 
 
 def log_diagnostics(state: dict, stats: dict, grad_rms: dict[str, float]):
-    """Log training metrics and weight/gradient RMS values to WandB."""
+    """Log training metrics, weight/gradient RMS values, and update ratios to WandB."""
     stats["global_step"] = state["global_step"]
     model = state["model"]
+    lr = stats["lr"]
 
     with torch.no_grad():
         for name, param in model.named_parameters():
@@ -230,9 +243,13 @@ def log_diagnostics(state: dict, stats: dict, grad_rms: dict[str, float]):
                 continue
             parts = name.rsplit(".", 1)
             layer = parts[0] if len(parts) == 2 else name
-            stats[f"weight_rms/{layer}"] = (param.norm() / (param.numel() ** 0.5)).item()
+            w_rms = (param.norm() / (param.numel() ** 0.5)).item()
+            stats[f"weight_rms/{layer}"] = w_rms
             if name in grad_rms:
-                stats[f"grad_rms/{layer}"] = grad_rms[name]
+                g_rms = grad_rms[name]
+                stats[f"grad_rms/{layer}"] = g_rms
+                if w_rms > 0:
+                    stats[f"update_ratio/{layer}"] = (lr * g_rms) / w_rms
     wandb.log(stats)
 
 
@@ -251,14 +268,14 @@ def optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor):
                 if param.grad is not None:
                     grad_rms[name] = (param.grad.norm() / (param.grad.numel() ** 0.5)).item()
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+    total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm).item()
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad(set_to_none=True)
     state["global_step"] += 1
 
     if is_eval_step:
-        val_loss, val_entropy, val_latency = run_val(state)
+        val_loss, val_entropy, val_prec, val_rec, val_f1, val_latency = run_val(state)
         log_diagnostics(
             state=state,
             stats={
@@ -267,17 +284,11 @@ def optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor):
                 "lr": scheduler.get_last_lr()[0],
                 "loss/val": val_loss,
                 "entropy/val": val_entropy,
+                "val/precision": val_prec,
+                "val/recall": val_rec,
+                "val/f1": val_f1,
+                "total_grad_norm": total_grad_norm,
                 "inf_latency_ms": val_latency,
-                "loss/upper": 0.2,
-                "loss/lower": 0.05,
-                "grad_rms/upper": 0.1,
-                "grad_rms/lower": 1e-4,
-                "weight_rms/upper": 1,
-                "weight_rms/lower": 0.01,
-                "entropy/upper": 0.35,
-                "entropy/lower": 0.10,
-                "inf_latency_ms/upper": 10,
-                "inf_latency_ms/lower": 0,
             },
             grad_rms=grad_rms,
         )
@@ -301,7 +312,7 @@ def run_train_epoch(state: dict, steps: int) -> float:
             break
         num_batches = i + 1
 
-        loss, state["train_hidden"], entropy = process_batch(
+        loss, state["train_hidden"], entropy, _, _ = process_batch(
             model=model,
             frames=frames,
             actions_bin=actions_bin,
@@ -322,11 +333,11 @@ def run_train_epoch(state: dict, steps: int) -> float:
     return (train_loss_tensor.item() / num_batches) if num_batches > 0 else 0.0
 
 
-def run_val(state: dict) -> tuple[float, float, float]:
-    """Run validation steps and measure inference latency.
+def run_val(state: dict) -> tuple[float, float, float, float, float, float]:
+    """Run validation steps and measure inference latency and classification metrics.
 
     Returns:
-        Tuple of (avg_val_loss, avg_val_entropy, inference_latency_ms).
+        Tuple of (avg_val_loss, avg_val_entropy, precision, recall, f1, inference_latency_ms).
     """
     val_steps = CONFIG["training"]["valSteps"]
     model, val_iter = state["model"], state["val_iter"]
@@ -336,6 +347,10 @@ def run_val(state: dict) -> tuple[float, float, float]:
     val_loss_tensor = torch.zeros(1, device=DEVICE)
     val_entropy_tensor = torch.zeros(1, device=DEVICE)
 
+    total_tp = 0.0
+    total_fp = 0.0
+    total_fn = 0.0
+
     with torch.no_grad():
         for i in range(val_steps):
             try:
@@ -344,7 +359,7 @@ def run_val(state: dict) -> tuple[float, float, float]:
                 break
             num_batches = i + 1
 
-            loss, state["val_hidden"], entropy = process_batch(
+            loss, state["val_hidden"], entropy, logits, target_60 = process_batch(
                 model=model,
                 frames=frames,
                 actions_bin=actions_bin,
@@ -353,6 +368,11 @@ def run_val(state: dict) -> tuple[float, float, float]:
             )
             val_loss_tensor += loss.detach()
             val_entropy_tensor += entropy.detach()
+
+            preds = logits.argmax(dim=-1)  # [N, T]
+            total_tp += ((preds == 1) & (target_60 == 1)).sum().item()
+            total_fp += ((preds == 1) & (target_60 == 0)).sum().item()
+            total_fn += ((preds == 0) & (target_60 == 1)).sum().item()
 
         dummy_x = torch.zeros(1, 1, 480, 640, 3, device=DEVICE)
         dummy_h = torch.zeros(1, 1, model.hidden_dim, device=DEVICE)
@@ -366,7 +386,12 @@ def run_val(state: dict) -> tuple[float, float, float]:
 
     avg_val_loss = (val_loss_tensor.item() / num_batches) if num_batches > 0 else 0.0
     avg_val_entropy = (val_entropy_tensor.item() / num_batches) if num_batches > 0 else 0.0
-    return avg_val_loss, avg_val_entropy, elapsed_ms
+
+    precision = total_tp / (total_tp + total_fp + 1e-9)
+    recall = total_tp / (total_tp + total_fn)
+    f1 = (2 * precision * recall) / (precision + recall + 1e-9)
+
+    return avg_val_loss, avg_val_entropy, precision, recall, f1, elapsed_ms
 
 
 def save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None):
