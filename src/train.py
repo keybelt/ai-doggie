@@ -1,9 +1,3 @@
-"""Handles logic from loading the saved data files, to loading the previous checkpoint and continuing training.
-
-Example:
-    $ python train.py
-"""
-
 import json
 import random
 import sys
@@ -11,8 +5,8 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import numpy as np
 import h5py
+import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
@@ -23,52 +17,65 @@ sys.path.append(str(Path(__file__).resolve().parent))
 
 from model import Model
 
-# Shared configuration constants
-_BATCH_SIZE = 8
-_SEQ_LEN = 64
-_ACCUMULATION_STEPS = 4
-_EPOCHS = 100
-_DEVICE = torch.device("mps")
-_LR = 1e-3
-_WEIGHT_DECAY = 0.01
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+with CONFIG_PATH.open() as f:
+    CONFIG = json.load(f)
+
+DEVICE = torch.device("mps")
 
 
-class _DatasetGenerator(IterableDataset):
+class DatasetGenerator(IterableDataset):
     """Yield training batches built from parallel gameplay streams."""
 
     def __init__(self, src_files: list[Path], is_val: bool):
-        self.src_files: list[Path] = src_files
-        self.is_val: bool = is_val
-        self._dataset_files: list[Path] = []
+        self.src_files = src_files
+        self.is_val = is_val
+        self.dataset_files: list[Path] = []
 
-    def _get_next_file(self) -> Path:
-        if not self._dataset_files:
-            self._dataset_files = self.src_files.copy()
+    def get_next_file(self) -> Path:
+        if not self.dataset_files:
+            self.dataset_files = self.src_files.copy()
             if not self.is_val:
-                random.shuffle(self._dataset_files)
-        return self._dataset_files.pop(0)
+                random.shuffle(self.dataset_files)
+        return self.dataset_files.pop(0)
+
+    def stream_file(self, filepath: Path) -> Iterator[tuple[np.ndarray, np.ndarray, bool]]:
+        """Stream frame and action chunks from HDF5 file directly without full RAM load.
+
+        Yields:
+            Tuple of (frames_chunk, actions_chunk, is_first_chunk_flag).
+        """
+        seq_len = CONFIG["training"]["seqLen"]
+        with h5py.File(filepath, "r") as f:
+            frames_ds = f["frames"]
+            actions_ds = f["actions_bin"]
+            num_chunks = len(frames_ds) // seq_len
+
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * seq_len
+                end = start + seq_len
+                yield frames_ds[start:end], actions_ds[start:end], (chunk_idx == 0)
 
     def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch together mini batches from each file stream.
 
         Yields:
-            Tuple of arrays of frames, action binaries, and is_first flags of the concatenated mini batches.
+            Tuple of (frames, actions_bin, are_first) concatenated arrays.
         """
-        self._dataset_files = []
-
-        file_streams = [self._stream_file(self._get_next_file()) for _ in range(_BATCH_SIZE)]
+        batch_size = CONFIG["training"]["batchSize"]
+        self.dataset_files = []
+        file_streams = [self.stream_file(self.get_next_file()) for _ in range(batch_size)]
 
         while True:
-            batch_frames = []
-            batch_actions_bin = []
-            batch_are_first = []
+            batch_frames, batch_actions_bin, batch_are_first = [], [], []
 
-            for batch_idx in range(_BATCH_SIZE):
+            for i in range(batch_size):
                 try:
-                    frames, actions_bin, is_first = next(file_streams[batch_idx])
+                    frames, actions_bin, is_first = next(file_streams[i])
                 except StopIteration:
-                    file_streams[batch_idx] = self._stream_file(self._get_next_file())
-                    frames, actions_bin, is_first = next(file_streams[batch_idx])
+                    file_streams[i] = self.stream_file(self.get_next_file())
+                    frames, actions_bin, is_first = next(file_streams[i])
 
                 batch_frames.append(frames)
                 batch_actions_bin.append(actions_bin)
@@ -80,235 +87,179 @@ class _DatasetGenerator(IterableDataset):
                 np.stack(batch_are_first),
             )
 
-    def _stream_file(
-        self,
-        filepath: Path,
-    ) -> Iterator[tuple[np.ndarray, np.ndarray, bool]]:
-        """Stream chunks from the HDF5 file directly, without loading the whole file into RAM.
 
-        Yields:
-            The frames, action binaries, and whether the chunk is the first of the file.
-        """
-        with h5py.File(filepath, "r") as f:
-            frames_ds = f["frames"]
-            actions_ds = f["actions_bin"]
-
-            num_chunks = len(frames_ds) // _SEQ_LEN
-
-            # Chop up each file stream into chunks with length seq_len.
-            for chunk_idx in range(num_chunks):
-                start_idx = chunk_idx * _SEQ_LEN
-                end_idx = start_idx + _SEQ_LEN
-                chunk_frames = frames_ds[start_idx:end_idx]
-                chunk_actions_bin = actions_ds[start_idx:end_idx]
-
-                yield chunk_frames, chunk_actions_bin, (chunk_idx == 0)
-
-
-def _preprocess_inputs(
+def preprocess_inputs(
     frames: Tensor,
     actions_bin: Tensor,
     are_first: Tensor,
     hidden: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Preprocess and transfer frames, action targets, and hidden states to the target device.
-
-    Args:
-        frames: [N, T, H, W, C] raw frames.
-        actions_bin: [N, T, 4] action target binaries.
-        are_first: [N] is_first flags.
-        hidden: [N, L, D] previous hidden state.
+    """Normalize frames to [0, 1] and zero out hidden states on episode reset.
 
     Returns:
-        Normalized frames, action targets, and masked hidden state.
+        Tuple of (frames_norm, target_actions_bin, masked_hidden_state).
     """
-    keep_hidden_mask = (~are_first).to(_DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
-    hidden_state = hidden * keep_hidden_mask
-
-    frames_norm = frames.to(_DEVICE, non_blocking=True).to(dtype=torch.float32).mul_(1.0 / 255.0)
-    target_actions_bin = actions_bin.to(_DEVICE, dtype=torch.long)
-
+    keep_hidden = (~are_first).to(DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)
+    hidden_state = hidden * keep_hidden
+    frames_norm = frames.to(DEVICE, non_blocking=True).to(dtype=torch.float32).mul_(1.0 / 255.0)
+    target_actions_bin = actions_bin.to(DEVICE, dtype=torch.long)
     return frames_norm, target_actions_bin, hidden_state
 
 
-def _process_batch(
+def process_batch(
     model: Model,
     frames: Tensor,
     actions_bin: Tensor,
     are_first: Tensor,
     hidden: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Process a single batch through the model and calculate loss.
-
-    Args:
-        model: the neural network.
-        frames: [N, T, H, W, C].
-        actions_bin: [N, T, 4].
-        are_first: [N].
-        hidden: [N, L, D].
+    """Pass batch through model and compute loss + entropy.
 
     Returns:
-        A tuple of the loss, new hidden state, and prediction entropy.
+        Tuple of (loss, detached_hidden_state, entropy).
     """
-    CLASS_WEIGHTS = [1.0, 2.2759]
-
-    frames_norm, target_actions_bin, hidden_state = _preprocess_inputs(
+    frames_norm, target_actions_bin, hidden_state = preprocess_inputs(
         frames=frames,
         actions_bin=actions_bin,
         are_first=are_first,
         hidden=hidden,
     )
-
     logits, hidden_state = model(frames_norm, hidden_state)
-
-    # Ensure hidden state doesn't effect the gradients of the entire dataset.
     hidden_state = hidden_state.detach()
-    N, T, _ = logits.shape
 
-    # --- 60Hz Coarse Mode (Phase 1a) ---
-    target_60 = target_actions_bin.max(dim=-1)[0]  # Max pool 240Hz labels to 60Hz
-    weight = torch.tensor(CLASS_WEIGHTS, device=logits.device)
-    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=weight)
+    # --- Phase 1a: 60Hz Coarse Mode ---
+    target_60 = target_actions_bin.max(dim=-1)[0]
+    weights_tensor = torch.tensor(CONFIG["training"]["classWeights"], device=logits.device)
+    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=weights_tensor)
 
-    # Calculate prediction entropy
     probs = F.softmax(logits, dim=-1)
     entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
-    # --- 240Hz Subtick Mode (Phase 1b / Original) ---
+    # --- Phase 1b: 240Hz Subtick Control Mode ---
+    # N, T, _ = logits.shape
     # logits_240 = logits.view(N, T * 4, 2)
     # target_actions_bin_240 = target_actions_bin.view(N, T * 4)
-    # weight = torch.tensor(CLASS_WEIGHTS, device=logits.device)
-    # loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weight)
-    # # Calculate prediction entropy
+    # weights_tensor = torch.tensor(CONFIG["training"]["classWeights"], device=logits.device)
+    # loss = F.cross_entropy(logits_240.transpose(1, 2), target_actions_bin_240, weight=weights_tensor)
     # probs = F.softmax(logits_240, dim=-1)
     # entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
     return loss, hidden_state, entropy
 
 
-def _prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
-    """Prepare train/validation files and calculate step limits.
+def prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
+    """Scan training and validation dataset directory files and compute steps per epoch.
 
     Returns:
-        A tuple containing (train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch).
+        Tuple of (train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch).
     """
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    TRAINING_DATA_DIR = PROJECT_ROOT / "data" / "training"
-    VALIDATION_DATA_DIR = PROJECT_ROOT / "data" / "validation"
+    seq_len = CONFIG["training"]["seqLen"]
+    batch_size = CONFIG["training"]["batchSize"]
+    accumulation_steps = CONFIG["training"]["accumulationSteps"]
 
-    train_files = list(TRAINING_DATA_DIR.glob("*.h5"))
-    val_files = list(VALIDATION_DATA_DIR.glob("*.h5"))
+    train_dir = PROJECT_ROOT / "data" / "training"
+    val_dir = PROJECT_ROOT / "data" / "validation"
+
+    train_files = list(train_dir.glob("*.h5"))
+    val_files = list(val_dir.glob("*.h5"))
 
     def get_chunks(f: Path) -> int:
         with h5py.File(f, "r") as data:
-            return len(data["actions_bin"]) // _SEQ_LEN
+            return len(data["actions_bin"]) // seq_len
 
     total_train_chunks = sum(get_chunks(f) for f in train_files)
-    train_steps_per_epoch = max(1, total_train_chunks // _BATCH_SIZE)
+    train_steps_per_epoch = max(1, total_train_chunks // batch_size)
 
     total_val_chunks = sum(get_chunks(f) for f in val_files)
-    val_steps_per_epoch = max(1, total_val_chunks // _BATCH_SIZE)
+    val_steps_per_epoch = max(1, total_val_chunks // batch_size)
 
-    opt_steps_per_epoch = (train_steps_per_epoch + _ACCUMULATION_STEPS - 1) // _ACCUMULATION_STEPS
-
+    opt_steps_per_epoch = (train_steps_per_epoch + accumulation_steps - 1) // accumulation_steps
     return train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch
 
 
-def _init_model_and_optimizer(
+def init_model_and_optimizer(
     opt_steps_per_epoch: int,
 ) -> tuple[Model, torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
-    """Initialize Model, Optimizer, and LR Scheduler on the specified device."""
+    """Instantiate Model, AdamW optimizer, and OneCycleLR scheduler.
 
-    model = Model().to(_DEVICE)
+    Returns:
+        Tuple of (model, optimizer, scheduler).
+    """
+    model = Model().to(DEVICE)
+    lr = CONFIG["training"]["learningRate"]
+    weight_decay = CONFIG["training"]["weightDecay"]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=_LR, weight_decay=_WEIGHT_DECAY)
-
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=_LR,
-        epochs=_EPOCHS,
+        max_lr=lr,
+        epochs=CONFIG["training"]["epochs"],
         steps_per_epoch=opt_steps_per_epoch,
-        pct_start=0.05,
+        pct_start=0.1,
         anneal_strategy="cos",
     )
-
     return model, optimizer, scheduler
 
 
-def _load_checkpoint(checkpoint_file: str, state: dict) -> int:
-    """Load checkpoint state if a checkpoint file is specified.
+def load_checkpoint(checkpoint_file: str, state: dict) -> int:
+    """Load model weights and training state if specified.
 
     Returns:
-        The starting epoch number (defaults to 1 if no checkpoint is loaded).
+        Starting epoch number.
     """
     if not checkpoint_file:
         return 1
 
-    checkpoint = torch.load(
-        Path(checkpoint_file),
-        map_location=_DEVICE,
-    )
-
+    checkpoint = torch.load(Path(checkpoint_file), map_location=DEVICE)
     state["model"].load_state_dict(checkpoint["model_state"])
     state["optimizer"].load_state_dict(checkpoint["optimizer_state"])
     state["scheduler"].load_state_dict(checkpoint["scheduler_state"])
 
-    print(f"Loading checkpoint {checkpoint_file}.")
+    print(f"Loaded checkpoint {checkpoint_file}.")
     return checkpoint["epoch"] + 1
 
 
-def _log_diagnostics(
-    state: dict,
-    stats: dict,
-    grad_rms: dict[str, float],
-):
-    """Log training metrics, validation loss, and parameter/gradient RMS values to WandB."""
+def log_diagnostics(state: dict, stats: dict, grad_rms: dict[str, float]):
+    """Log training metrics and weight/gradient RMS values to WandB."""
     stats["global_step"] = state["global_step"]
     model = state["model"]
 
     with torch.no_grad():
         for name, param in model.named_parameters():
             if "bias" in name:
-                # biases have small rms
                 continue
-
             parts = name.rsplit(".", 1)
             layer = parts[0] if len(parts) == 2 else name
             stats[f"weight_rms/{layer}"] = (param.norm() / (param.numel() ** 0.5)).item()
-
             if name in grad_rms:
                 stats[f"grad_rms/{layer}"] = grad_rms[name]
     wandb.log(stats)
 
 
-def _optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor) -> None:
-    """Perform optimizer step, learning rate scheduler update, grad norm clipping, and validation."""
-    EVAL_FREQ_STEPS = 100
-    MAX_GRAD_NORM = 1.0
+def optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor):
+    """Step optimizer/scheduler, clip gradients, and run periodic evaluation."""
+    eval_freq = CONFIG["training"]["evalFreqSteps"]
+    max_grad_norm = CONFIG["training"]["maxGradNorm"]
 
-    model = state["model"]
-    optimizer = state["optimizer"]
-    scheduler = state["scheduler"]
-
-    is_eval_step = (state["global_step"] + 1) % EVAL_FREQ_STEPS == 0
+    model, optimizer, scheduler = state["model"], state["optimizer"], state["scheduler"]
+    is_eval_step = (state["global_step"] + 1) % eval_freq == 0
     grad_rms = {}
+
     if is_eval_step:
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if param.grad is not None:
                     grad_rms[name] = (param.grad.norm() / (param.grad.numel() ** 0.5)).item()
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
     optimizer.step()
     scheduler.step()
-
     optimizer.zero_grad(set_to_none=True)
     state["global_step"] += 1
 
     if is_eval_step:
-        val_loss, val_entropy, val_latency = _run_val(state)
-
-        _log_diagnostics(
+        val_loss, val_entropy, val_latency = run_val(state)
+        log_diagnostics(
             state=state,
             stats={
                 "loss/train": loss.item(),
@@ -333,25 +284,24 @@ def _optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor) -> None:
         model.train()
 
 
-def _run_train_epoch(state: dict, steps: int) -> float:
-    """Run a single training epoch and return training loss."""
-    model = state["model"]
-    train_iter = state["train_iter"]
+def run_train_epoch(state: dict, steps: int) -> float:
+    """Run one training epoch over step count and return average train loss."""
+    model, train_iter = state["model"], state["train_iter"]
+    accum_steps = CONFIG["training"]["accumulationSteps"]
 
     model.train()
-    num_train_batches = 0
-    train_loss_tensor = torch.zeros(1, device=_DEVICE)
-    loss = None
-    entropy = None
+    num_batches = 0
+    train_loss_tensor = torch.zeros(1, device=DEVICE)
+    loss, entropy = None, None
 
     for i in range(steps):
         try:
             frames, actions_bin, are_first = next(train_iter)
         except StopIteration:
             break
-        num_train_batches = i + 1
+        num_batches = i + 1
 
-        loss, state["train_hidden"], entropy = _process_batch(
+        loss, state["train_hidden"], entropy = process_batch(
             model=model,
             frames=frames,
             actions_bin=actions_bin,
@@ -359,56 +309,53 @@ def _run_train_epoch(state: dict, steps: int) -> float:
             hidden=state["train_hidden"],
         )
 
-        scaled_loss = loss / _ACCUMULATION_STEPS
-        scaled_loss.backward()
+        (loss / accum_steps).backward()
 
-        if num_train_batches % _ACCUMULATION_STEPS == 0:
-            _optimize_and_evaluate(state, loss, entropy)
+        if num_batches % accum_steps == 0:
+            optimize_and_evaluate(state, loss, entropy)
 
         train_loss_tensor += loss.detach()
 
-    if num_train_batches % _ACCUMULATION_STEPS != 0 and loss is not None and entropy is not None:
-        _optimize_and_evaluate(state, loss, entropy)
+    if num_batches % accum_steps != 0 and loss is not None:
+        optimize_and_evaluate(state, loss, entropy)
 
-    avg_train_loss = (train_loss_tensor.item() / num_train_batches) if num_train_batches > 0 else 0.0
-    return avg_train_loss
+    return (train_loss_tensor.item() / num_batches) if num_batches > 0 else 0.0
 
 
-def _run_val(state: dict) -> tuple[float, float, float | None]:
-    """Run a fixed number of validation steps and return the average loss, average entropy, and validation latency."""
-    VAL_STEPS = 50
+def run_val(state: dict) -> tuple[float, float, float]:
+    """Run validation steps and measure inference latency.
 
-    model = state["model"]
-    val_iter = state["val_iter"]
+    Returns:
+        Tuple of (avg_val_loss, avg_val_entropy, inference_latency_ms).
+    """
+    val_steps = CONFIG["training"]["valSteps"]
+    model, val_iter = state["model"], state["val_iter"]
 
     model.eval()
-    num_val_batches = 0
-    val_loss_tensor = torch.zeros(1, device=_DEVICE)
-    val_entropy_tensor = torch.zeros(1, device=_DEVICE)
+    num_batches = 0
+    val_loss_tensor = torch.zeros(1, device=DEVICE)
+    val_entropy_tensor = torch.zeros(1, device=DEVICE)
 
     with torch.no_grad():
-        for i in range(VAL_STEPS):
+        for i in range(val_steps):
             try:
                 frames, actions_bin, are_first = next(val_iter)
             except StopIteration:
                 break
-            num_val_batches = i + 1
+            num_batches = i + 1
 
-            loss, state["val_hidden"], entropy = _process_batch(
+            loss, state["val_hidden"], entropy = process_batch(
                 model=model,
                 frames=frames,
                 actions_bin=actions_bin,
                 are_first=are_first,
                 hidden=state["val_hidden"],
             )
-
             val_loss_tensor += loss.detach()
             val_entropy_tensor += entropy.detach()
 
-        # inf measuring
-        dummy_x = torch.zeros(1, 1, 480, 640, 3, device=_DEVICE)
-        dummy_h = torch.zeros(1, 1, model._hidden_dim, device=_DEVICE)
-        # Warmup and synchronization
+        dummy_x = torch.zeros(1, 1, 480, 640, 3, device=DEVICE)
+        dummy_h = torch.zeros(1, 1, model.hidden_dim, device=DEVICE)
         model(dummy_x, dummy_h)
         torch.mps.synchronize()
 
@@ -417,14 +364,13 @@ def _run_val(state: dict) -> tuple[float, float, float | None]:
         torch.mps.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    avg_val_loss = (val_loss_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0
-    avg_val_entropy = (val_entropy_tensor.item() / num_val_batches) if num_val_batches > 0 else 0.0
-
+    avg_val_loss = (val_loss_tensor.item() / num_batches) if num_batches > 0 else 0.0
+    avg_val_entropy = (val_entropy_tensor.item() / num_batches) if num_batches > 0 else 0.0
     return avg_val_loss, avg_val_entropy, elapsed_ms
 
 
-def _save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None) -> None:
-    """Save the model checkpoint."""
+def save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None):
+    """Save epoch model, optimizer, and scheduler state to checkpoint file."""
     checkpoint_data = {
         "epoch": epoch,
         "model_state": state["model"].state_dict(),
@@ -433,83 +379,54 @@ def _save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float
         "train_loss": train_loss,
         "val_loss": val_loss,
     }
-
-    # Save epoch-specific checkpoint inside WandB run directory for automatic cloud upload
     if wandb.run is not None:
         wandb_checkpoint_path = Path(wandb.run.dir) / f"epoch_{epoch}.pt"
         torch.save(checkpoint_data, wandb_checkpoint_path)
 
 
-def _train():
-    """Load model, previous checkpoints, and dataset. Train over epochs hyper-parameter."""
+def train():
+    cfg_tr = CONFIG["training"]
+    batch_size = cfg_tr["batchSize"]
+    epochs = cfg_tr["epochs"]
 
-    train_files, val_files, train_steps_per_epoch, _, opt_steps_per_epoch = _prepare_data_files()
+    train_files, val_files, train_steps, _, opt_steps = prepare_data_files()
 
-    train_loader = DataLoader(_DatasetGenerator(train_files, is_val=False), batch_size=None)
-    val_loader = DataLoader(_DatasetGenerator(val_files, is_val=True), batch_size=None)
+    train_loader = DataLoader(DatasetGenerator(train_files, is_val=False), batch_size=None)
+    val_loader = DataLoader(DatasetGenerator(val_files, is_val=True), batch_size=None)
 
-    train_iter = iter(train_loader)
-    val_iter = iter(val_loader)
+    model, optimizer, scheduler = init_model_and_optimizer(opt_steps)
+    hidden_dim = CONFIG["model"]["hiddenDim"]
 
-    model, optimizer, scheduler = _init_model_and_optimizer(
-        opt_steps_per_epoch=opt_steps_per_epoch,
-    )
-
-    with (Path(__file__).resolve().parent / "config.json").open() as f:
-        config = json.load(f)
-
-    hidden_state_dim = config["model"]["hiddenDim"]
-
-    # Initialize state context to reduce argument passing
     state = {
         "model": model,
         "optimizer": optimizer,
         "scheduler": scheduler,
-        "train_iter": train_iter,
-        "val_iter": val_iter,
+        "train_iter": iter(train_loader),
+        "val_iter": iter(val_loader),
         "global_step": 0,
-        "train_hidden": torch.zeros(_BATCH_SIZE, 1, hidden_state_dim, device=_DEVICE),
-        "val_hidden": torch.zeros(_BATCH_SIZE, 1, hidden_state_dim, device=_DEVICE),
+        "train_hidden": torch.zeros(batch_size, 1, hidden_dim, device=DEVICE),
+        "val_hidden": torch.zeros(batch_size, 1, hidden_dim, device=DEVICE),
     }
 
-    start_epoch = _load_checkpoint(
-        checkpoint_file=config["checkpointFile"],
-        state=state,
+    start_epoch = load_checkpoint(CONFIG["checkpointFile"], state)
+    state["global_step"] = (start_epoch - 1) * opt_steps
+
+    wandb.init(
+        project="ai-doggie",
+        name="more epochs and accurate cls weights",
+        config=cfg_tr,
     )
+    wandb.define_metric("global_step", hidden=True)
+    wandb.define_metric("*", step_metric="global_step")
 
-    state["global_step"] = (start_epoch - 1) * opt_steps_per_epoch
-
-    # Initialize Weights & Biases
-    # wandb.init(
-    #    project="ai-doggie",
-    #    name="more epochs and accurate cls weights",
-    #    config={
-    #        "batch_size": _BATCH_SIZE,
-    #        "seq_len": _SEQ_LEN,
-    #        "accumulation_steps": _ACCUMULATION_STEPS,
-    #        "epochs": _EPOCHS,
-    #        "learning_rate": _LR,
-    #        "weight_decay": _WEIGHT_DECAY,
-    #    },
-    # )
-    # wandb.define_metric("global_step", hidden=True)
-    # wandb.define_metric("*", step_metric="global_step")
-
-    for epoch in range(start_epoch, _EPOCHS + 1):
-        avg_train_loss = _run_train_epoch(
-            state=state,
-            steps=train_steps_per_epoch,
-        )
+    for epoch in range(start_epoch, epochs + 1):
+        avg_train_loss = run_train_epoch(state, train_steps)
 
         if epoch % 10 == 0:
-            _save_checkpoint(
-                epoch=epoch,
-                state=state,
-                train_loss=avg_train_loss,
-            )
+            save_checkpoint(epoch, state, avg_train_loss)
 
     wandb.finish()
 
 
 if __name__ == "__main__":
-    _train()
+    train()

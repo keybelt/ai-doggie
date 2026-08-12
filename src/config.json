@@ -1,6 +1,22 @@
 {
     "model": {
-        "hiddenDim": 256
+        "hiddenDim": 256,
+        "attnDim": 16,
+        "numHeads": 8,
+        "actionDim": 2,
+        "dropout": 0.1
+    },
+    "training": {
+        "batchSize": 8,
+        "seqLen": 64,
+        "accumulationSteps": 8,
+        "epochs": 100,
+        "learningRate": 0.001,
+        "weightDecay": 0.01,
+        "maxGradNorm": 1.0,
+        "evalFreqSteps": 500,
+        "valSteps": 50,
+        "classWeights": [1.0, 2.2759]
     },
     "frame": {
         "width": 640,
