@@ -44,6 +44,13 @@ class Model(nn.Module):
         self.dropout = nn.Dropout(dropout_p)
         self.policy_head = nn.Linear(self.hidden_dim, self.action_dim)
 
+        # Pre-compute spatial CoordConv meshgrid buffers
+        h, w = CONFIG["frame"]["height"], CONFIG["frame"]["width"]
+        y_coords = torch.linspace(-1, 1, h).view(1, 1, h, 1).expand(1, 1, h, w)
+        x_coords = torch.linspace(-1, 1, w).view(1, 1, 1, w).expand(1, 1, h, w)
+        self.register_buffer("y_coords", y_coords, persistent=False)
+        self.register_buffer("x_coords", x_coords, persistent=False)
+
         self.init_params()
 
     def init_params(self):
@@ -70,7 +77,7 @@ class Model(nn.Module):
         nn.init.zeros_(self.policy_head.bias)
 
     def conv_forward(self, X: Tensor) -> Tensor:
-        """Applies CoordConv and sequential conv layers.
+        """Applies CoordConv using cached grid buffers and sequential conv layers.
 
         Args:
             X: [N, C, H, W]
@@ -79,9 +86,9 @@ class Model(nn.Module):
             Tensor of shape [N, C', H', W'].
         """
         batch_size, _, h, w = X.size()
-        y_coords = torch.linspace(-1, 1, h, device=X.device).view(1, 1, h, 1).expand(batch_size, 1, h, w)
-        x_coords = torch.linspace(-1, 1, w, device=X.device).view(1, 1, 1, w).expand(batch_size, 1, h, w)
-        X = torch.cat([X, y_coords, x_coords], dim=1)
+        y = self.y_coords.expand(batch_size, 1, h, w)
+        x = self.x_coords.expand(batch_size, 1, h, w)
+        X = torch.cat([X, y, x], dim=1)
 
         X = torch.relu(self.conv1(X))
         X = torch.relu(self.conv2(X))

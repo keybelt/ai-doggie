@@ -23,6 +23,7 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 DEVICE = torch.device("mps")
+CLASS_WEIGHTS = torch.tensor(CONFIG["training"]["classWeights"], device=DEVICE)
 
 
 class DatasetGenerator(IterableDataset):
@@ -107,7 +108,8 @@ def preprocess_inputs(
     """
     keep_hidden = (~are_first).to(DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)  # [N, 1, 1]
     hidden_state = hidden * keep_hidden  # [N, 1, D]
-    frames_norm = frames.to(DEVICE, non_blocking=True).to(dtype=torch.float32).mul_(1.0 / 255.0)  # [N, T, H, W, C]
+    frames_gpu = frames.to(DEVICE, non_blocking=True)  # Compact uint8 host-to-device transfer
+    frames_norm = frames_gpu.to(dtype=torch.float32).mul_(1.0 / 255.0)  # [N, T, H, W, C]
     target_actions_bin = actions_bin.to(DEVICE, dtype=torch.long)  # [N, T, 4]
     return frames_norm, target_actions_bin, hidden_state
 
@@ -119,7 +121,7 @@ def process_batch(
     are_first: Tensor,
     hidden: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Pass batch through model and compute loss + entropy.
+    """Pass batch through model and compute loss + entropy using AMP autocast.
 
     Args:
         frames: [N, T, H, W, C]
@@ -136,16 +138,16 @@ def process_batch(
         are_first=are_first,
         hidden=hidden,
     )
-    logits, hidden_state = model(frames_norm, hidden_state)  # logits: [N, T, 2], hidden_state: [N, 1, D]
-    hidden_state = hidden_state.detach()
+    with torch.amp.autocast(device_type="mps", dtype=torch.float16):
+        logits, hidden_state = model(frames_norm, hidden_state)  # logits: [N, T, 2], hidden_state: [N, 1, D]
+        hidden_state = hidden_state.detach()
 
-    # --- Phase 1a: 60Hz Coarse Mode ---
-    target_60 = target_actions_bin.max(dim=-1)[0]  # [N, T]
-    weights_tensor = torch.tensor(CONFIG["training"]["classWeights"], device=logits.device)
-    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=weights_tensor)  # logits.transpose: [N, 2, T]
+        # --- Phase 1a: 60Hz Coarse Mode ---
+        target_60 = target_actions_bin.max(dim=-1)[0]  # [N, T]
+        loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=CLASS_WEIGHTS)  # logits.transpose: [N, 2, T]
 
-    probs = F.softmax(logits, dim=-1)  # [N, T, 2]
-    entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
+        probs = F.softmax(logits, dim=-1)  # [N, T, 2]
+        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
     # --- Phase 1b: 240Hz Subtick Control Mode ---
     # N, T, _ = logits.shape
@@ -234,6 +236,8 @@ def load_checkpoint(checkpoint_file: str, state: dict) -> int:
 def log_diagnostics(state: dict, stats: dict, grad_rms: dict[str, float]):
     """Log training metrics, weight/gradient RMS values, and update ratios to WandB."""
     stats["global_step"] = state["global_step"]
+    opt_steps = state["opt_steps"]
+    stats["epoch"] = (state["global_step"] / opt_steps) + 1.0
     model = state["model"]
     lr = stats["lr"]
 
@@ -429,6 +433,7 @@ def train():
         "train_iter": iter(train_loader),
         "val_iter": iter(val_loader),
         "global_step": 0,
+        "opt_steps": opt_steps,
         "train_hidden": torch.zeros(batch_size, 1, hidden_dim, device=DEVICE),
         "val_hidden": torch.zeros(batch_size, 1, hidden_dim, device=DEVICE),
     }
@@ -441,8 +446,8 @@ def train():
         name="more epochs and accurate cls weights",
         config=cfg_tr,
     )
-    wandb.define_metric("global_step", hidden=True)
-    wandb.define_metric("*", step_metric="global_step")
+    wandb.define_metric("epoch", hidden=True)
+    wandb.define_metric("*", step_metric="epoch")
 
     for epoch in range(start_epoch, epochs + 1):
         avg_train_loss = run_train_epoch(state, train_steps)
