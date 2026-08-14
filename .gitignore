@@ -7,5 +7,6 @@ __pycache__
 macro_parser
 .eclipse
 CONTEXT.md
+checkpoints
 mod/*
 !mod/src

@@ -121,7 +121,7 @@ def process_batch(
     are_first: Tensor,
     hidden: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Pass batch through model and compute loss + entropy using AMP autocast.
+    """Pass batch through model and compute loss + entropy in float32.
 
     Args:
         frames: [N, T, H, W, C]
@@ -138,16 +138,15 @@ def process_batch(
         are_first=are_first,
         hidden=hidden,
     )
-    with torch.amp.autocast(device_type="mps", dtype=torch.float16):
-        logits, hidden_state = model(frames_norm, hidden_state)  # logits: [N, T, 2], hidden_state: [N, 1, D]
-        hidden_state = hidden_state.detach()
+    logits, hidden_state = model(frames_norm, hidden_state)  # logits: [N, T, 2], hidden_state: [N, 1, D]
+    hidden_state = hidden_state.detach()
 
-        # --- Phase 1a: 60Hz Coarse Mode ---
-        target_60 = target_actions_bin.max(dim=-1)[0]  # [N, T]
-        loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=CLASS_WEIGHTS)  # logits.transpose: [N, 2, T]
+    # --- Phase 1a: 60Hz Coarse Mode ---
+    target_60 = target_actions_bin.max(dim=-1)[0]  # [N, T]
+    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=CLASS_WEIGHTS)  # logits.transpose: [N, 2, T]
 
-        probs = F.softmax(logits, dim=-1)  # [N, T, 2]
-        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
+    probs = F.softmax(logits, dim=-1)  # [N, T, 2]
+    entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
     # --- Phase 1b: 240Hz Subtick Control Mode ---
     # N, T, _ = logits.shape
@@ -408,9 +407,10 @@ def save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float 
         "train_loss": train_loss,
         "val_loss": val_loss,
     }
-    if wandb.run is not None:
-        wandb_checkpoint_path = Path(wandb.run.dir) / f"epoch_{epoch}.pt"
-        torch.save(checkpoint_data, wandb_checkpoint_path)
+    checkpoints_dir = PROJECT_ROOT / "checkpoints"
+    checkpoint_path = checkpoints_dir / f"epoch_{epoch}.pt"
+    torch.save(checkpoint_data, checkpoint_path)
+    print(f"Saved checkpoint to {checkpoint_path}")
 
 
 def train():
@@ -443,7 +443,7 @@ def train():
 
     wandb.init(
         project="ai-doggie",
-        name="more epochs and accurate cls weights",
+        name="less peak lr",
         config=cfg_tr,
     )
     wandb.define_metric("epoch", hidden=True)

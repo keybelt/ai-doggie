@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -11,7 +12,7 @@ with CONFIG_PATH.open() as f:
 
 
 class Model(nn.Module):
-    """CNN + GRU policy model with player-centric cross-attention pooling."""
+    """CNN + GRU policy model with learned-query cross-attention pooling."""
 
     def __init__(self):
         super().__init__()
@@ -27,17 +28,12 @@ class Model(nn.Module):
         cnn_out_channels = 64
         self.conv3 = nn.Conv2d(128, cnn_out_channels, kernel_size=3, stride=2)
 
-        # Player-centric cross-attention pooling
-        self.plr_selector = nn.Conv2d(cnn_out_channels, 1, kernel_size=1, bias=False)
-        self.q_proj = nn.Linear(cnn_out_channels, self.attn_dim * self.num_heads, bias=False)
+        # Learned Query Cross-Attention pooling
+        self.player_query = nn.Parameter(torch.randn(1, self.num_heads, 1, self.attn_dim) * 0.02)
         self.k_proj = nn.Linear(cnn_out_channels, self.attn_dim * self.num_heads, bias=False)
         self.v_proj = nn.Linear(cnn_out_channels, self.attn_dim * self.num_heads, bias=False)
-        self.plr_proj = nn.Linear(cnn_out_channels, self.hidden_dim)
         self.out_proj = nn.Linear(self.num_heads * self.attn_dim, self.hidden_dim)
         self.ln = nn.LayerNorm(self.hidden_dim)
-
-        # Per-head learnable logit scale initialized to 1/0.1 = 10.0 (log scale = 2.3026)
-        self.logit_scale = nn.Parameter(torch.ones(1, self.num_heads, 1, 1) * math.log(1.0 / 0.1))
 
         # Temporal processing and output
         self.gru = nn.GRU(self.hidden_dim, self.hidden_dim, batch_first=True)
@@ -50,31 +46,6 @@ class Model(nn.Module):
         x_coords = torch.linspace(-1, 1, w).view(1, 1, 1, w).expand(1, 1, h, w)
         self.register_buffer("y_coords", y_coords, persistent=False)
         self.register_buffer("x_coords", x_coords, persistent=False)
-
-        self.init_params()
-
-    def init_params(self):
-        """Initialize weights with He/Kaiming for Conv and Xavier for GRU/Attention."""
-        for conv in [self.conv1, self.conv2, self.conv3]:
-            nn.init.kaiming_normal_(conv.weight, mode="fan_out", nonlinearity="relu")
-            nn.init.zeros_(conv.bias)
-
-        nn.init.xavier_uniform_(self.plr_selector.weight)
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.kaiming_normal_(self.plr_proj.weight, nonlinearity="relu")
-        nn.init.zeros_(self.plr_proj.bias)
-        nn.init.kaiming_normal_(self.out_proj.weight, nonlinearity="relu")
-        nn.init.zeros_(self.out_proj.bias)
-
-        nn.init.xavier_uniform_(self.gru.weight_ih_l0)
-        nn.init.xavier_uniform_(self.gru.weight_hh_l0)
-        nn.init.zeros_(self.gru.bias_ih_l0)
-        nn.init.zeros_(self.gru.bias_hh_l0)
-
-        nn.init.xavier_uniform_(self.policy_head.weight)
-        nn.init.zeros_(self.policy_head.bias)
 
     def conv_forward(self, X: Tensor) -> Tensor:
         """Applies CoordConv using cached grid buffers and sequential conv layers.
@@ -90,13 +61,13 @@ class Model(nn.Module):
         x = self.x_coords.expand(batch_size, 1, h, w)
         X = torch.cat([X, y, x], dim=1)
 
-        X = torch.relu(self.conv1(X))
-        X = torch.relu(self.conv2(X))
-        X = torch.relu(self.conv3(X))
+        X = F.gelu(self.conv1(X))
+        X = F.gelu(self.conv2(X))
+        X = F.gelu(self.conv3(X))
         return X
 
-    def player_centric_attention(self, X_conv: Tensor) -> Tensor:
-        """Pools CNN spatial features via player-centric cross-attention.
+    def cross_attention_pooling(self, X_conv: Tensor) -> Tensor:
+        """Pools CNN spatial features via learned player query cross-attention.
 
         Args:
             X_conv: [B, C_in, H_conv, W_conv] features from the CNN.
@@ -106,37 +77,21 @@ class Model(nn.Module):
         """
         B, C_in, _, _ = X_conv.shape
 
-        plr_channel = self.plr_selector(X_conv)  # [B, 1, H_conv, W_conv]
-        plr_channel = plr_channel.view(B, -1)  # [B, H_conv*W_conv]
-        plr_weights = torch.softmax(plr_channel, dim=-1)  # [B, H_conv*W_conv]
-
         X_flat = X_conv.view(B, C_in, -1).transpose(1, 2)  # [B, H_conv*W_conv, C_in]
-        plr_feat = torch.bmm(plr_weights.unsqueeze(1), X_flat)  # [B, 1, C_in]
+        k = self.k_proj(X_flat).view(B, -1, self.num_heads, self.attn_dim).transpose(1, 2)  # [B, Heads, H*W, D_attn]
+        v = self.v_proj(X_flat).view(B, -1, self.num_heads, self.attn_dim).transpose(1, 2)
 
-        q = self.q_proj(plr_feat)  # [B, 1, H_heads * D_attn]
-        k = self.k_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
-        v = self.v_proj(X_flat)  # [B, H_conv*W_conv, H_heads * D_attn]
+        # Expand learned query across batch: [B, Heads, 1, D_attn]
+        q = self.player_query.expand(B, -1, -1, -1)
 
-        q = q.view(B, 1, self.num_heads, self.attn_dim).transpose(1, 2)  # [B, H_heads, 1, D_attn]
-        k = k.view(B, -1, self.num_heads, self.attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
-        v = v.view(B, -1, self.num_heads, self.attn_dim).transpose(1, 2)  # [B, H_heads, H_conv*W_conv, D_attn]
+        # Standard Scaled Dot-Product Attention
+        scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.attn_dim)  # [B, Heads, 1, H*W]
+        attn_probs = torch.softmax(scores, dim=-1)  # [B, Heads, 1, H*W]
 
-        # Apply QK-normalization (Cosine Similarity Attention) to prevent softmax saturation
-        q = torch.nn.functional.normalize(q, p=2, dim=-1)
-        k = torch.nn.functional.normalize(k, p=2, dim=-1)
+        context = (attn_probs @ v).reshape(B, -1)  # [B, Heads * D_attn]
 
-        # Scale by per-head learnable logit scale
-        logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
-        scores = q @ k.transpose(-1, -2) * logit_scale  # [B, H_heads, 1, H_conv*W_conv]
-        attn_probs = torch.softmax(scores, dim=-1)  # [B, H_heads, 1, H_conv*W_conv]
-
-        context = attn_probs @ v  # [B, H_heads, 1, D_attn]
-        context = context.reshape(B, -1)  # [B, H_heads * D_attn]
-
-        # Residual skip connection
-        X_proj = self.out_proj(context) + self.plr_proj(plr_feat.squeeze(1))  # [B, D]
-        X_proj = torch.relu(X_proj)
-        X_proj = self.ln(X_proj)
+        # Clean Linear Projection + LayerNorm + Dropout into GRU
+        X_proj = self.ln(self.out_proj(context))
         X_proj = self.dropout(X_proj)
         return X_proj
 
@@ -155,7 +110,7 @@ class Model(nn.Module):
         X = X.view(N * T, H, W, C).permute(0, 3, 1, 2).contiguous()
         X_conv = self.conv_forward(X)
 
-        X_proj = self.player_centric_attention(X_conv).view(N, T, self.hidden_dim)
+        X_proj = self.cross_attention_pooling(X_conv).view(N, T, self.hidden_dim)
 
         gru_out, h = self.gru(X_proj, prev_h.transpose(0, 1).contiguous())  # [N, T, D]
 

@@ -7,16 +7,19 @@
         "dropout": 0.1
     },
     "training": {
-        "batchSize": 8,
+        "batchSize": 16,
         "seqLen": 64,
-        "accumulationSteps": 8,
+        "accumulationSteps": 4,
         "epochs": 100,
-        "learningRate": 0.001,
-        "weightDecay": 0.01,
+        "learningRate": 0.0003,
+        "weightDecay": 0.001,
         "maxGradNorm": 1.0,
         "evalFreqSteps": 500,
         "valSteps": 50,
-        "classWeights": [1.0, 2.2759]
+        "classWeights": [
+            1.0,
+            2.2759
+        ]
     },
     "frame": {
         "width": 640,
