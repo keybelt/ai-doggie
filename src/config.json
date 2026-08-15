@@ -1,18 +1,16 @@
 {
     "model": {
-        "hiddenDim": 256,
-        "attnDim": 16,
+        "hiddenDim": 64,
+        "attnDim": 32,
         "numHeads": 8,
-        "actionDim": 2,
-        "dropout": 0.1
+        "actionDim": 2
     },
     "training": {
         "batchSize": 16,
         "seqLen": 64,
         "accumulationSteps": 4,
-        "epochs": 100,
+        "epochs": 15,
         "learningRate": 0.0003,
-        "weightDecay": 0.001,
         "maxGradNorm": 1.0,
         "evalFreqSteps": 100,
         "valSteps": 50,

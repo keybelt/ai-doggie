@@ -193,22 +193,23 @@ def prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
 def init_model_and_optimizer(
     opt_steps_per_epoch: int,
 ) -> tuple[Model, torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
-    """Instantiate Model, AdamW optimizer, and OneCycleLR scheduler.
+    """Instantiate Model, Adam optimizer, and OneCycleLR scheduler.
 
     Returns:
         Tuple of (model, optimizer, scheduler).
     """
     model = Model().to(DEVICE)
     lr = CONFIG["training"]["learningRate"]
-    weight_decay = CONFIG["training"]["weightDecay"]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=lr,
         epochs=CONFIG["training"]["epochs"],
         steps_per_epoch=opt_steps_per_epoch,
-        pct_start=0.1,
+        pct_start=0.08,
+        div_factor=6.0,
+        final_div_factor=1000.0,
         anneal_strategy="cos",
     )
     return model, optimizer, scheduler
@@ -232,13 +233,17 @@ def load_checkpoint(checkpoint_file: str, state: dict) -> int:
     return checkpoint["epoch"] + 1
 
 
-def log_diagnostics(state: dict, stats: dict, grad_rms: dict[str, float]):
-    """Log training metrics, weight/gradient RMS values, and update ratios to WandB."""
+def log_diagnostics(
+    state: dict,
+    stats: dict,
+    grad_rms: dict[str, float],
+    update_ratios: dict[str, float],
+):
+    """Log training metrics, weight/gradient RMS values, and true Adam update ratios to WandB."""
     stats["global_step"] = state["global_step"]
     opt_steps = state["opt_steps"]
     stats["epoch"] = (state["global_step"] / opt_steps) + 1.0
     model = state["model"]
-    lr = stats["lr"]
 
     with torch.no_grad():
         for name, param in model.named_parameters():
@@ -249,10 +254,9 @@ def log_diagnostics(state: dict, stats: dict, grad_rms: dict[str, float]):
             w_rms = (param.norm() / (param.numel() ** 0.5)).item()
             stats[f"weight_rms/{layer}"] = w_rms
             if name in grad_rms:
-                g_rms = grad_rms[name]
-                stats[f"grad_rms/{layer}"] = g_rms
-                if w_rms > 0:
-                    stats[f"update_ratio/{layer}"] = (lr * g_rms) / w_rms
+                stats[f"grad_rms/{layer}"] = grad_rms[name]
+            if name in update_ratios:
+                stats[f"update_ratio/{layer}"] = update_ratios[name]
     wandb.log(stats)
 
 
@@ -264,16 +268,32 @@ def optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor):
     model, optimizer, scheduler = state["model"], state["optimizer"], state["scheduler"]
     is_eval_step = (state["global_step"] + 1) % eval_freq == 0
     grad_rms = {}
+    old_params = {}
+    update_ratios = {}
 
     if is_eval_step:
         with torch.no_grad():
             for name, param in model.named_parameters():
+                if "bias" in name:
+                    continue
                 if param.grad is not None:
                     grad_rms[name] = (param.grad.norm() / (param.grad.numel() ** 0.5)).item()
+                old_params[name] = param.detach().clone()
 
     total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm).item()
     optimizer.step()
     scheduler.step()
+
+    if is_eval_step:
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in old_params:
+                    delta = param - old_params[name]
+                    delta_rms = (delta.norm() / (delta.numel() ** 0.5)).item()
+                    w_rms = (param.norm() / (param.numel() ** 0.5)).item()
+                    if w_rms > 0:
+                        update_ratios[name] = delta_rms / w_rms
+
     optimizer.zero_grad(set_to_none=True)
     state["global_step"] += 1
 
@@ -294,6 +314,7 @@ def optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor):
                 "inf_latency_ms": val_latency,
             },
             grad_rms=grad_rms,
+            update_ratios=update_ratios,
         )
         model.train()
 
@@ -443,7 +464,7 @@ def train():
 
     wandb.init(
         project="ai-doggie",
-        name="less peak lr, less w decay, new attn arch",
+        name="15 epochs, 0 LN, 0 dropout, 0 wd, 8x32 attn",
         config=cfg_tr,
     )
     wandb.define_metric("epoch", hidden=True)
@@ -452,7 +473,7 @@ def train():
     for epoch in range(start_epoch, epochs + 1):
         avg_train_loss = run_train_epoch(state, train_steps)
 
-        if epoch % 10 == 0:
+        if epoch % 5 == 0 or epoch == epochs:
             save_checkpoint(epoch, state, avg_train_loss)
 
     wandb.finish()
