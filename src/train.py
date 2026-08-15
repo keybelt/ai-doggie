@@ -443,7 +443,7 @@ def train():
 
     wandb.init(
         project="ai-doggie",
-        name="less peak lr",
+        name="less peak lr, less w decay, new attn arch",
         config=cfg_tr,
     )
     wandb.define_metric("epoch", hidden=True)

@@ -1,5 +1,4 @@
 import json
-import math
 from pathlib import Path
 
 import torch
@@ -28,11 +27,29 @@ class Model(nn.Module):
         cnn_out_channels = 64
         self.conv3 = nn.Conv2d(128, cnn_out_channels, kernel_size=3, stride=2)
 
-        # Learned Query Cross-Attention pooling
-        self.player_query = nn.Parameter(torch.randn(1, self.num_heads, 1, self.attn_dim) * 0.02)
-        self.k_proj = nn.Linear(cnn_out_channels, self.attn_dim * self.num_heads, bias=False)
-        self.v_proj = nn.Linear(cnn_out_channels, self.attn_dim * self.num_heads, bias=False)
-        self.out_proj = nn.Linear(self.num_heads * self.attn_dim, self.hidden_dim)
+        # Cascaded Two-Stage Cross-Attention pooling
+        attn_total_dim = self.num_heads * self.attn_dim
+        self.player_query = nn.Parameter(torch.randn(1, 1, attn_total_dim) * 0.02)
+
+        self.mha1 = nn.MultiheadAttention(
+            embed_dim=attn_total_dim,
+            num_heads=self.num_heads,
+            kdim=cnn_out_channels,
+            vdim=cnn_out_channels,
+            batch_first=True,
+        )
+        self.ln1 = nn.LayerNorm(attn_total_dim)
+
+        self.mha2 = nn.MultiheadAttention(
+            embed_dim=attn_total_dim,
+            num_heads=self.num_heads,
+            kdim=cnn_out_channels,
+            vdim=cnn_out_channels,
+            batch_first=True,
+        )
+        self.ln2 = nn.LayerNorm(attn_total_dim)
+
+        self.out_proj = nn.Linear(2 * attn_total_dim, self.hidden_dim)
         self.ln = nn.LayerNorm(self.hidden_dim)
 
         # Temporal processing and output
@@ -67,7 +84,7 @@ class Model(nn.Module):
         return X
 
     def cross_attention_pooling(self, X_conv: Tensor) -> Tensor:
-        """Pools CNN spatial features via learned player query cross-attention.
+        """Pools CNN spatial features via two-stage cascaded cross-attention.
 
         Args:
             X_conv: [B, C_in, H_conv, W_conv] features from the CNN.
@@ -78,20 +95,22 @@ class Model(nn.Module):
         B, C_in, _, _ = X_conv.shape
 
         X_flat = X_conv.view(B, C_in, -1).transpose(1, 2)  # [B, H_conv*W_conv, C_in]
-        k = self.k_proj(X_flat).view(B, -1, self.num_heads, self.attn_dim).transpose(1, 2)  # [B, Heads, H*W, D_attn]
-        v = self.v_proj(X_flat).view(B, -1, self.num_heads, self.attn_dim).transpose(1, 2)
 
-        # Expand learned query across batch: [B, Heads, 1, D_attn]
-        q = self.player_query.expand(B, -1, -1, -1)
+        # Stage 1: Extract Player
+        q0 = self.player_query.expand(B, -1, -1)  # [B, 1, attn_total_dim]
+        z1, _ = self.mha1(query=q0, key=X_flat, value=X_flat, need_weights=False)
+        z1 = self.ln1(z1.squeeze(1))  # [B, attn_total_dim]
 
-        # Standard Scaled Dot-Product Attention
-        scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.attn_dim)  # [B, Heads, 1, H*W]
-        attn_probs = torch.softmax(scores, dim=-1)  # [B, Heads, 1, H*W]
+        # Stage 2: Query Hazards conditioned on dynamic Player State
+        q1 = z1.unsqueeze(1)  # [B, 1, attn_total_dim]
+        z2, _ = self.mha2(query=q1, key=X_flat, value=X_flat, need_weights=False)
+        z2 = self.ln2(z2.squeeze(1))  # [B, attn_total_dim]
 
-        context = (attn_probs @ v).reshape(B, -1)  # [B, Heads * D_attn]
+        # Concatenate player state and trajectory hazard context
+        combined = torch.cat([z1, z2], dim=-1)  # [B, 2 * attn_total_dim]
 
-        # Clean Linear Projection + LayerNorm + Dropout into GRU
-        X_proj = self.ln(self.out_proj(context))
+        # Linear Projection + LayerNorm + Dropout into GRU
+        X_proj = self.ln(self.out_proj(combined))
         X_proj = self.dropout(X_proj)
         return X_proj
 

@@ -14,7 +14,7 @@
         "learningRate": 0.0003,
         "weightDecay": 0.001,
         "maxGradNorm": 1.0,
-        "evalFreqSteps": 500,
+        "evalFreqSteps": 100,
         "valSteps": 50,
         "classWeights": [
             1.0,
