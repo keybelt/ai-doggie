@@ -143,11 +143,25 @@ def process_batch(
     logits, hidden_state = model(frames_norm, hidden_state)  # logits: [N, T, 2], hidden_state: [N, 1, D]
     hidden_state = hidden_state.detach()
 
-    # --- Phase 1a: 60Hz Coarse Mode ---
+    # --- Phase 1a: 60Hz Coarse Mode with Soft-WTA ---
     target_60 = target_actions_bin.max(dim=-1)[0]  # [N, T]
-    loss = F.cross_entropy(logits.transpose(1, 2), target_60, weight=CLASS_WEIGHTS)  # logits.transpose: [N, 2, T]
+    K, N, _, _ = logits.shape
 
-    probs = F.softmax(logits, dim=-1)  # [N, T, 2]
+    head_losses = torch.stack(
+        [
+            F.cross_entropy(logits[k].transpose(1, 2), target_60, weight=CLASS_WEIGHTS, reduction="none").mean(dim=1)
+            for k in range(K)
+        ]
+    )  # [K, N]
+
+    tau = CONFIG["training"]["wtaTau"]
+    weights = F.softmax(-head_losses / tau, dim=0).detach()  # [K, N]
+    loss = (weights * head_losses).sum(dim=0).mean()
+
+    best_head_idx = torch.argmin(head_losses, dim=0)  # [N]
+    best_logits = torch.stack([logits[best_head_idx[n], n] for n in range(N)])  # [N, T, 2]
+
+    probs = F.softmax(best_logits, dim=-1)  # [N, T, 2]
     entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
     # --- Phase 1b: 240Hz Subtick Control Mode ---
@@ -159,7 +173,7 @@ def process_batch(
     # probs = F.softmax(logits_240, dim=-1)
     # entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
 
-    return loss, hidden_state, entropy, logits, target_60
+    return loss, hidden_state, entropy, best_logits, target_60
 
 
 def prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:

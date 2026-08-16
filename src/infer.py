@@ -69,10 +69,16 @@ def run_inference_loop(model: Model, shm: SharedMemory):
                 torch.from_numpy(frame).unsqueeze(0).unsqueeze(0).to(device=DEVICE, dtype=torch.float32) / 255.0
             )
 
-            logits, hidden_state = model(frame_tensor, hidden_state)
-            actions = torch.argmax(logits.view(4, 2), dim=-1).cpu().tolist()
-            action_val = actions[0] | (actions[1] << 1) | (actions[2] << 2) | (actions[3] << 3)
-            acknowledge_handshake(shm, action_val)
+            # NOTE: Live inference is bypassed during Multi-Head WTA BC pretraining.
+            # Multi-head WTA serves as a representation learning pretraining tool for the CNN+GRU backbone.
+            # Live in-game inference will be resumed in Phase 2 once a single RL policy head is attached and fine-tuned.
+            #
+            # logits, hidden_state = model(frame_tensor, hidden_state)
+            # actions = torch.argmax(logits.view(4, 2), dim=-1).cpu().tolist()
+            # action_val = actions[0] | (actions[1] << 1) | (actions[2] << 2) | (actions[3] << 3)
+            # acknowledge_handshake(shm, action_val)
+
+            acknowledge_handshake(shm, 0)
 
             if i % log_interval == 0:
                 latency = (time.perf_counter() - time_start) * 1000

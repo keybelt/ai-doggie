@@ -48,8 +48,9 @@ class Model(nn.Module):
         self.out_proj = nn.Linear(2 * attn_total_dim, self.hidden_dim)
 
         # Temporal processing and output
+        self.num_policy_heads = CONFIG["model"]["numPolicyHeads"]
         self.gru = nn.GRU(self.hidden_dim, self.hidden_dim, batch_first=True)
-        self.policy_head = nn.Linear(self.hidden_dim, self.action_dim)
+        self.policy_heads = nn.Linear(self.hidden_dim, self.num_policy_heads * self.action_dim)
 
         # Pre-compute spatial CoordConv meshgrid buffers
         h, w = CONFIG["frame"]["height"], CONFIG["frame"]["width"]
@@ -127,6 +128,5 @@ class Model(nn.Module):
         gru_out, h = self.gru(X_proj, prev_h.transpose(0, 1).contiguous())  # [N, T, D]
 
         gru_out = gru_out + X_proj
-
-        logits = self.policy_head(gru_out.reshape(N * T, -1)).view(N, T, self.action_dim)
+        logits = self.policy_heads(gru_out).view(N, T, self.num_policy_heads, self.action_dim).permute(2, 0, 1, 3)
         return logits, h.transpose(0, 1).contiguous()
