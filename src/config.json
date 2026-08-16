@@ -9,7 +9,7 @@
         "batchSize": 16,
         "seqLen": 64,
         "accumulationSteps": 4,
-        "epochs": 15,
+        "epochs": 50,
         "learningRate": 0.0003,
         "maxGradNorm": 1.0,
         "evalFreqSteps": 100,
@@ -17,7 +17,10 @@
         "classWeights": [
             1.0,
             2.2759
-        ]
+        ],
+        "warmupRatio": 0.03,
+        "decayRatio": 0.07,
+        "minLrRatio": 0.01
     },
     "frame": {
         "width": 640,

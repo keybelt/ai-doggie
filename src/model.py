@@ -28,7 +28,7 @@ class Model(nn.Module):
 
         # Cascaded Two-Stage Cross-Attention pooling
         attn_total_dim = self.num_heads * self.attn_dim
-        self.player_query = nn.Parameter(torch.randn(1, 1, attn_total_dim) * 0.05)
+        self.player_query = nn.Parameter(torch.randn(1, 1, attn_total_dim) * 0.02)
 
         self.mha1 = nn.MultiheadAttention(
             embed_dim=attn_total_dim,

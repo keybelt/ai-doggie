@@ -1,4 +1,5 @@
 import json
+import math
 import random
 import sys
 import time
@@ -11,6 +12,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 from torch import Tensor
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.append(str(Path(__file__).resolve().parent))
@@ -190,28 +192,48 @@ def prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
     return train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch
 
 
+def get_wsd_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+) -> LambdaLR:
+    """Warmup-Stable-Decay Learning Rate Scheduler configured from CONFIG."""
+    warmup_ratio = CONFIG["training"]["warmupRatio"]
+    decay_ratio = CONFIG["training"]["decayRatio"]
+    min_lr_ratio = CONFIG["training"]["minLrRatio"]
+
+    warmup_steps = int(total_steps * warmup_ratio)
+    decay_steps = int(total_steps * decay_ratio)
+    stable_steps = total_steps - warmup_steps - decay_steps
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / warmup_steps
+        elif step < warmup_steps + stable_steps:
+            return 1.0
+        else:
+            decay_step = step - (warmup_steps + stable_steps)
+            progress = decay_step / decay_steps
+            progress = min(1.0, max(0.0, progress))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def init_model_and_optimizer(
     opt_steps_per_epoch: int,
-) -> tuple[Model, torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
-    """Instantiate Model, Adam optimizer, and OneCycleLR scheduler.
+) -> tuple[Model, torch.optim.Optimizer, LambdaLR]:
+    """Instantiate Model, Adam optimizer, and Warmup-Stable-Decay (WSD) scheduler.
 
     Returns:
         Tuple of (model, optimizer, scheduler).
     """
     model = Model().to(DEVICE)
     lr = CONFIG["training"]["learningRate"]
+    total_steps = CONFIG["training"]["epochs"] * opt_steps_per_epoch
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=lr,
-        epochs=CONFIG["training"]["epochs"],
-        steps_per_epoch=opt_steps_per_epoch,
-        pct_start=0.08,
-        div_factor=6.0,
-        final_div_factor=1000.0,
-        anneal_strategy="cos",
-    )
+    scheduler = get_wsd_scheduler(optimizer, total_steps=total_steps)
     return model, optimizer, scheduler
 
 
@@ -464,7 +486,7 @@ def train():
 
     wandb.init(
         project="ai-doggie",
-        name="15 epochs, 0 LN, 0 dropout, 0 wd, 8x32 attn",
+        name="more epochs + wsd scheduler",
         config=cfg_tr,
     )
     wandb.define_metric("epoch", hidden=True)
