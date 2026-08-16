@@ -264,7 +264,7 @@ def log_diagnostics(
     """Log training metrics, weight/gradient RMS values, and true Adam update ratios to WandB."""
     stats["global_step"] = state["global_step"]
     opt_steps = state["opt_steps"]
-    stats["epoch"] = (state["global_step"] / opt_steps) + 1.0
+    stats["epoch"] = state["global_step"] / opt_steps
     model = state["model"]
 
     with torch.no_grad():
