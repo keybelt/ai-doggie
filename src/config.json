@@ -7,19 +7,25 @@
         "numPolicyHeads": 8
     },
     "training": {
-        "batchSize": 16,
-        "seqLen": 64,
-        "accumulationSteps": 4,
-        "epochs": 50,
-        "learningRate": 0.0003,
+        "batchSize": 64,
+        "seqLen": 16,
+        "accumulationSteps": 2,
+        "epochs": 15,
+        "learningRate": 1e-3,
         "maxGradNorm": 1.0,
         "evalFreqSteps": 100,
-        "valSteps": 50,
         "classWeights": [
             1.0,
             2.2759
         ],
+        "timingToleranceWindows": [
+            1,
+            2,
+            3,
+            5
+        ],
         "wtaTau": 0.1,
+        "weightDecay": 0.01,
         "warmupRatio": 0.03,
         "decayRatio": 0.07,
         "minLrRatio": 0.01

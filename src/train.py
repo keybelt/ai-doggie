@@ -116,6 +116,33 @@ def preprocess_inputs(
     return frames_norm, target_actions_bin, hidden_state
 
 
+def compute_timing_tolerant_loss(
+    logits: Tensor,
+    target: Tensor,
+    window: int,
+    class_weights: Tensor,
+) -> Tensor:
+    """Compute cross-entropy loss with temporal variance tolerance window (+/- window frames).
+
+    Args:
+        logits: [..., T, 2]
+        target: [..., T]
+
+    Returns:
+        Tolerant loss tensor of shape [N].
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    ce_0 = -log_probs[..., 0] * class_weights[0]
+    ce_1 = -log_probs[..., 1] * class_weights[1]
+
+    k = 2 * window + 1
+    min_ce_1 = -F.max_pool1d(-ce_1.unsqueeze(1), kernel_size=k, stride=1, padding=window).squeeze(1)
+    target_has_pos = F.max_pool1d(target.float().unsqueeze(1), kernel_size=k, stride=1, padding=window).squeeze(1) > 0.5
+
+    loss_neg = torch.where(target_has_pos, torch.minimum(ce_0, ce_1), ce_0)
+    return torch.where(target == 1, min_ce_1, loss_neg).mean(dim=-1)
+
+
 def process_batch(
     model: Model,
     frames: Tensor,
@@ -237,16 +264,25 @@ def get_wsd_scheduler(
 def init_model_and_optimizer(
     opt_steps_per_epoch: int,
 ) -> tuple[Model, torch.optim.Optimizer, LambdaLR]:
-    """Instantiate Model, Adam optimizer, and Warmup-Stable-Decay (WSD) scheduler.
+    """Instantiate Model, AdamW optimizer, and Warmup-Stable-Decay (WSD) scheduler.
 
     Returns:
         Tuple of (model, optimizer, scheduler).
     """
     model = Model().to(DEVICE)
     lr = CONFIG["training"]["learningRate"]
+    weight_decay = CONFIG["training"]["weightDecay"]
     total_steps = CONFIG["training"]["epochs"] * opt_steps_per_epoch
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    decay_params = [p for p in model.parameters() if p.ndim >= 2]
+    no_decay_params = [p for p in model.parameters() if p.ndim < 2]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=lr,
+    )
     scheduler = get_wsd_scheduler(optimizer, total_steps=total_steps)
     return model, optimizer, scheduler
 
@@ -334,21 +370,23 @@ def optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor):
     state["global_step"] += 1
 
     if is_eval_step:
-        val_loss, val_entropy, val_prec, val_rec, val_f1, val_latency = run_val(state)
+        val_loss, val_entropy, val_prec, val_rec, val_f1, val_latency, val_tol_losses = run_val(state)
+        val_stats = {
+            "loss/train": loss.item(),
+            "entropy/train": entropy.item(),
+            "lr": scheduler.get_last_lr()[0],
+            "loss/val": val_loss,
+            "entropy/val": val_entropy,
+            "val/precision": val_prec,
+            "val/recall": val_rec,
+            "val/f1": val_f1,
+            "total_grad_norm": total_grad_norm,
+            "inf_latency_ms": val_latency,
+        }
+        val_stats.update(val_tol_losses)
         log_diagnostics(
             state=state,
-            stats={
-                "loss/train": loss.item(),
-                "entropy/train": entropy.item(),
-                "lr": scheduler.get_last_lr()[0],
-                "loss/val": val_loss,
-                "entropy/val": val_entropy,
-                "val/precision": val_prec,
-                "val/recall": val_rec,
-                "val/f1": val_f1,
-                "total_grad_norm": total_grad_norm,
-                "inf_latency_ms": val_latency,
-            },
+            stats=val_stats,
             grad_rms=grad_rms,
             update_ratios=update_ratios,
         )
@@ -390,22 +428,29 @@ def run_train_epoch(state: dict, steps: int) -> float:
     if num_batches % accum_steps != 0 and loss is not None:
         optimize_and_evaluate(state, loss, entropy)
 
-    return (train_loss_tensor.item() / num_batches) if num_batches > 0 else 0.0
+    return train_loss_tensor.item() / num_batches
 
 
-def run_val(state: dict) -> tuple[float, float, float, float, float, float]:
-    """Run validation steps and measure inference latency and classification metrics.
+def run_val(state: dict) -> tuple[float, float, float, float, float, float, dict[str, float]]:
+    """Run validation steps dynamically over full validation dataset with clean hidden state.
 
     Returns:
-        Tuple of (avg_val_loss, avg_val_entropy, precision, recall, f1, inference_latency_ms).
+        Tuple of (avg_val_loss, avg_val_entropy, precision, recall, f1, inference_latency_ms, tol_losses_dict).
     """
-    val_steps = CONFIG["training"]["valSteps"]
-    model, val_iter = state["model"], state["val_iter"]
+    model = state["model"]
+    val_loader = state["val_loader"]
+    val_steps = state["val_steps"]
+    batch_size = CONFIG["training"]["batchSize"]
+    windows = CONFIG["training"]["timingToleranceWindows"]
 
     model.eval()
+    val_iter = iter(val_loader)
+    val_hidden = torch.zeros(batch_size, 1, model.hidden_dim, device=DEVICE)
+
     num_batches = 0
     val_loss_tensor = torch.zeros(1, device=DEVICE)
     val_entropy_tensor = torch.zeros(1, device=DEVICE)
+    val_tol_loss_tensors = {w: torch.zeros(1, device=DEVICE) for w in windows}
 
     total_tp = 0.0
     total_fp = 0.0
@@ -419,15 +464,21 @@ def run_val(state: dict) -> tuple[float, float, float, float, float, float]:
                 break
             num_batches = i + 1
 
-            loss, state["val_hidden"], entropy, logits, target_60 = process_batch(
+            loss, val_hidden, entropy, logits, target_60 = process_batch(
                 model=model,
                 frames=frames,
                 actions_bin=actions_bin,
                 are_first=are_first,
-                hidden=state["val_hidden"],
+                hidden=val_hidden,
             )
             val_loss_tensor += loss.detach()
             val_entropy_tensor += entropy.detach()
+
+            for w in windows:
+                tol_loss_w = compute_timing_tolerant_loss(
+                    logits, target_60, window=w, class_weights=CLASS_WEIGHTS
+                ).mean()
+                val_tol_loss_tensors[w] += tol_loss_w.detach()
 
             preds = logits.argmax(dim=-1)  # [N, T]
             total_tp += ((preds == 1) & (target_60 == 1)).sum().item()
@@ -444,14 +495,16 @@ def run_val(state: dict) -> tuple[float, float, float, float, float, float]:
         torch.mps.synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    avg_val_loss = (val_loss_tensor.item() / num_batches) if num_batches > 0 else 0.0
-    avg_val_entropy = (val_entropy_tensor.item() / num_batches) if num_batches > 0 else 0.0
+    avg_val_loss = val_loss_tensor.item() / num_batches
+    avg_val_entropy = val_entropy_tensor.item() / num_batches
+
+    avg_tol_losses = {f"val/loss_tol_{w}f": val_tol_loss_tensors[w].item() / num_batches for w in windows}
 
     precision = total_tp / (total_tp + total_fp + 1e-9)
-    recall = total_tp / (total_tp + total_fn)
+    recall = total_tp / (total_tp + total_fn + 1e-9)
     f1 = (2 * precision * recall) / (precision + recall + 1e-9)
 
-    return avg_val_loss, avg_val_entropy, precision, recall, f1, elapsed_ms
+    return avg_val_loss, avg_val_entropy, precision, recall, f1, elapsed_ms, avg_tol_losses
 
 
 def save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None):
@@ -475,7 +528,7 @@ def train():
     batch_size = cfg_tr["batchSize"]
     epochs = cfg_tr["epochs"]
 
-    train_files, val_files, train_steps, _, opt_steps = prepare_data_files()
+    train_files, val_files, train_steps, val_steps, opt_steps = prepare_data_files()
 
     train_loader = DataLoader(DatasetGenerator(train_files, is_val=False), batch_size=None)
     val_loader = DataLoader(DatasetGenerator(val_files, is_val=True), batch_size=None)
@@ -488,11 +541,11 @@ def train():
         "optimizer": optimizer,
         "scheduler": scheduler,
         "train_iter": iter(train_loader),
-        "val_iter": iter(val_loader),
+        "val_loader": val_loader,
+        "val_steps": val_steps,
         "global_step": 0,
         "opt_steps": opt_steps,
         "train_hidden": torch.zeros(batch_size, 1, hidden_dim, device=DEVICE),
-        "val_hidden": torch.zeros(batch_size, 1, hidden_dim, device=DEVICE),
     }
 
     start_epoch = load_checkpoint(CONFIG["checkpointFile"], state)
@@ -500,7 +553,7 @@ def train():
 
     wandb.init(
         project="ai-doggie",
-        name="more epochs + wsd scheduler",
+        name="new val metric",
         config=cfg_tr,
     )
     wandb.define_metric("epoch", hidden=True)

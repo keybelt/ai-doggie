@@ -22,9 +22,12 @@ class Model(nn.Module):
 
         # 3-layer CNN backbone with CoordConv on first layer
         self.conv1 = nn.Conv2d(3 + 2, 32, kernel_size=5, stride=4)
+        self.gn1 = nn.GroupNorm(4, 32)
         self.conv2 = nn.Conv2d(32, 128, kernel_size=5, stride=4)
+        self.gn2 = nn.GroupNorm(8, 128)
         cnn_out_channels = 64
         self.conv3 = nn.Conv2d(128, cnn_out_channels, kernel_size=3, stride=2)
+        self.gn3 = nn.GroupNorm(8, cnn_out_channels)
 
         # Cascaded Two-Stage Cross-Attention pooling
         attn_total_dim = self.num_heads * self.attn_dim
@@ -37,6 +40,8 @@ class Model(nn.Module):
             vdim=cnn_out_channels,
             batch_first=True,
         )
+        self.ln1 = nn.LayerNorm(attn_total_dim)
+
         self.mha2 = nn.MultiheadAttention(
             embed_dim=attn_total_dim,
             num_heads=self.num_heads,
@@ -44,8 +49,10 @@ class Model(nn.Module):
             vdim=cnn_out_channels,
             batch_first=True,
         )
+        self.ln2 = nn.LayerNorm(attn_total_dim)
 
         self.out_proj = nn.Linear(2 * attn_total_dim, self.hidden_dim)
+        self.ln = nn.LayerNorm(self.hidden_dim)
 
         # Temporal processing and output
         self.num_policy_heads = CONFIG["model"]["numPolicyHeads"]
@@ -73,9 +80,9 @@ class Model(nn.Module):
         x = self.x_coords.expand(batch_size, 1, h, w)
         X = torch.cat([X, y, x], dim=1)
 
-        X = F.gelu(self.conv1(X))
-        X = F.gelu(self.conv2(X))
-        X = F.gelu(self.conv3(X))
+        X = F.gelu(self.gn1(self.conv1(X)))
+        X = F.gelu(self.gn2(self.conv2(X)))
+        X = F.gelu(self.gn3(self.conv3(X)))
         return X
 
     def cross_attention_pooling(self, X_conv: Tensor) -> Tensor:
@@ -94,18 +101,18 @@ class Model(nn.Module):
         # Stage 1: Extract Player
         q0 = self.player_query.expand(B, -1, -1)  # [B, 1, attn_total_dim]
         z1, _ = self.mha1(query=q0, key=X_flat, value=X_flat, need_weights=False)
-        z1 = z1.squeeze(1)  # [B, attn_total_dim]
+        z1 = self.ln1(z1.squeeze(1))  # [B, attn_total_dim]
 
         # Stage 2: Query Hazards conditioned on dynamic Player State
         q1 = z1.unsqueeze(1)  # [B, 1, attn_total_dim]
         z2, _ = self.mha2(query=q1, key=X_flat, value=X_flat, need_weights=False)
-        z2 = z2.squeeze(1)  # [B, attn_total_dim]
+        z2 = self.ln2(z2.squeeze(1))  # [B, attn_total_dim]
 
         # Concatenate player state and trajectory hazard context
         combined = torch.cat([z1, z2], dim=-1)  # [B, 2 * attn_total_dim]
 
-        # Linear Projection into GRU
-        X_proj = self.out_proj(combined)
+        # Linear Projection + LayerNorm into GRU
+        X_proj = self.ln(self.out_proj(combined))
         return X_proj
 
     def forward(self, X: Tensor, prev_h: Tensor) -> tuple[Tensor, Tensor]:
@@ -127,6 +134,5 @@ class Model(nn.Module):
 
         gru_out, h = self.gru(X_proj, prev_h.transpose(0, 1).contiguous())  # [N, T, D]
 
-        gru_out = gru_out + X_proj
         logits = self.policy_heads(gru_out).view(N, T, self.num_policy_heads, self.action_dim).permute(2, 0, 1, 3)
         return logits, h.transpose(0, 1).contiguous()
