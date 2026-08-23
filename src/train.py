@@ -170,23 +170,31 @@ def process_batch(
     logits, hidden_state = model(frames_norm, hidden_state)  # logits: [N, T, 2], hidden_state: [N, 1, D]
     hidden_state = hidden_state.detach()
 
-    # --- Phase 1a: 60Hz Coarse Mode with Soft-WTA ---
+    # --- Phase 1a: 60Hz Coarse Mode with Sub-Block Soft-WTA ---
     target_60 = target_actions_bin.max(dim=-1)[0]  # [N, T]
-    K, N, _, _ = logits.shape
+    K, N, T, C = logits.shape
 
-    head_losses = torch.stack(
+    sub_len = CONFIG["training"]["subLen"]
+    num_blocks = T // sub_len
+
+    ce = torch.stack(
         [
-            F.cross_entropy(logits[k].transpose(1, 2), target_60, weight=CLASS_WEIGHTS, reduction="none").mean(dim=1)
+            F.cross_entropy(logits[k].transpose(1, 2), target_60, weight=CLASS_WEIGHTS, reduction="none")
             for k in range(K)
         ]
-    )  # [K, N]
+    )  # [K, N, T]
+
+    ce_blocks = ce.view(K, N, num_blocks, sub_len)
+    block_losses = ce_blocks.mean(dim=-1)  # [K, N, num_blocks]
 
     tau = CONFIG["training"]["wtaTau"]
-    weights = F.softmax(-head_losses / tau, dim=0).detach()  # [K, N]
-    loss = (weights * head_losses).sum(dim=0).mean()
+    weights = F.softmax(-block_losses / tau, dim=0).detach()  # [K, N, num_blocks]
+    loss = (weights * block_losses).sum(dim=0).mean()
 
-    best_head_idx = torch.argmin(head_losses, dim=0)  # [N]
-    best_logits = torch.stack([logits[best_head_idx[n], n] for n in range(N)])  # [N, T, 2]
+    best_head_idx = torch.argmin(block_losses, dim=0)  # [N, num_blocks]
+    logits_blocks = logits.view(K, N, num_blocks, sub_len, C)
+    idx_expanded = best_head_idx.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand(1, N, num_blocks, sub_len, C)
+    best_logits = torch.gather(logits_blocks, 0, idx_expanded).squeeze(0).view(N, T, C)  # [N, T, 2]
 
     probs = F.softmax(best_logits, dim=-1)  # [N, T, 2]
     entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
@@ -553,7 +561,7 @@ def train():
 
     wandb.init(
         project="ai-doggie",
-        name="new val metric",
+        name="new loss!",
         config=cfg_tr,
     )
     wandb.define_metric("epoch", hidden=True)

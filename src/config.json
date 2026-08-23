@@ -7,9 +7,10 @@
         "numPolicyHeads": 8
     },
     "training": {
-        "batchSize": 64,
-        "seqLen": 16,
-        "accumulationSteps": 2,
+        "batchSize": 16,
+        "seqLen": 64,
+        "subLen": 16,
+        "accumulationSteps": 8,
         "epochs": 15,
         "learningRate": 1e-3,
         "maxGradNorm": 1.0,
