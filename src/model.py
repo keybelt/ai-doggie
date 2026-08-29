@@ -11,7 +11,7 @@ with CONFIG_PATH.open() as f:
 
 
 class Model(nn.Module):
-    """CNN + GRU policy model with learned-query cross-attention pooling."""
+    """CNN + GRU policy value model with learned-query cross-attention pooling."""
 
     def __init__(self):
         super().__init__()
@@ -54,10 +54,9 @@ class Model(nn.Module):
         self.out_proj = nn.Linear(2 * attn_total_dim, self.hidden_dim)
         self.ln = nn.LayerNorm(self.hidden_dim)
 
-        # Temporal processing and output
-        self.num_policy_heads = CONFIG["model"]["numPolicyHeads"]
+        # Temporal processing and continuous value output head
         self.gru = nn.GRU(self.hidden_dim, self.hidden_dim, batch_first=True)
-        self.policy_heads = nn.Linear(self.hidden_dim, self.num_policy_heads * self.action_dim)
+        self.value_head = nn.Linear(self.hidden_dim, self.action_dim)
 
         # Pre-compute spatial CoordConv meshgrid buffers
         h, w = CONFIG["frame"]["height"], CONFIG["frame"]["width"]
@@ -116,14 +115,14 @@ class Model(nn.Module):
         return X_proj
 
     def forward(self, X: Tensor, prev_h: Tensor) -> tuple[Tensor, Tensor]:
-        """Pass inputs through CNN + GRU + policy head.
+        """Pass inputs through CNN + GRU + value head.
 
         Args:
             X: [N, T, H, W, C]
             prev_h: [N, L, D]
 
         Returns:
-            Logits and new hidden state of shapes [N, T, V] and [N, L, D].
+            Predicted action Q-values and new hidden state of shapes [N, T, 2] and [N, L, D].
         """
         N, T, H, W, C = X.shape
 
@@ -134,5 +133,5 @@ class Model(nn.Module):
 
         gru_out, h = self.gru(X_proj, prev_h.transpose(0, 1).contiguous())  # [N, T, D]
 
-        logits = self.policy_heads(gru_out).view(N, T, self.num_policy_heads, self.action_dim).permute(2, 0, 1, 3)
-        return logits, h.transpose(0, 1).contiguous()
+        q_values = self.value_head(gru_out)  # [N, T, 2]
+        return q_values, h.transpose(0, 1).contiguous()

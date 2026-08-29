@@ -1,6 +1,8 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -9,15 +11,18 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
-#include <unistd.h>
+#include <unistd>
+#include <utility>
 
 using namespace geode::prelude;
 
 struct SharedData {
-  volatile int32_t frameIdx;
-  volatile int32_t currActionBin;
+  volatile int32_t frameIdx;   // 60Hz frame counter
+  volatile int32_t currAction; // 0 = Release, 1 = Jump
   volatile int32_t frameReadyBin;
   volatile int32_t actionReadyBin;
+  volatile int32_t ttdRelease;
+  volatile int32_t ttdHold;
   uint8_t frameBuffer[640 * 480 * 3]; // 921,600 bytes
 };
 
@@ -32,7 +37,7 @@ void initShm() {
   if (data)
     return;
 
-  // 0_RDWR is read/write, 0666 is read/write for owner, group, and others.
+  // O_RDWR is read/write, 0666 is read/write for owner, group, and others.
   fileDescriptor = shm_open(("/" + shmName).c_str(), O_RDWR, 0666);
 
   if (fileDescriptor != -1) {
@@ -43,7 +48,7 @@ void initShm() {
       fileDescriptor = -1;
     }
   }
-};
+}
 
 /// Unmap the shared memory and reset values.
 void closeShm() {
@@ -57,7 +62,108 @@ void closeShm() {
   data = nullptr;
 }
 
-/// Injects shared memory logic into game loop.
+namespace TrajectorySim {
+static PlayerObject *s_clonePlayer = nullptr;
+static bool s_simulating = false;
+static bool s_simulationDead = false;
+
+inline bool isSimulating() { return s_simulating; }
+
+inline bool handleSimulationDeath(PlayerObject *player) {
+  if (s_simulating && player == s_clonePlayer) {
+    s_simulationDead = true;
+    return true;
+  }
+  return false;
+}
+
+void init(PlayLayer *pl) {
+  if (!pl || s_clonePlayer)
+    return;
+
+  s_clonePlayer = PlayerObject::create(1, 1, pl, pl, true);
+  if (!s_clonePlayer)
+    return;
+
+  s_clonePlayer->retain();
+  s_clonePlayer->setPosition({0, 105});
+  s_clonePlayer->setVisible(false);
+  if (pl->m_objectLayer) {
+    pl->m_objectLayer->addChild(s_clonePlayer);
+  }
+}
+
+void cleanup() {
+  if (s_clonePlayer) {
+    s_clonePlayer->removeFromParent();
+    s_clonePlayer->release();
+    s_clonePlayer = nullptr;
+  }
+}
+
+int simulateBranch(PlayLayer *pl, PlayerObject *realPlayer, bool isHold, int horizon, float dt) {
+  if (!s_clonePlayer || !realPlayer || !pl)
+    return horizon;
+
+  s_simulationDead = false;
+
+  s_clonePlayer->copyAttributes(realPlayer);
+  s_clonePlayer->setPosition(realPlayer->getPosition());
+  s_clonePlayer->m_yAccel = realPlayer->m_yAccel;
+  s_clonePlayer->m_xAccel = realPlayer->m_xAccel;
+  s_clonePlayer->m_isUpsideDown = realPlayer->m_isUpsideDown;
+  s_clonePlayer->m_gravityMod = realPlayer->m_gravityMod;
+  s_clonePlayer->m_isOnGround = realPlayer->m_isOnGround;
+  s_clonePlayer->m_playerSpeed = realPlayer->m_playerSpeed;
+  s_clonePlayer->m_vehicleSize = realPlayer->m_vehicleSize;
+
+  if (isHold) {
+    s_clonePlayer->pushButton(PlayerButton::Jump);
+  } else {
+    s_clonePlayer->releaseButton(PlayerButton::Jump);
+  }
+
+  for (int step = 0; step < horizon; ++step) {
+    if (s_clonePlayer->m_collisionLogTop)
+      s_clonePlayer->m_collisionLogTop->removeAllObjects();
+    if (s_clonePlayer->m_collisionLogBottom)
+      s_clonePlayer->m_collisionLogBottom->removeAllObjects();
+    if (s_clonePlayer->m_collisionLogLeft)
+      s_clonePlayer->m_collisionLogLeft->removeAllObjects();
+    if (s_clonePlayer->m_collisionLogRight)
+      s_clonePlayer->m_collisionLogRight->removeAllObjects();
+
+    pl->checkCollisions(s_clonePlayer, dt, false);
+    if (s_simulationDead) {
+      return step;
+    }
+
+    s_clonePlayer->update(dt);
+  }
+
+  return horizon;
+}
+
+std::pair<int32_t, int32_t> computeTTD(PlayLayer *pl, int horizon = 120) {
+  if (!pl || !pl->m_player1 || !s_clonePlayer) {
+    return {horizon, horizon};
+  }
+
+  s_simulating = true;
+  float dt = 1.0f / 240.0f;
+  if (pl->m_gameState.m_timeWarp > 0.0f) {
+    dt = (1.0f / 240.0f) / pl->m_gameState.m_timeWarp;
+  }
+
+  int32_t ttdRelease = simulateBranch(pl, pl->m_player1, false, horizon, dt);
+  int32_t ttdHold = simulateBranch(pl, pl->m_player1, true, horizon, dt);
+
+  s_simulating = false;
+  return {ttdRelease, ttdHold};
+}
+} // namespace TrajectorySim
+
+/// Injects shared memory logic and simulator lifecycle into game loop.
 class $modify(MyPlayLayer, PlayLayer) {
   bool init(GJGameLevel *level, bool useReplay, bool dontCreateObjects) {
     if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
@@ -65,6 +171,7 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     initShm();
+    TrajectorySim::init(this);
     isJumping = false;
     lastFrameIdx = -1;
     return true;
@@ -76,14 +183,86 @@ class $modify(MyPlayLayer, PlayLayer) {
     lastFrameIdx = -1;
   }
 
+  void destroyPlayer(PlayerObject *player, GameObject *gameObject) {
+    if (TrajectorySim::handleSimulationDeath(player)) {
+      return;
+    }
+    PlayLayer::destroyPlayer(player, gameObject);
+  }
+
+  void flipGravity(PlayerObject *player, bool p1, bool p2) {
+    if (TrajectorySim::isSimulating()) {
+      if (player) {
+        player->m_isUpsideDown = !player->m_isUpsideDown;
+        player->m_gravityMod = -player->m_gravityMod;
+      }
+      return;
+    }
+    PlayLayer::flipGravity(player, p1, p2);
+  }
+
   void onQuit() {
+    TrajectorySim::cleanup();
     closeShm();
     PlayLayer::onQuit();
   }
 };
 
-/// Override all the jumping logic.
+class $modify(MyPlayerObject, PlayerObject) {
+  void ringJump(RingObject *ring, bool p1) {
+    if (TrajectorySim::isSimulating()) {
+      if (ring) {
+        this->m_yAccel = ring->m_jumpBoost;
+      }
+      return;
+    }
+    PlayerObject::ringJump(ring, p1);
+  }
+};
+
+class $modify(MyEffectGameObject, EffectGameObject) {
+  void triggerObject(GJBaseGameLayer *layer, int p1, const gd::vector<int> *p2) {
+    if (TrajectorySim::isSimulating())
+      return;
+    EffectGameObject::triggerObject(layer, p1, p2);
+  }
+};
+
+/// Override jumping and collision logic.
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
+  bool canBeActivatedByPlayer(PlayerObject *p0, EffectGameObject *p1) {
+    if (TrajectorySim::isSimulating())
+      return false;
+    return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
+  }
+
+  void collisionCheckObjects(PlayerObject *player, gd::vector<GameObject *> *vec, int objectsCount, float dt) {
+    if (TrajectorySim::isSimulating()) {
+      gd::vector<GameObject *> extra;
+      extra.reserve(objectsCount);
+      for (int i = 0; i < objectsCount; i++) {
+        GameObject *obj = vec->at(i);
+        if (obj->m_objectType == GameObjectType::Solid || 
+            obj->m_objectType == GameObjectType::Hazard ||
+            obj->m_objectType == GameObjectType::AnimatedHazard || 
+            obj->m_objectType == GameObjectType::Slope ||
+            obj->m_objectType == GameObjectType::JumpPad ||
+            obj->m_objectType == GameObjectType::Modifier) {
+          extra.push_back(obj);
+        }
+      }
+      GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
+      return;
+    }
+    GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
+  }
+
+  void playerTouchedRing(PlayerObject *player, RingObject *ring) {
+    if (TrajectorySim::isSimulating())
+      return;
+    GJBaseGameLayer::playerTouchedRing(player, ring);
+  }
+
   void simulateClick(PlayerButton button, bool down, bool player2) {
     auto isClick = down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
 
@@ -119,34 +298,36 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
         return;
     }
 
-    // 2.208 made m_currentProgress count twice as fast, for now we just divide it by 2
-    int frameIdx = m_gameState.m_currentProgress / 2;
-    if (frameIdx == lastFrameIdx)
+    // GD 2.208 advances m_currentProgress by 8 per 60Hz frame (2 per 240Hz tick)
+    int frame60Idx = (m_gameState.m_currentProgress / 2) / 4;
+    if (frame60Idx == lastFrameIdx)
       return;
-    lastFrameIdx = frameIdx;
-    data->frameIdx = frameIdx;
+    lastFrameIdx = frame60Idx;
+    data->frameIdx = frame60Idx;
 
-    if (frameIdx % 4 == 0) {
-      // Capture 640x480 screen pixels from Cocos2d-x frame buffer
-      glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
+    // Compute Time-To-Death (TTD) for Release and Hold
+    auto [ttdRelease, ttdHold] = TrajectorySim::computeTTD(PlayLayer::get(), 120);
+    data->ttdRelease = ttdRelease;
+    data->ttdHold = ttdHold;
 
-      data->actionReadyBin = 0;
-      std::atomic_thread_fence(std::memory_order_release);
-      data->frameReadyBin = 1;
+    // Capture 640x480 screen pixels from Cocos2d-x frame buffer at 60Hz
+    glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
 
-      auto start = std::chrono::steady_clock::now();
+    data->actionReadyBin = 0;
+    std::atomic_thread_fence(std::memory_order_release);
+    data->frameReadyBin = 1;
 
-      // TODO: make timeout indefinite for macro recording, only enforce 60hz for inference
-      while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(8)) {
-        if (data->actionReadyBin != 0) {
-          break;
-        }
-        std::this_thread::yield();
+    auto start = std::chrono::steady_clock::now();
+
+    // TODO: make timeout indefinite for macro recording, only enforce 60hz for inference
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(8)) {
+      if (data->actionReadyBin != 0) {
+        break;
       }
+      std::this_thread::yield();
     }
 
-    bool shouldJump = ((data->currActionBin >> (frameIdx % 4)) & 1);
-
+    bool shouldJump = (data->currAction == 1);
     if (shouldJump && !isJumping) {
       simulateClick(PlayerButton::Jump, true, false);
       isJumping = true;
