@@ -69,6 +69,7 @@ static bool s_simulationDead = false;
 static bool s_isHold = false;
 static float s_frameDt = 1.0f / 240.0f;
 static std::vector<RingObject *> s_activatedRings;
+static std::vector<EffectGameObject *> s_activatedEffects;
 
 inline bool isSimulating() { return s_simulating; }
 inline bool isHold() { return s_isHold; }
@@ -99,13 +100,26 @@ inline void trackActivatedRing(RingObject *ring) {
 
 inline void restoreActivatedRings() {
   for (auto *ring : s_activatedRings) {
-    if (ring) {
-      ring->m_activated = false;
-      ring->m_activatedByPlayer1 = false;
-      ring->m_activatedByPlayer2 = false;
-    }
+    ring->m_activated = false;
+    ring->m_activatedByPlayer1 = false;
+    ring->m_activatedByPlayer2 = false;
   }
   s_activatedRings.clear();
+}
+
+inline void trackActivatedEffect(EffectGameObject *effect) {
+  if (s_simulating && effect) {
+    s_activatedEffects.push_back(effect);
+  }
+}
+
+inline void restoreActivatedEffects() {
+  for (auto *effect : s_activatedEffects) {
+    effect->m_activated = false;
+    effect->m_activatedByPlayer1 = false;
+    effect->m_activatedByPlayer2 = false;
+  }
+  s_activatedEffects.clear();
 }
 
 void init(PlayLayer *pl) {
@@ -173,6 +187,7 @@ int simulateBranch(PlayLayer *pl, PlayerObject *realPlayer, bool isHold, int hor
   }
 
   restoreActivatedRings();
+  restoreActivatedEffects();
   return result;
 }
 
@@ -273,7 +288,7 @@ class $modify(MyEffectGameObject, EffectGameObject) {
 };
 
 class $modify(MyCCNode, cocos2d::CCNode) {
-  cocos2d::CCAction* runAction(cocos2d::CCAction* action) {
+  cocos2d::CCAction *runAction(cocos2d::CCAction *action) {
     if (TrajectorySim::isSimulating())
       return nullptr;
     return cocos2d::CCNode::runAction(action);
@@ -327,6 +342,41 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
       return;
     }
     GJBaseGameLayer::playerTouchedRing(player, ring);
+  }
+
+  void playerTouchedTrigger(PlayerObject *player, EffectGameObject *trigger) {
+    if (TrajectorySim::isSimulating()) {
+      TrajectorySim::trackActivatedEffect(trigger);
+      if (trigger && !trigger->m_activatedByPlayer1 && trigger->m_speedModType > 0) {
+        // Native GD speed portal constants from EffectGameObject::updateSpeedModType:
+        // 1 = 0.5x (Slow), 2 = 1.0x (Normal), 3 = 2.0x (Fast), 4 = 3.0x (Very Fast), 5 = 4.0x (Fastest)
+        float speed = 0.9f;
+        switch (trigger->m_speedModType) {
+        case 1:
+          speed = 0.7f; // 0.5x speed
+          break;
+        case 2:
+          speed = 0.9f; // 1.0x speed
+          break;
+        case 3:
+          speed = 1.1f; // 2.0x speed
+          break;
+        case 4:
+          speed = 1.3f; // 3.0x speed
+          break;
+        case 5:
+          speed = 1.6f; // 4.0x speed
+          break;
+        default:
+          speed = 0.9f;
+          break;
+        }
+        player->updateTimeMod(speed, true);
+      }
+      GJBaseGameLayer::playerTouchedTrigger(player, trigger);
+      return;
+    }
+    GJBaseGameLayer::playerTouchedTrigger(player, trigger);
   }
 
   void simulateClick(PlayerButton button, bool down, bool player2) {
