@@ -1,17 +1,16 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/GameObject.hpp>
+#include <Geode/modify/HardStreak.hpp>
+#include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 
-#include <atomic>
-#include <chrono>
 #include <fcntl.h>
-#include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <thread>
-#include <unistd>
+#include <unistd.h>
 #include <utility>
 
 using namespace geode::prelude;
@@ -68,6 +67,7 @@ static bool s_simulating = false;
 static bool s_simulationDead = false;
 
 inline bool isSimulating() { return s_simulating; }
+inline PlayerObject *getClonePlayer() { return s_clonePlayer; }
 
 inline bool handleSimulationDeath(PlayerObject *player) {
   if (s_simulating && player == s_clonePlayer) {
@@ -106,16 +106,12 @@ int simulateBranch(PlayLayer *pl, PlayerObject *realPlayer, bool isHold, int hor
     return horizon;
 
   s_simulationDead = false;
+  s_clonePlayer->m_isDead = false;
 
   s_clonePlayer->copyAttributes(realPlayer);
-  s_clonePlayer->setPosition(realPlayer->getPosition());
-  s_clonePlayer->m_yAccel = realPlayer->m_yAccel;
-  s_clonePlayer->m_xAccel = realPlayer->m_xAccel;
-  s_clonePlayer->m_isUpsideDown = realPlayer->m_isUpsideDown;
+  s_clonePlayer->setVisible(false);
   s_clonePlayer->m_gravityMod = realPlayer->m_gravityMod;
   s_clonePlayer->m_isOnGround = realPlayer->m_isOnGround;
-  s_clonePlayer->m_playerSpeed = realPlayer->m_playerSpeed;
-  s_clonePlayer->m_vehicleSize = realPlayer->m_vehicleSize;
 
   if (isHold) {
     s_clonePlayer->pushButton(PlayerButton::Jump);
@@ -132,6 +128,7 @@ int simulateBranch(PlayLayer *pl, PlayerObject *realPlayer, bool isHold, int hor
       s_clonePlayer->m_collisionLogLeft->removeAllObjects();
     if (s_clonePlayer->m_collisionLogRight)
       s_clonePlayer->m_collisionLogRight->removeAllObjects();
+    s_clonePlayer->m_touchedRings.clear();
 
     pl->checkCollisions(s_clonePlayer, dt, false);
     if (s_simulationDead) {
@@ -152,7 +149,7 @@ std::pair<int32_t, int32_t> computeTTD(PlayLayer *pl, int horizon = 120) {
   s_simulating = true;
   float dt = 1.0f / 240.0f;
   if (pl->m_gameState.m_timeWarp > 0.0f) {
-    dt = (1.0f / 240.0f) / pl->m_gameState.m_timeWarp;
+    dt = (1.0f / 240.0f) * pl->m_gameState.m_timeWarp;
   }
 
   int32_t ttdRelease = simulateBranch(pl, pl->m_player1, false, horizon, dt);
@@ -201,6 +198,12 @@ class $modify(MyPlayLayer, PlayLayer) {
     PlayLayer::flipGravity(player, p1, p2);
   }
 
+  void playEndAnimationToPos(cocos2d::CCPoint p0) {
+    if (TrajectorySim::isSimulating())
+      return;
+    PlayLayer::playEndAnimationToPos(p0);
+  }
+
   void onQuit() {
     TrajectorySim::cleanup();
     closeShm();
@@ -208,15 +211,27 @@ class $modify(MyPlayLayer, PlayLayer) {
   }
 };
 
-class $modify(MyPlayerObject, PlayerObject) {
-  void ringJump(RingObject *ring, bool p1) {
-    if (TrajectorySim::isSimulating()) {
-      if (ring) {
-        this->m_yAccel = ring->m_jumpBoost;
-      }
+class $modify(MyLevelEditorLayer, LevelEditorLayer) {
+  bool init(GJGameLevel *level, bool unk) {
+    bool result = LevelEditorLayer::init(level, unk);
+    TrajectorySim::cleanup();
+    return result;
+  }
+};
+
+class $modify(MyHardStreak, HardStreak) {
+  void addPoint(cocos2d::CCPoint p0) {
+    if (TrajectorySim::isSimulating())
       return;
-    }
-    PlayerObject::ringJump(ring, p1);
+    HardStreak::addPoint(p0);
+  }
+};
+
+class $modify(MyGameObject, GameObject) {
+  void playShineEffect() {
+    if (TrajectorySim::isSimulating())
+      return;
+    GameObject::playShineEffect();
   }
 };
 
@@ -228,7 +243,32 @@ class $modify(MyEffectGameObject, EffectGameObject) {
   }
 };
 
-/// Override jumping and collision logic.
+class $modify(MyPlayerObject, PlayerObject) {
+  void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
+    if (TrajectorySim::isSimulating())
+      return;
+    PlayerObject::playSpiderDashEffect(from, to);
+  }
+
+  void incrementJumps() {
+    if (TrajectorySim::isSimulating())
+      return;
+    PlayerObject::incrementJumps();
+  }
+
+  void ringJump(RingObject *ring, bool p1) {
+    if (TrajectorySim::isSimulating()) {
+      PlayerObject::ringJump(ring, p1);
+      ring->m_activated = false;
+      ring->m_activatedByPlayer1 = false;
+      ring->m_activatedByPlayer2 = false;
+      return;
+    }
+    PlayerObject::ringJump(ring, p1);
+  }
+};
+
+/// Override jumping and input processing.
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
   bool canBeActivatedByPlayer(PlayerObject *p0, EffectGameObject *p1) {
     if (TrajectorySim::isSimulating())
@@ -238,28 +278,39 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
 
   void collisionCheckObjects(PlayerObject *player, gd::vector<GameObject *> *vec, int objectsCount, float dt) {
     if (TrajectorySim::isSimulating()) {
-      gd::vector<GameObject *> extra;
-      extra.reserve(objectsCount);
+      gd::vector<GameObject *> simObjects;
+      simObjects.reserve(objectsCount);
       for (int i = 0; i < objectsCount; i++) {
         GameObject *obj = vec->at(i);
-        if (obj->m_objectType == GameObjectType::Solid || 
-            obj->m_objectType == GameObjectType::Hazard ||
-            obj->m_objectType == GameObjectType::AnimatedHazard || 
-            obj->m_objectType == GameObjectType::Slope ||
-            obj->m_objectType == GameObjectType::JumpPad ||
-            obj->m_objectType == GameObjectType::Modifier) {
-          extra.push_back(obj);
+        auto type = obj->m_objectType;
+
+        if (type == GameObjectType::Solid || type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard ||
+            type == GameObjectType::Slope || type == GameObjectType::Breakable ||
+            type == GameObjectType::YellowJumpPad || type == GameObjectType::PinkJumpPad ||
+            type == GameObjectType::GravityPad || type == GameObjectType::RedJumpPad ||
+            type == GameObjectType::SpiderPad || type == GameObjectType::YellowJumpRing ||
+            type == GameObjectType::PinkJumpRing || type == GameObjectType::GravityRing ||
+            type == GameObjectType::GreenRing || type == GameObjectType::DropRing ||
+            type == GameObjectType::RedJumpRing || type == GameObjectType::CustomRing ||
+            type == GameObjectType::DashRing || type == GameObjectType::GravityDashRing ||
+            type == GameObjectType::SpiderOrb || type == GameObjectType::TeleportOrb ||
+            type == GameObjectType::InverseGravityPortal || type == GameObjectType::NormalGravityPortal) {
+          simObjects.push_back(obj);
         }
       }
-      GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
+
+      GJBaseGameLayer::collisionCheckObjects(player, &simObjects, simObjects.size(), dt);
       return;
     }
+
     GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
   }
 
   void playerTouchedRing(PlayerObject *player, RingObject *ring) {
-    if (TrajectorySim::isSimulating())
+    if (TrajectorySim::isSimulating()) {
+      player->m_touchedRings.insert(ring->m_uniqueID);
       return;
+    }
     GJBaseGameLayer::playerTouchedRing(player, ring);
   }
 

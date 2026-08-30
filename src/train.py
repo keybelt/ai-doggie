@@ -36,8 +36,8 @@ def compute_q_targets(ttd: Tensor) -> Tensor:
     Returns:
         Normalized discounted Q-value targets of shape [..., 2] in range [0, 1].
     """
-    gamma = CONFIG["training"]["ttdGamma"]
-    horizon = CONFIG["training"]["ttdHorizon"]
+    gamma = CONFIG["data"]["ttdGamma"]
+    horizon = CONFIG["data"]["ttdHorizon"]
     max_return = 1.0 - (gamma**horizon)
     return (1.0 - torch.pow(gamma, ttd.float())) / max_return
 

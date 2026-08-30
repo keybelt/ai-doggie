@@ -5,17 +5,19 @@
         "numHeads": 8,
         "actionDim": 2
     },
+    "data": {
+        "ttdGamma": 0.95,
+        "ttdHorizon": 240,
+        "recordingBufferSize": 50000
+    },
     "training": {
         "batchSize": 16,
         "seqLen": 64,
-        "subLen": 16,
         "accumulationSteps": 4,
-        "epochs": 51,
+        "epochs": 50,
         "learningRate": 1e-3,
         "maxGradNorm": 1.0,
         "evalFreqSteps": 100,
-        "ttdGamma": 0.95,
-        "ttdHorizon": 120,
         "weightDecay": 0.01,
         "warmupRatio": 0.04,
         "decayRatio": 0.1176,
@@ -25,7 +27,7 @@
         "width": 640,
         "height": 480
     },
-    "checkpointFile": "checkpoints/epoch_45.pt",
+    "checkpointFile": "",
     "keys": {
         "exitKeyName": "backspace",
         "recordKeyName": "space"

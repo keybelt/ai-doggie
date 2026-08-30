@@ -19,7 +19,7 @@ with CONFIG_PATH.open() as f:
 
 # Implementation Constants
 TARGET_FPS = 60
-RECORDING_BUFFER_SIZE = 50000
+RECORDING_BUFFER_SIZE = CONFIG["data"]["recordingBufferSize"]
 
 
 def parse_macro_file(filepath: Path) -> dict:
