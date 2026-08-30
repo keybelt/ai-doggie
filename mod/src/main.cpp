@@ -1,4 +1,5 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/CCNode.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/GameObject.hpp>
@@ -65,9 +66,22 @@ namespace TrajectorySim {
 static PlayerObject *s_clonePlayer = nullptr;
 static bool s_simulating = false;
 static bool s_simulationDead = false;
+static bool s_isHold = false;
+static float s_frameDt = 1.0f / 240.0f;
+static std::vector<RingObject *> s_activatedRings;
 
 inline bool isSimulating() { return s_simulating; }
+inline bool isHold() { return s_isHold; }
 inline PlayerObject *getClonePlayer() { return s_clonePlayer; }
+
+inline void setFrameDelta(float dt) {
+  PlayLayer *pl = PlayLayer::get();
+  if (pl && pl->m_gameState.m_timeWarp > 0.0f) {
+    s_frameDt = dt / pl->m_gameState.m_timeWarp;
+  } else {
+    s_frameDt = dt;
+  }
+}
 
 inline bool handleSimulationDeath(PlayerObject *player) {
   if (s_simulating && player == s_clonePlayer) {
@@ -75,6 +89,23 @@ inline bool handleSimulationDeath(PlayerObject *player) {
     return true;
   }
   return false;
+}
+
+inline void trackActivatedRing(RingObject *ring) {
+  if (s_simulating && ring) {
+    s_activatedRings.push_back(ring);
+  }
+}
+
+inline void restoreActivatedRings() {
+  for (auto *ring : s_activatedRings) {
+    if (ring) {
+      ring->m_activated = false;
+      ring->m_activatedByPlayer1 = false;
+      ring->m_activatedByPlayer2 = false;
+    }
+  }
+  s_activatedRings.clear();
 }
 
 void init(PlayLayer *pl) {
@@ -107,11 +138,12 @@ int simulateBranch(PlayLayer *pl, PlayerObject *realPlayer, bool isHold, int hor
 
   s_simulationDead = false;
   s_clonePlayer->m_isDead = false;
+  s_isHold = isHold;
 
   s_clonePlayer->copyAttributes(realPlayer);
-  s_clonePlayer->setVisible(false);
   s_clonePlayer->m_gravityMod = realPlayer->m_gravityMod;
   s_clonePlayer->m_isOnGround = realPlayer->m_isOnGround;
+  s_clonePlayer->setVisible(false);
 
   if (isHold) {
     s_clonePlayer->pushButton(PlayerButton::Jump);
@@ -119,6 +151,7 @@ int simulateBranch(PlayLayer *pl, PlayerObject *realPlayer, bool isHold, int hor
     s_clonePlayer->releaseButton(PlayerButton::Jump);
   }
 
+  int result = horizon;
   for (int step = 0; step < horizon; ++step) {
     if (s_clonePlayer->m_collisionLogTop)
       s_clonePlayer->m_collisionLogTop->removeAllObjects();
@@ -131,31 +164,28 @@ int simulateBranch(PlayLayer *pl, PlayerObject *realPlayer, bool isHold, int hor
     s_clonePlayer->m_touchedRings.clear();
 
     pl->checkCollisions(s_clonePlayer, dt, false);
-    if (s_simulationDead) {
-      return step;
+    if (s_simulationDead || s_clonePlayer->m_isDead) {
+      result = step;
+      break;
     }
 
     s_clonePlayer->update(dt);
   }
 
-  return horizon;
+  restoreActivatedRings();
+  return result;
 }
 
-std::pair<int32_t, int32_t> computeTTD(PlayLayer *pl, int horizon = 120) {
+std::pair<int32_t, int32_t> computeTTD(PlayLayer *pl, int horizon) {
   if (!pl || !pl->m_player1 || !s_clonePlayer) {
     return {horizon, horizon};
   }
 
   s_simulating = true;
-  float dt = 1.0f / 240.0f;
-  if (pl->m_gameState.m_timeWarp > 0.0f) {
-    dt = (1.0f / 240.0f) * pl->m_gameState.m_timeWarp;
-  }
-
-  int32_t ttdRelease = simulateBranch(pl, pl->m_player1, false, horizon, dt);
-  int32_t ttdHold = simulateBranch(pl, pl->m_player1, true, horizon, dt);
-
+  int32_t ttdRelease = simulateBranch(pl, pl->m_player1, false, horizon, s_frameDt);
+  int32_t ttdHold = simulateBranch(pl, pl->m_player1, true, horizon, s_frameDt);
   s_simulating = false;
+
   return {ttdRelease, ttdHold};
 }
 } // namespace TrajectorySim
@@ -190,8 +220,7 @@ class $modify(MyPlayLayer, PlayLayer) {
   void flipGravity(PlayerObject *player, bool p1, bool p2) {
     if (TrajectorySim::isSimulating()) {
       if (player) {
-        player->m_isUpsideDown = !player->m_isUpsideDown;
-        player->m_gravityMod = -player->m_gravityMod;
+        player->flipGravity(p1, true);
       }
       return;
     }
@@ -243,6 +272,14 @@ class $modify(MyEffectGameObject, EffectGameObject) {
   }
 };
 
+class $modify(MyCCNode, cocos2d::CCNode) {
+  cocos2d::CCAction* runAction(cocos2d::CCAction* action) {
+    if (TrajectorySim::isSimulating())
+      return nullptr;
+    return cocos2d::CCNode::runAction(action);
+  }
+};
+
 class $modify(MyPlayerObject, PlayerObject) {
   void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
     if (TrajectorySim::isSimulating())
@@ -256,12 +293,17 @@ class $modify(MyPlayerObject, PlayerObject) {
     PlayerObject::incrementJumps();
   }
 
+  void update(float dt) {
+    PlayerObject::update(dt);
+    if (PlayLayer::get() && !TrajectorySim::isSimulating()) {
+      TrajectorySim::setFrameDelta(dt);
+    }
+  }
+
   void ringJump(RingObject *ring, bool p1) {
     if (TrajectorySim::isSimulating()) {
+      TrajectorySim::trackActivatedRing(ring);
       PlayerObject::ringJump(ring, p1);
-      ring->m_activated = false;
-      ring->m_activatedByPlayer1 = false;
-      ring->m_activatedByPlayer2 = false;
       return;
     }
     PlayerObject::ringJump(ring, p1);
@@ -270,45 +312,18 @@ class $modify(MyPlayerObject, PlayerObject) {
 
 /// Override jumping and input processing.
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
-  bool canBeActivatedByPlayer(PlayerObject *p0, EffectGameObject *p1) {
+  void toggleDualMode(GameObject *object, bool dual, PlayerObject *player, bool noEffects) {
     if (TrajectorySim::isSimulating())
-      return false;
-    return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
-  }
-
-  void collisionCheckObjects(PlayerObject *player, gd::vector<GameObject *> *vec, int objectsCount, float dt) {
-    if (TrajectorySim::isSimulating()) {
-      gd::vector<GameObject *> simObjects;
-      simObjects.reserve(objectsCount);
-      for (int i = 0; i < objectsCount; i++) {
-        GameObject *obj = vec->at(i);
-        auto type = obj->m_objectType;
-
-        if (type == GameObjectType::Solid || type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard ||
-            type == GameObjectType::Slope || type == GameObjectType::Breakable ||
-            type == GameObjectType::YellowJumpPad || type == GameObjectType::PinkJumpPad ||
-            type == GameObjectType::GravityPad || type == GameObjectType::RedJumpPad ||
-            type == GameObjectType::SpiderPad || type == GameObjectType::YellowJumpRing ||
-            type == GameObjectType::PinkJumpRing || type == GameObjectType::GravityRing ||
-            type == GameObjectType::GreenRing || type == GameObjectType::DropRing ||
-            type == GameObjectType::RedJumpRing || type == GameObjectType::CustomRing ||
-            type == GameObjectType::DashRing || type == GameObjectType::GravityDashRing ||
-            type == GameObjectType::SpiderOrb || type == GameObjectType::TeleportOrb ||
-            type == GameObjectType::InverseGravityPortal || type == GameObjectType::NormalGravityPortal) {
-          simObjects.push_back(obj);
-        }
-      }
-
-      GJBaseGameLayer::collisionCheckObjects(player, &simObjects, simObjects.size(), dt);
       return;
-    }
-
-    GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
+    GJBaseGameLayer::toggleDualMode(object, dual, player, noEffects);
   }
 
   void playerTouchedRing(PlayerObject *player, RingObject *ring) {
     if (TrajectorySim::isSimulating()) {
       player->m_touchedRings.insert(ring->m_uniqueID);
+      if (TrajectorySim::isHold() && !ring->m_activated) {
+        player->ringJump(ring, true);
+      }
       return;
     }
     GJBaseGameLayer::playerTouchedRing(player, ring);
@@ -357,7 +372,7 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     data->frameIdx = frame60Idx;
 
     // Compute Time-To-Death (TTD) for Release and Hold
-    auto [ttdRelease, ttdHold] = TrajectorySim::computeTTD(PlayLayer::get(), 120);
+    auto [ttdRelease, ttdHold] = TrajectorySim::computeTTD(PlayLayer::get(), 240);
     data->ttdRelease = ttdRelease;
     data->ttdHold = ttdHold;
 
@@ -388,8 +403,8 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     }
   }
 
-  void processQueuedButtons(float dt, bool clearInputQueue) {
-    GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+  void updateCamera(float dt) {
     this->processClick();
+    GJBaseGameLayer::updateCamera(dt);
   }
 };
