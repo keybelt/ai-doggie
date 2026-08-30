@@ -1,13 +1,22 @@
-"""Shared memory utilities for communication between Python scripts and Geometry Dash."""
-
+import json
 import time
 from multiprocessing.shared_memory import SharedMemory
-from struct import pack, unpack
+from pathlib import Path
+from struct import pack_into, unpack
 
 import numpy as np
 
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+with CONFIG_PATH.open() as f:
+    CONFIG = json.load(f)
+
 SHM_NAME = "GDMem"
-SHM_SIZE = 921624  # 24 bytes header (6 int32s) + 640 * 480 * 3 bytes frame
+HEADER_SIZE = 20  # 5 int32s: frameIdx, frameReadyBin, ttdRelease, ttdHold, macroCount
+FRAME_SIZE = CONFIG["frame"]["width"] * CONFIG["frame"]["height"] * 3
+MAX_MACRO_EVENTS = CONFIG["data"]["recordingBufferSize"]
+MACRO_EVENT_SIZE = 8  # 2 int32s: frame, down
+SHM_SIZE = HEADER_SIZE + FRAME_SIZE + (MAX_MACRO_EVENTS * MACRO_EVENT_SIZE)
+MACRO_OFFSET = HEADER_SIZE + FRAME_SIZE
 
 
 def init_shm() -> SharedMemory:
@@ -24,12 +33,29 @@ def init_shm() -> SharedMemory:
         create=True,
         size=SHM_SIZE,
     )
-    shm.buf[0:24] = bytes(24)
+    shm.buf[0:HEADER_SIZE] = bytes(HEADER_SIZE)
     return shm
 
 
+def load_macro_to_shm(shm: SharedMemory, macro_events: list[dict]) -> None:
+    """Write raw 240Hz macro events (frame, down) into the shared memory macro buffer."""
+    count = min(len(macro_events), MAX_MACRO_EVENTS)
+    for i in range(count):
+        ev = macro_events[i]
+        offset = MACRO_OFFSET + (i * MACRO_EVENT_SIZE)
+        pack_into(
+            "2i",
+            shm.buf,
+            offset,
+            int(ev["frame"]),
+            1 if ev["down"] else 0,
+        )
+    # Set macroCount at offset 16
+    pack_into("i", shm.buf, 16, count)
+
+
 def get_frame(shm: SharedMemory, width: int, height: int) -> np.ndarray:
-    """Read a frame buffer from shared memory starting at offset 24 and reshape it.
+    """Read a frame buffer from shared memory starting at offset HEADER_SIZE and reshape it.
 
     Args:
         shm: The SharedMemory object.
@@ -42,7 +68,7 @@ def get_frame(shm: SharedMemory, width: int, height: int) -> np.ndarray:
     frame_size = width * height * 3
     return (
         np.frombuffer(
-            shm.buf[24 : 24 + frame_size],
+            shm.buf[HEADER_SIZE : HEADER_SIZE + frame_size],
             dtype=np.uint8,
         )
         .reshape((height, width, 3))
@@ -50,16 +76,9 @@ def get_frame(shm: SharedMemory, width: int, height: int) -> np.ndarray:
     )
 
 
-def acknowledge_handshake(shm: SharedMemory, action_val: int | None = None) -> None:
-    """Acknowledge the C++ handshake, optionally writing an action value.
-
-    If action_val is provided, it updates the action value, sets frameReadyBin = 0,
-    and sets actionReadyBin = 1 atomically. Otherwise, it only resets the ready states.
-    """
-    if action_val is None:
-        shm.buf[8:16] = pack("2i", 0, 1)
-    else:
-        shm.buf[4:16] = pack("3i", action_val, 0, 1)
+def acknowledge_handshake(shm: SharedMemory) -> None:
+    """Reset frameReadyBin to 0 to signal C++ that the frame was consumed."""
+    pack_into("i", shm.buf, 4, 0)
 
 
 def get_ttd(shm: SharedMemory) -> tuple[int, int]:
@@ -68,7 +87,7 @@ def get_ttd(shm: SharedMemory) -> tuple[int, int]:
     Returns:
         tuple[int, int]: (ttd_release, ttd_hold)
     """
-    ttd_release, ttd_hold = unpack("2i", shm.buf[16:24])
+    ttd_release, ttd_hold = unpack("2i", shm.buf[8:16])
     return ttd_release, ttd_hold
 
 
@@ -81,7 +100,7 @@ def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool, i
     Returns:
         tuple[int, bool, int, int]: (current_tick, is_new_frame_ready, ttd_release, ttd_hold)
     """
-    current_tick, _, frame_ready, _, ttd_release, ttd_hold = unpack("6i", shm.buf[0:24])
+    current_tick, frame_ready, ttd_release, ttd_hold, _ = unpack("5i", shm.buf[0:HEADER_SIZE])
 
     if frame_ready != 1:
         time.sleep(0)

@@ -16,21 +16,26 @@
 
 using namespace geode::prelude;
 
+struct MacroEvent {
+  int32_t frame;
+  int32_t down;
+};
+
 struct SharedData {
-  volatile int32_t frameIdx;   // 60Hz frame counter
-  volatile int32_t currAction; // 0 = Release, 1 = Jump
-  volatile int32_t frameReadyBin;
-  volatile int32_t actionReadyBin;
-  volatile int32_t ttdRelease;
-  volatile int32_t ttdHold;
+  volatile int32_t frameIdx;          // 60Hz frame counter
+  volatile int32_t frameReadyBin;     // 1 when C++ writes frame, 0 when Python consumed
+  volatile int32_t ttdRelease;        // Time to death for release
+  volatile int32_t ttdHold;           // Time to death for hold
+  volatile int32_t macroCount;        // Number of 240Hz macro events loaded
   uint8_t frameBuffer[640 * 480 * 3]; // 921,600 bytes
+  MacroEvent macroBuffer[50000];      // 400,000 bytes
 };
 
 SharedData *data = nullptr;
-bool isJumping = false;
 int lastFrameIdx = -1;
 std::string shmName = "GDMem";
 int fileDescriptor = -1;
+static size_t s_macroIndex = 0;
 
 /// Retrieve the data from the shared memory.
 void initShm() {
@@ -214,15 +219,15 @@ class $modify(MyPlayLayer, PlayLayer) {
 
     initShm();
     TrajectorySim::init(this);
-    isJumping = false;
     lastFrameIdx = -1;
+    s_macroIndex = 0;
     return true;
   }
 
   void resetLevel() {
     PlayLayer::resetLevel();
-    isJumping = false;
     lastFrameIdx = -1;
+    s_macroIndex = 0;
   }
 
   void destroyPlayer(PlayerObject *player, GameObject *gameObject) {
@@ -380,18 +385,20 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
   }
 
   void simulateClick(PlayerButton button, bool down, bool player2) {
-    auto isClick = down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
+    auto performButton = down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
+    bool swapControls = GameManager::get()->getGameVariable(GameVar::Flip2PlayerControls);
+    player2 = swapControls ? !player2 : player2;
 
-    if (m_levelSettings->m_twoPlayerMode && m_gameState.m_isDualMode) {
+    if (m_levelSettings->m_twoPlayerMode) {
       PlayerObject *plr = player2 ? m_player2 : m_player1;
       if (plr)
-        (plr->*isClick)(button);
+        (plr->*performButton)(button);
     } else {
       if (m_player1)
-        (m_player1->*isClick)(button);
+        (m_player1->*performButton)(button);
 
       if (m_gameState.m_isDualMode && m_player2) {
-        (m_player2->*isClick)(button);
+        (m_player2->*performButton)(button);
       }
     }
 
@@ -404,7 +411,24 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     }
   }
 
-  void processClick() {
+  void processBot() {
+    if (!data || data->macroCount <= 0)
+      return;
+
+    // gd 2.208 quirk makes currentProgress count twice as fast
+    int32_t progress = m_gameState.m_currentProgress / 2;
+    while (s_macroIndex < (size_t)data->macroCount && data->macroBuffer[s_macroIndex].frame <= progress) {
+      const auto &ev = data->macroBuffer[s_macroIndex++];
+      this->simulateClick(PlayerButton::Jump, ev.down != 0, false);
+    }
+  }
+
+  void processQueuedButtons(float dt, bool clearInputQueue) {
+    GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+    this->processBot();
+  }
+
+  void processRecording() {
     if (!m_player1)
       return;
 
@@ -429,32 +453,12 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     // Capture 640x480 screen pixels from Cocos2d-x frame buffer at 60Hz
     glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
 
-    data->actionReadyBin = 0;
     std::atomic_thread_fence(std::memory_order_release);
     data->frameReadyBin = 1;
-
-    auto start = std::chrono::steady_clock::now();
-
-    // TODO: make timeout indefinite for macro recording, only enforce 60hz for inference
-    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(8)) {
-      if (data->actionReadyBin != 0) {
-        break;
-      }
-      std::this_thread::yield();
-    }
-
-    bool shouldJump = (data->currAction == 1);
-    if (shouldJump && !isJumping) {
-      simulateClick(PlayerButton::Jump, true, false);
-      isJumping = true;
-    } else if (!shouldJump && isJumping) {
-      simulateClick(PlayerButton::Jump, false, false);
-      isJumping = false;
-    }
   }
 
   void updateCamera(float dt) {
-    this->processClick();
+    this->processRecording();
     GJBaseGameLayer::updateCamera(dt);
   }
 };
