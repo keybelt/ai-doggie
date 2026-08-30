@@ -6,7 +6,7 @@
         "actionDim": 2
     },
     "data": {
-        "ttdGamma": 0.95,
+        "ttdGamma": 0.99,
         "ttdHorizon": 240,
         "recordingBufferSize": 50000
     },
@@ -33,5 +33,5 @@
         "recordKeyName": "space"
     },
     "fps": 60,
-    "logIntervalSec": 1
+    "logIntervalSec": 0.1
 }
