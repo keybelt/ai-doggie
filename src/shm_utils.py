@@ -1,3 +1,5 @@
+"""Shared memory utilities for communication between Python scripts and Geometry Dash."""
+
 import json
 import time
 from multiprocessing.shared_memory import SharedMemory
@@ -11,7 +13,7 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 SHM_NAME = "GDMem"
-HEADER_SIZE = 20  # 5 int32s: frameIdx, frameReadyBin, ttdRelease, ttdHold, macroCount
+HEADER_SIZE = 12  # 3 int32s: frameIdx, frameReadyBin, macroCount
 FRAME_SIZE = CONFIG["frame"]["width"] * CONFIG["frame"]["height"] * 3
 MAX_MACRO_EVENTS = CONFIG["data"]["recordingBufferSize"]
 MACRO_EVENT_SIZE = 8  # 2 int32s: frame, down
@@ -20,7 +22,7 @@ MACRO_OFFSET = HEADER_SIZE + FRAME_SIZE
 
 
 def init_shm() -> SharedMemory:
-    """Initialize a shared memory block between the Python script and the C++ mod."""
+    """Create or open POSIX shared memory buffer matching GDMem structure."""
     try:
         shm = SharedMemory(name=SHM_NAME)
         shm.close()
@@ -50,8 +52,7 @@ def load_macro_to_shm(shm: SharedMemory, macro_events: list[dict]) -> None:
             int(ev["frame"]),
             1 if ev["down"] else 0,
         )
-    # Set macroCount at offset 16
-    pack_into("i", shm.buf, 16, count)
+    pack_into("i", shm.buf, 8, count)
 
 
 def get_frame(shm: SharedMemory, width: int, height: int) -> np.ndarray:
@@ -81,33 +82,24 @@ def acknowledge_handshake(shm: SharedMemory) -> None:
     pack_into("i", shm.buf, 4, 0)
 
 
-def get_ttd(shm: SharedMemory) -> tuple[int, int]:
-    """Read ttdRelease and ttdHold from shared memory header.
-
-    Returns:
-        tuple[int, int]: (ttd_release, ttd_hold)
-    """
-    ttd_release, ttd_hold = unpack("2i", shm.buf[8:16])
-    return ttd_release, ttd_hold
-
-
-def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool, int, int]:
+def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool]:
     """Checks the shared memory header state to see if a new frame is ready.
 
-    If a frame is not ready, it sleeps briefly. If the tick matches the last tick,
-    it acknowledges the handshake and returns False.
+    Args:
+        shm: SharedMemory object.
+        last_tick: The last processed game tick.
 
     Returns:
-        tuple[int, bool, int, int]: (current_tick, is_new_frame_ready, ttd_release, ttd_hold)
+        tuple[int, bool]: (current_tick, is_new_frame_ready)
     """
-    current_tick, frame_ready, ttd_release, ttd_hold, _ = unpack("5i", shm.buf[0:HEADER_SIZE])
+    current_tick, frame_ready = unpack("2i", shm.buf[0:8])
 
     if frame_ready != 1:
         time.sleep(0)
-        return current_tick, False, ttd_release, ttd_hold
+        return current_tick, False
 
     if current_tick == last_tick:
         acknowledge_handshake(shm)
-        return current_tick, False, ttd_release, ttd_hold
+        return current_tick, False
 
-    return current_tick, True, ttd_release, ttd_hold
+    return current_tick, True

@@ -11,14 +11,12 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
-from shm_utils import acknowledge_handshake, get_frame, init_shm, load_macro_to_shm, wait_for_next_frame
+from shm_utils import acknowledge_handshake, get_frame, init_shm, wait_for_next_frame
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
-# Implementation Constants
-TARGET_FPS = 60
 RECORDING_BUFFER_SIZE = CONFIG["data"]["recordingBufferSize"]
 
 
@@ -47,15 +45,14 @@ def parse_macro_file(filepath: Path) -> dict:
 
 
 def process_macro(parsed_macro: dict) -> list[dict]:
-    """Extract raw 240Hz jump macro inputs.
+    """Normalize macro events to raw frame event list.
 
     Returns:
-        Sorted list of raw macro event dicts with frame and down.
+        Sorted list of raw macro event dicts with frame and down keys.
     """
     raw_events = []
     macro_fps = parsed_macro["framerate"]
     print(f"Macro FPS: {macro_fps}.")
-
     for macro_input in parsed_macro["inputs"]:
         if macro_input["btn"] == 1:
             raw_events.append(
@@ -70,27 +67,56 @@ def process_macro(parsed_macro: dict) -> list[dict]:
     return raw_events
 
 
-def run_recording_loop(
-    shm: SharedMemory,
-    max_frame_60: int,
-) -> tuple[np.ndarray, np.ndarray, bool]:
-    """Run 60Hz frame and TTD recording loop.
+def build_macro_actions_60(macro_events: list[dict]) -> tuple[np.ndarray, int]:
+    """Pre-populate a 60Hz binary action array from raw 240Hz macro events.
 
     Returns:
-        Tuple of (recorded_frames, recorded_ttd, is_dead_flag).
+        Tuple of (dense_60hz_actions, max_frame_60).
+    """
+    max_tick_240 = max(e["frame"] for e in macro_events)
+    max_frame_60 = (max_tick_240 // 4) + 60
+    macro_actions_240 = np.zeros(max_tick_240 + 16, dtype=np.uint8)
+
+    prev_frame = 0
+    current_action = 0
+    for ev in macro_events:
+        frame = ev["frame"]
+        down = 1 if ev["down"] else 0
+        macro_actions_240[prev_frame:frame] = current_action
+        prev_frame = frame
+        current_action = down
+    macro_actions_240[prev_frame:] = current_action
+
+    num_frames = (len(macro_actions_240) + 3) // 4
+    macro_actions_60 = np.zeros(num_frames, dtype=np.uint8)
+    for f in range(num_frames):
+        macro_actions_60[f] = 1 if np.any(macro_actions_240[f * 4 : (f + 1) * 4] > 0) else 0
+
+    return macro_actions_60, max_frame_60
+
+
+def run_recording_loop(
+    shm: SharedMemory,
+    macro_actions_60: np.ndarray,
+    max_frame_60: int,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Run 60Hz frame and action recording loop.
+
+    Returns:
+        Tuple of (recorded_frames, recorded_actions, is_dead_flag).
     """
     frame_w: int = CONFIG["frame"]["width"]
     frame_h: int = CONFIG["frame"]["height"]
     log_interval: int = max(1, round(CONFIG["logIntervalSec"] * CONFIG["fps"]))
 
     frames_buf = np.empty((RECORDING_BUFFER_SIZE, frame_h, frame_w, 3), dtype=np.uint8)
-    ttd_buf = np.zeros((RECORDING_BUFFER_SIZE, 2), dtype=np.int32)
+    actions_buf = np.zeros(RECORDING_BUFFER_SIZE, dtype=np.uint8)
 
     frame_idx = 0
     last_frame = -1
 
     while True:
-        current_frame, is_ready, ttd_release, ttd_hold = wait_for_next_frame(shm, last_frame)
+        current_frame, is_ready = wait_for_next_frame(shm, last_frame)
         if not is_ready:
             continue
 
@@ -117,44 +143,37 @@ def run_recording_loop(
             print("Frame buffer exceeded.")
             break
 
+        action = macro_actions_60[current_frame] if current_frame < len(macro_actions_60) else 0
         frames_buf[frame_idx] = raw_frame
-        ttd_buf[frame_idx] = [ttd_release, ttd_hold]
+        actions_buf[frame_idx] = action
         frame_idx += 1
 
         if frame_idx % log_interval == 0:
-            print(
-                f"\r\033[KFrames recorded: {frame_idx} | TTD: [{ttd_release:>3}, {ttd_hold:>3}]",
-                end="",
-                flush=True,
-            )
+            print(f"\rFrames recorded: {frame_idx}", end="", flush=True)
 
-    return frames_buf[:frame_idx], ttd_buf[:frame_idx], is_dead
+    return frames_buf[:frame_idx], actions_bin_buf[:frame_idx], is_dead
 
 
 def record(filepath: Path):
-    """Parse macro, set up shared memory, and record frames and TTD into an HDF5 dataset file."""
+    """Parse macro, set up shared memory, and record frames into an HDF5 dataset file."""
     parsed_macro = parse_macro_file(filepath)
     macro_events = process_macro(parsed_macro)
     shm = init_shm()
-    load_macro_to_shm(shm, macro_events)
-
-    max_frame_60 = (macro_events[-1]["frame"] // 4) + 60
 
     try:
-        frames, ttd, is_dead = run_recording_loop(shm, max_frame_60)
-        min_seq_len = CONFIG["training"]["seqLen"]
-        if len(frames) < min_seq_len:
-            print(f"Recording too short ({len(frames)} frames < {min_seq_len}), discarding.\n")
+        frames, actions_bin, is_dead = run_recording_loop(shm, macro_events)
+        if is_dead:
             filepath.unlink()
             return
 
         data_dir = Path(__file__).resolve().parents[1] / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
 
         save_path = data_dir / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}.h5"
         with h5py.File(save_path, "w") as f:
             f.create_dataset("frames", data=frames, compression="gzip", compression_opts=4, chunks=(64, 480, 640, 3))
-            f.create_dataset("ttd", data=ttd, compression="lzf")
-        print(f"Saved {'partial' if is_dead else 'complete'} recording ({len(frames)} frames) to {save_path}\n")
+            f.create_dataset("actions_bin", data=actions_bin, compression="lzf", compression_opts=4)
+        print(f"Saved recording to {save_path}\n")
         filepath.unlink()
     finally:
         shm.close()

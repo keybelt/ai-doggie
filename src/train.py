@@ -25,21 +25,7 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 DEVICE = torch.device("mps")
-
-
-def compute_q_targets(ttd: Tensor) -> Tensor:
-    """Convert raw survival ticks into discounted survival returns Q*(s, a) normalized to [0, 1].
-
-    Args:
-        ttd: Tensor of shape [..., 2] with raw ticks in range [0, ttdHorizon].
-
-    Returns:
-        Normalized discounted Q-value targets of shape [..., 2] in range [0, 1].
-    """
-    gamma = CONFIG["data"]["ttdGamma"]
-    horizon = CONFIG["data"]["ttdHorizon"]
-    max_return = 1.0 - (gamma**horizon)
-    return (1.0 - torch.pow(gamma, ttd.float())) / max_return
+CLASS_WEIGHTS = torch.tensor(CONFIG["training"]["classWeights"], device=DEVICE)
 
 
 class DatasetGenerator(IterableDataset):
@@ -58,108 +44,161 @@ class DatasetGenerator(IterableDataset):
         return self.dataset_files.pop(0)
 
     def stream_file(self, filepath: Path) -> Iterator[tuple[np.ndarray, np.ndarray, bool]]:
-        """Stream frame and TTD chunks from HDF5 file directly without full RAM load.
+        """Stream frame and action chunks from HDF5 file directly without full RAM load.
 
         Yields:
-            Tuple of (frames_chunk, ttd_chunk, is_first_chunk_flag).
+            Tuple of (frames_chunk, actions_chunk, is_first_chunk_flag).
         """
         seq_len = CONFIG["training"]["seqLen"]
         with h5py.File(filepath, "r") as f:
             frames_ds = f["frames"]
-            ttd_ds = f["ttd"]
+            actions_ds = f["actions"]
             num_chunks = len(frames_ds) // seq_len
 
             for chunk_idx in range(num_chunks):
                 start = chunk_idx * seq_len
                 end = start + seq_len
-                yield frames_ds[start:end], ttd_ds[start:end], (chunk_idx == 0)
+                yield frames_ds[start:end], actions_ds[start:end], (chunk_idx == 0)
 
     def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch together mini batches from each file stream.
 
         Yields:
-            Tuple of (frames, ttd, are_first) concatenated arrays.
+            Tuple of (frames, actions, are_first) concatenated arrays.
         """
         batch_size = CONFIG["training"]["batchSize"]
         self.dataset_files = []
         file_streams = [self.stream_file(self.get_next_file()) for _ in range(batch_size)]
 
         while True:
-            batch_frames, batch_ttd, batch_are_first = [], [], []
+            batch_frames, batch_actions, batch_are_first = [], [], []
 
             for i in range(batch_size):
                 try:
-                    frames, ttd, is_first = next(file_streams[i])
+                    frames, actions, is_first = next(file_streams[i])
                 except StopIteration:
                     file_streams[i] = self.stream_file(self.get_next_file())
-                    frames, ttd, is_first = next(file_streams[i])
+                    frames, actions, is_first = next(file_streams[i])
 
                 batch_frames.append(frames)
-                batch_ttd.append(ttd)
+                batch_actions.append(actions)
                 batch_are_first.append(is_first)
 
             yield (
                 np.stack(batch_frames),
-                np.stack(batch_ttd),
+                np.stack(batch_actions),
                 np.stack(batch_are_first),
             )
 
 
 def preprocess_inputs(
     frames: Tensor,
-    ttd: Tensor,
+    actions: Tensor,
     are_first: Tensor,
     hidden: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Normalize frames to [0, 1], mask hidden states on reset, and compute target Q-values.
+    """Normalize frames to [0, 1] and zero out hidden states on episode reset.
 
     Args:
         frames: [N, T, H, W, C]
-        ttd: [N, T, 2]
+        actions: [N, T]
         are_first: [N]
         hidden: [N, 1, D]
 
     Returns:
-        Tuple of (frames_norm [N, T, H, W, C], q_targets [N, T, 2], masked_hidden [N, 1, D]).
+        Tuple of (frames_norm [N, T, H, W, C], target_actions [N, T], masked_hidden [N, 1, D]).
     """
     keep_hidden = (~are_first).to(DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)  # [N, 1, 1]
     hidden_state = hidden * keep_hidden  # [N, 1, D]
     frames_gpu = frames.to(DEVICE, non_blocking=True)  # Compact uint8 host-to-device transfer
     frames_norm = frames_gpu.to(dtype=torch.float32).mul_(1.0 / 255.0)  # [N, T, H, W, C]
-    ttd_gpu = ttd.to(DEVICE, dtype=torch.float32)  # [N, T, 2]
-    q_targets = compute_q_targets(ttd_gpu)  # [N, T, 2]
-    return frames_norm, q_targets, hidden_state
+    target_actions = actions.to(DEVICE, dtype=torch.long)  # [N, T]
+    return frames_norm, target_actions, hidden_state
+
+
+def compute_timing_tolerant_loss(
+    logits: Tensor,
+    target: Tensor,
+    window: int,
+    class_weights: Tensor,
+) -> Tensor:
+    """Compute cross-entropy loss with temporal variance tolerance window (+/- window frames).
+
+    Args:
+        logits: [..., T, 2]
+        target: [..., T]
+
+    Returns:
+        Tolerant loss tensor of shape [N].
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    ce_0 = -log_probs[..., 0] * class_weights[0]
+    ce_1 = -log_probs[..., 1] * class_weights[1]
+
+    k = 2 * window + 1
+    min_ce_1 = -F.max_pool1d(-ce_1.unsqueeze(1), kernel_size=k, stride=1, padding=window).squeeze(1)
+    target_has_pos = F.max_pool1d(target.float().unsqueeze(1), kernel_size=k, stride=1, padding=window).squeeze(1) > 0.5
+
+    loss_neg = torch.where(target_has_pos, torch.minimum(ce_0, ce_1), ce_0)
+    return torch.where(target == 1, min_ce_1, loss_neg).mean(dim=-1)
 
 
 def process_batch(
     model: Model,
     frames: Tensor,
-    ttd: Tensor,
+    actions: Tensor,
     are_first: Tensor,
     hidden: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Pass batch through model and compute MSE loss on continuous Q-values.
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Pass batch through model and compute sub-block MoE loss + entropy.
 
     Args:
         frames: [N, T, H, W, C]
-        ttd: [N, T, 2]
+        actions: [N, T]
         are_first: [N]
         hidden: [N, 1, D]
 
     Returns:
-        Tuple of (loss, hidden [N, 1, D]).
+        Tuple of (loss, hidden [N, 1, D], entropy, best_logits [N, T, 2], target [N, T]).
     """
-    frames_norm, q_targets, hidden_state = preprocess_inputs(
+    frames_norm, target, hidden_state = preprocess_inputs(
         frames=frames,
-        ttd=ttd,
+        actions=actions,
         are_first=are_first,
         hidden=hidden,
     )
-    q_pred, hidden_state = model(frames_norm, hidden_state)  # q_pred: [N, T, 2], hidden_state: [N, 1, D]
+    logits, hidden_state = model(frames_norm, hidden_state)  # logits: [K, N, T, 2], hidden_state: [N, 1, D]
     hidden_state = hidden_state.detach()
 
-    loss = F.mse_loss(q_pred, q_targets)
-    return loss, hidden_state
+    # --- Sub-Block Soft-WTA MoE Loss ---
+    K, N, T, C = logits.shape
+
+    sub_len = CONFIG["training"]["subLen"]
+    num_blocks = T // sub_len
+
+    ce = torch.stack(
+        [
+            F.cross_entropy(logits[k].transpose(1, 2), target, weight=CLASS_WEIGHTS, reduction="none")
+            for k in range(K)
+        ]
+    )  # [K, N, T]
+
+    ce_blocks = ce.view(K, N, num_blocks, sub_len)
+    block_losses = ce_blocks.mean(dim=-1)  # [K, N, num_blocks]
+
+    tau = CONFIG["training"]["wtaTau"]
+    weights = F.softmax(-block_losses / tau, dim=0).detach()  # [K, N, num_blocks]
+    loss = (weights * block_losses).sum(dim=0).mean()
+
+    best_head_idx = torch.argmin(block_losses, dim=0)  # [N, num_blocks]
+    logits_blocks = logits.view(K, N, num_blocks, sub_len, C)
+    idx_expanded = best_head_idx.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).expand(1, N, num_blocks, sub_len, C)
+    best_logits = torch.gather(logits_blocks, 0, idx_expanded).squeeze(0).view(N, T, C)  # [N, T, 2]
+
+    probs = F.softmax(best_logits, dim=-1)  # [N, T, 2]
+    entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean()
+
+    return loss, hidden_state, entropy, best_logits, target
 
 
 def prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
@@ -291,7 +330,7 @@ def log_diagnostics(
     wandb.log(stats)
 
 
-def optimize_and_evaluate(state: dict, loss: Tensor):
+def optimize_and_evaluate(state: dict, loss: Tensor, entropy: Tensor):
     """Step optimizer/scheduler, clip gradients, and run periodic evaluation."""
     eval_freq = CONFIG["training"]["evalFreqSteps"]
     max_grad_norm = CONFIG["training"]["maxGradNorm"]
@@ -329,14 +368,20 @@ def optimize_and_evaluate(state: dict, loss: Tensor):
     state["global_step"] += 1
 
     if is_eval_step:
-        val_loss, val_latency = run_val(state)
+        val_loss, val_entropy, val_prec, val_rec, val_f1, val_latency, val_tol_losses = run_val(state)
         val_stats = {
             "loss/train": loss.item(),
+            "entropy/train": entropy.item(),
             "lr": scheduler.get_last_lr()[0],
             "loss/val": val_loss,
+            "entropy/val": val_entropy,
+            "val/precision": val_prec,
+            "val/recall": val_rec,
+            "val/f1": val_f1,
             "total_grad_norm": total_grad_norm,
             "inf_latency_ms": val_latency,
         }
+        val_stats.update(val_tol_losses)
         log_diagnostics(
             state=state,
             stats=val_stats,
@@ -354,19 +399,19 @@ def run_train_epoch(state: dict, steps: int) -> float:
     model.train()
     num_batches = 0
     train_loss_tensor = torch.zeros(1, device=DEVICE)
-    loss = None
+    loss, entropy = None, None
 
     for i in range(steps):
         try:
-            frames, ttd, are_first = next(train_iter)
+            frames, actions, are_first = next(train_iter)
         except StopIteration:
             break
         num_batches = i + 1
 
-        loss, state["train_hidden"] = process_batch(
+        loss, state["train_hidden"], entropy, _, _ = process_batch(
             model=model,
             frames=frames,
-            ttd=ttd,
+            actions=actions,
             are_first=are_first,
             hidden=state["train_hidden"],
         )
@@ -374,26 +419,27 @@ def run_train_epoch(state: dict, steps: int) -> float:
         (loss / accum_steps).backward()
 
         if num_batches % accum_steps == 0:
-            optimize_and_evaluate(state, loss)
+            optimize_and_evaluate(state, loss, entropy)
 
         train_loss_tensor += loss.detach()
 
     if num_batches % accum_steps != 0 and loss is not None:
-        optimize_and_evaluate(state, loss)
+        optimize_and_evaluate(state, loss, entropy)
 
     return train_loss_tensor.item() / num_batches
 
 
-def run_val(state: dict) -> tuple[float, float]:
+def run_val(state: dict) -> tuple[float, float, float, float, float, float, dict[str, float]]:
     """Run validation steps dynamically over full validation dataset with clean hidden state.
 
     Returns:
-        Tuple of (avg_val_loss, inference_latency_ms).
+        Tuple of (avg_val_loss, avg_val_entropy, precision, recall, f1, inference_latency_ms, tol_losses_dict).
     """
     model = state["model"]
     val_loader = state["val_loader"]
     val_steps = state["val_steps"]
     batch_size = CONFIG["training"]["batchSize"]
+    windows = CONFIG["training"]["timingToleranceWindows"]
 
     model.eval()
     val_iter = iter(val_loader)
@@ -401,26 +447,43 @@ def run_val(state: dict) -> tuple[float, float]:
 
     num_batches = 0
     val_loss_tensor = torch.zeros(1, device=DEVICE)
+    val_entropy_tensor = torch.zeros(1, device=DEVICE)
+    val_tol_loss_tensors = {w: torch.zeros(1, device=DEVICE) for w in windows}
+
+    total_tp = 0.0
+    total_fp = 0.0
+    total_fn = 0.0
 
     with torch.no_grad():
         for i in range(val_steps):
             try:
-                frames, ttd, are_first = next(val_iter)
+                frames, actions, are_first = next(val_iter)
             except StopIteration:
                 break
             num_batches = i + 1
 
-            loss, val_hidden = process_batch(
+            loss, val_hidden, entropy, logits, target = process_batch(
                 model=model,
                 frames=frames,
-                ttd=ttd,
+                actions=actions,
                 are_first=are_first,
                 hidden=val_hidden,
             )
             val_loss_tensor += loss.detach()
+            val_entropy_tensor += entropy.detach()
 
-        # Measure inference latency
-        dummy_x = torch.zeros(1, 1, CONFIG["frame"]["height"], CONFIG["frame"]["width"], 3, device=DEVICE)
+            for w in windows:
+                tol_loss_w = compute_timing_tolerant_loss(
+                    logits, target, window=w, class_weights=CLASS_WEIGHTS
+                ).mean()
+                val_tol_loss_tensors[w] += tol_loss_w.detach()
+
+            preds = logits.argmax(dim=-1)  # [N, T]
+            total_tp += ((preds == 1) & (target == 1)).sum().item()
+            total_fp += ((preds == 1) & (target == 0)).sum().item()
+            total_fn += ((preds == 0) & (target == 1)).sum().item()
+
+        dummy_x = torch.zeros(1, 1, 480, 640, 3, device=DEVICE)
         dummy_h = torch.zeros(1, 1, model.hidden_dim, device=DEVICE)
         model(dummy_x, dummy_h)
         torch.mps.synchronize()
@@ -431,7 +494,15 @@ def run_val(state: dict) -> tuple[float, float]:
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
     avg_val_loss = val_loss_tensor.item() / num_batches
-    return avg_val_loss, elapsed_ms
+    avg_val_entropy = val_entropy_tensor.item() / num_batches
+
+    avg_tol_losses = {f"val/loss_tol_{w}f": val_tol_loss_tensors[w].item() / num_batches for w in windows}
+
+    precision = total_tp / (total_tp + total_fp + 1e-9)
+    recall = total_tp / (total_tp + total_fn + 1e-9)
+    f1 = (2 * precision * recall) / (precision + recall + 1e-9)
+
+    return avg_val_loss, avg_val_entropy, precision, recall, f1, elapsed_ms, avg_tol_losses
 
 
 def save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None):
@@ -480,7 +551,7 @@ def train():
 
     wandb.init(
         project="ai-doggie",
-        name="ttd q-value learning",
+        name="subblock moe",
         config=cfg_tr,
     )
     wandb.define_metric("epoch", hidden=True)

@@ -1,10 +1,10 @@
 import json
 import sys
 import time
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
 import torch
-from multiprocessing.shared_memory import SharedMemory
 from pynput.keyboard import Key, Listener
 
 sys.path.append(str(Path(__file__).resolve().parent))
@@ -40,7 +40,7 @@ def init_model() -> Model:
 
 
 def run_inference_loop(model: Model, shm: SharedMemory):
-    """Run real-time game frame capture, model forward pass, and action IPC output loop."""
+    """Run real-time game frame capture, model forward pass, and latency benchmark."""
     hidden_dim: int = CONFIG["model"]["hiddenDim"]
     frame_w: int = CONFIG["frame"]["width"]
     frame_h: int = CONFIG["frame"]["height"]
@@ -52,7 +52,7 @@ def run_inference_loop(model: Model, shm: SharedMemory):
 
     with torch.inference_mode():
         while not is_shutdown:
-            current_tick, is_ready, _, _ = wait_for_next_frame(shm, last_tick)
+            current_tick, is_ready = wait_for_next_frame(shm, last_tick)
             if not is_ready:
                 continue
 
@@ -65,13 +65,13 @@ def run_inference_loop(model: Model, shm: SharedMemory):
 
             last_tick = current_tick
             frame = get_frame(shm, frame_w, frame_h)
+            acknowledge_handshake(shm)
+
             frame_tensor = (
                 torch.from_numpy(frame).unsqueeze(0).unsqueeze(0).to(device=DEVICE, dtype=torch.float32) / 255.0
             )
 
-            q_values, hidden_state = model(frame_tensor, hidden_state)
-            action_val = 1 if q_values[0, 0, 1] > q_values[0, 0, 0] else 0
-            acknowledge_handshake(shm, action_val)
+            logits, hidden_state = model(frame_tensor, hidden_state)
 
             if i % log_interval == 0:
                 latency = (time.perf_counter() - time_start) * 1000
