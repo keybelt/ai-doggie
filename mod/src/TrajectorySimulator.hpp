@@ -21,7 +21,6 @@ public:
 
 private:
     void simulateBranch(PlayLayer* pl, bool down);
-    void drawHitboxes(PlayerObject* player);
 
     cocos2d::CCDrawNode* m_drawNode = nullptr;
     bool m_simulating = false;

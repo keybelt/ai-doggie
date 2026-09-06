@@ -1,5 +1,6 @@
 #include "TrajectorySimulator.hpp"
 
+#include <Geode/modify/AchievementNotifier.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -61,21 +62,7 @@ void TrajectorySimulator::handleButton(bool down, bool isPlayer1) {
   }
 }
 
-void TrajectorySimulator::drawHitboxes(PlayerObject *player) {
-  if (!player || !m_drawNode)
-    return;
 
-  auto drawRect = [this](const cocos2d::CCRect &rect, cocos2d::ccColor4B colBorder) {
-    cocos2d::CCPoint pts[4] = {{rect.getMinX(), rect.getMinY()},
-                               {rect.getMinX(), rect.getMaxY()},
-                               {rect.getMaxX(), rect.getMaxY()},
-                               {rect.getMaxX(), rect.getMinY()}};
-    m_drawNode->drawPolygon(pts, 4, {0, 0, 0, 0}, 0.25f, ccc4FFromccc4B(colBorder));
-  };
-
-  drawRect(player->getObjectRect(), {255, 0, 0, 255});
-  drawRect(player->getObjectRect(0.25f, 0.25f), {0, 255, 0, 255});
-}
 
 void TrajectorySimulator::simulateBranch(PlayLayer *pl, bool down) {
   m_simulationDead = false;
@@ -100,11 +87,13 @@ void TrajectorySimulator::simulateBranch(PlayLayer *pl, bool down) {
         break;
     }
 
-    if (i == 0) {
-      down ? p1->pushButton(PlayerButton::Jump) : p1->releaseButton(PlayerButton::Jump);
-      if (p2) {
-        down ? p2->pushButton(PlayerButton::Jump) : p2->releaseButton(PlayerButton::Jump);
-      }
+    if (down) {
+      // Tap every frame: push then release so orbs see a fresh press each step
+      p1->pushButton(PlayerButton::Jump);
+      if (p2) p2->pushButton(PlayerButton::Jump);
+    } else if (i == 0) {
+      p1->releaseButton(PlayerButton::Jump);
+      if (p2) p2->releaseButton(PlayerButton::Jump);
     }
 
     p1->update(m_frameDt);
@@ -115,10 +104,6 @@ void TrajectorySimulator::simulateBranch(PlayLayer *pl, bool down) {
     if (p2)
       m_drawNode->drawSegment(prev2, p2->getPosition(), 0.65f, col);
   }
-
-  drawHitboxes(p1);
-  if (p2)
-    drawHitboxes(p2);
 }
 
 void TrajectorySimulator::simulate(PlayLayer *pl) {
@@ -200,6 +185,8 @@ class $modify(TrajectoryPLHook, PlayLayer) {
     if (!PlayLayer::init(level, useReplay, dontCreateObjects))
       return false;
     TrajectorySimulator::get()->init(this);
+    if (m_attemptLabel)
+      m_attemptLabel->setVisible(false);
     return true;
   }
 
@@ -246,5 +233,11 @@ class $modify(TrajectoryHardStreakHook, HardStreak) {
     if (TrajectorySimulator::get()->isSimulating())
       return;
     HardStreak::addPoint(p0);
+  }
+};
+
+class $modify(TrajectoryAchievementHook, AchievementNotifier) {
+  void notifyAchievement(char const *title, char const *desc, char const *icon, bool quest) {
+    // suppress all achievement popups
   }
 };
