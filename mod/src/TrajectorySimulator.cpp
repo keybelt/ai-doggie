@@ -194,6 +194,8 @@ class $modify(TrajectoryPLHook, PlayLayer) {
 
   void resetLevel() {
     PlayLayer::resetLevel();
+    if (m_attemptLabel)
+      m_attemptLabel->setVisible(false);
     if (!TrajectorySimulator::get()->isSimulating()) {
       TrajectorySimulator::get()->init(this);
     }
