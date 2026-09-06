@@ -1,12 +1,12 @@
 #include "TrajectorySimulator.hpp"
 
-#include <Geode/modify/AchievementNotifier.hpp>
+#include <Geode/modify/CCActionManager.hpp>
+#include <Geode/modify/CCCircleWave.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/RingObject.hpp>
+#include <Geode/modify/AchievementNotifier.hpp>
 
 TrajectorySimulator *TrajectorySimulator::get() {
   static TrajectorySimulator instance;
@@ -215,6 +215,14 @@ class $modify(TrajectoryPLHook, PlayLayer) {
     TrajectorySimulator::get()->quit();
     PlayLayer::onQuit();
   }
+
+  void addCircle(CCCircleWave *cw) {
+    if (TrajectorySimulator::get()->isSimulating()) {
+      if (cw) cw->removeFromParent();
+      return;
+    }
+    PlayLayer::addCircle(cw);
+  }
 };
 
 class $modify(TrajectoryBGLHook, GJBaseGameLayer) {
@@ -238,6 +246,28 @@ class $modify(TrajectoryBGLHook, GJBaseGameLayer) {
   }
 };
 
+class $modify(TrajectoryActionMgrHook, cocos2d::CCActionManager) {
+  void addAction(cocos2d::CCAction* action, cocos2d::CCNode* target, bool paused) {
+    if (TrajectorySimulator::get()->isSimulating())
+      return; // Discard all sprite animations (orb bounces, pad compressions, scales)
+    CCActionManager::addAction(action, target, paused);
+  }
+};
+
+class $modify(TrajectoryCircleWaveHook, CCCircleWave) {
+  void draw() {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    CCCircleWave::draw();
+  }
+
+  void updateTweenAction(float value, char const* key) {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    CCCircleWave::updateTweenAction(value, key);
+  }
+};
+
 class $modify(TrajectoryHardStreakHook, HardStreak) {
   void addPoint(cocos2d::CCPoint p0) {
     if (TrajectorySimulator::get()->isSimulating())
@@ -249,22 +279,6 @@ class $modify(TrajectoryHardStreakHook, HardStreak) {
 class $modify(TrajectoryAchievementHook, AchievementNotifier) {
   void notifyAchievement(char const *title, char const *desc, char const *icon, bool quest) {
     // suppress all achievement popups
-  }
-};
-
-class $modify(TrajectoryGOHook, GameObject) {
-  void playShineEffect() {
-    if (TrajectorySimulator::get()->isSimulating())
-      return;
-    GameObject::playShineEffect();
-  }
-};
-
-class $modify(TrajectoryRingHook, RingObject) {
-  void spawnCircle() {
-    if (TrajectorySimulator::get()->isSimulating())
-      return;
-    RingObject::spawnCircle();
   }
 };
 
@@ -292,5 +306,12 @@ class $modify(TrajectoryPOHook, PlayerObject) {
       return;
     PlayerObject::spawnCircle2();
   }
+
+  void spawnDualCircle() {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    PlayerObject::spawnDualCircle();
+  }
 };
+
 
