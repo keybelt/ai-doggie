@@ -1,7 +1,9 @@
 #include "TrajectorySimulator.hpp"
 
 #include <Geode/modify/AchievementNotifier.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
@@ -239,5 +241,41 @@ class $modify(TrajectoryHardStreakHook, HardStreak) {
 class $modify(TrajectoryAchievementHook, AchievementNotifier) {
   void notifyAchievement(char const *title, char const *desc, char const *icon, bool quest) {
     // suppress all achievement popups
+  }
+};
+
+class $modify(TrajectoryEGOHook, EffectGameObject) {
+  void triggerObject(GJBaseGameLayer *p0, int p1, const gd::vector<int> *p2) {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    EffectGameObject::triggerObject(p0, p1, p2);
+  }
+};
+
+class $modify(TrajectoryGOHook, GameObject) {
+  void playShineEffect() {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    GameObject::playShineEffect();
+  }
+};
+
+class $modify(TrajectoryPOHook, PlayerObject) {
+  void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    PlayerObject::playSpiderDashEffect(from, to);
+  }
+
+  void incrementJumps() {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    PlayerObject::incrementJumps();
+  }
+
+  void ringJump(RingObject *p0, bool p1) {
+    if (TrajectorySimulator::get()->isSimulating())
+      return;
+    PlayerObject::ringJump(p0, p1);
   }
 };
