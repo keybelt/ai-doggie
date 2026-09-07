@@ -70,4 +70,7 @@ void TrajectoryDrawer::render(PlayLayer *pl, TrajectoryData const &data) {
 
   // Hold branch (Green)
   drawBranch(data.holdBranch, cocos2d::ccColor4F{0.f, 1.f, 0.1f, 1.f});
+
+  // Impulse branch (Yellow)
+  drawBranch(data.impulseBranch, cocos2d::ccColor4F{1.f, 0.9f, 0.f, 1.f});
 }

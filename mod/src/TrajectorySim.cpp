@@ -44,7 +44,13 @@ void handleSimulationDeath(PlayerObject *player) {
   }
 }
 
-static TrajectoryBranch simulateBranch(PlayLayer *pl, bool down, float dt) {
+enum class TrajectoryMode {
+  Release,
+  Hold,
+  Impulse,
+};
+
+static TrajectoryBranch simulateBranch(PlayLayer *pl, TrajectoryMode mode, float dt) {
   s_simulationDead = false;
   PlayerObject *p1 = pl->m_player1;
   PlayerObject *p2 = (pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
@@ -60,11 +66,21 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, bool down, float dt) {
   }
 
   for (size_t i = 0; i < SIM_ITERATIONS; ++i) {
-    if (down) {
+    if (mode == TrajectoryMode::Hold) {
       p1->pushButton(PlayerButton::Jump);
       if (p2)
         p2->pushButton(PlayerButton::Jump);
-    } else if (i == 0) {
+    } else if (mode == TrajectoryMode::Impulse) {
+      if (i == 0) {
+        p1->pushButton(PlayerButton::Jump);
+        if (p2)
+          p2->pushButton(PlayerButton::Jump);
+      } else if (i == 1) {
+        p1->releaseButton(PlayerButton::Jump);
+        if (p2)
+          p2->releaseButton(PlayerButton::Jump);
+      }
+    } else if (i == 0) { // TrajectoryMode::Release
       p1->releaseButton(PlayerButton::Jump);
       if (p2)
         p2->releaseButton(PlayerButton::Jump);
@@ -133,11 +149,15 @@ void simulate(PlayLayer *pl) {
 
   // 2. Step forward headlessly & reset level to checkpoint
   TrajectoryData data;
-  data.releaseBranch = simulateBranch(pl, false, dt); // Release branch (Red)
+  data.releaseBranch = simulateBranch(pl, TrajectoryMode::Release, dt); // Release branch (Red)
   pl->resetLevel();
   pl->loadLastCheckpoint();
 
-  data.holdBranch = simulateBranch(pl, true, dt); // Hold branch (Green)
+  data.holdBranch = simulateBranch(pl, TrajectoryMode::Hold, dt); // Hold branch (Green)
+  pl->resetLevel();
+  pl->loadLastCheckpoint();
+
+  data.impulseBranch = simulateBranch(pl, TrajectoryMode::Impulse, dt); // Impulse branch (Yellow)
   pl->resetLevel();
   pl->loadLastCheckpoint();
 

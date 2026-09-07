@@ -14,6 +14,7 @@ struct TrajectoryBranch {
 struct TrajectoryData {
   TrajectoryBranch releaseBranch;
   TrajectoryBranch holdBranch;
+  TrajectoryBranch impulseBranch;
 };
 
 class TrajectoryDrawer {
