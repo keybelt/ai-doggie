@@ -1,3 +1,5 @@
+#include "TrajectorySim.hpp"
+
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -62,6 +64,7 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     initShm();
+    TrajectorySim::init(this);
     lastFrameIdx = -1;
     s_macroIndex = 0;
     return true;
@@ -69,11 +72,23 @@ class $modify(MyPlayLayer, PlayLayer) {
 
   void resetLevel() {
     PlayLayer::resetLevel();
-    lastFrameIdx = -1;
-    s_macroIndex = 0;
+    if (!TrajectorySim::isSimulating()) {
+      TrajectorySim::init(this);
+      lastFrameIdx = -1;
+      s_macroIndex = 0;
+    }
+  }
+
+  void destroyPlayer(PlayerObject *player, GameObject *object) {
+    if (TrajectorySim::isSimulating()) {
+      TrajectorySim::handleSimulationDeath(player);
+      return;
+    }
+    PlayLayer::destroyPlayer(player, object);
   }
 
   void onQuit() {
+    TrajectorySim::quit();
     closeShm();
     PlayLayer::onQuit();
   }
@@ -96,6 +111,9 @@ class $modify(MyPlayLayer, PlayLayer) {
     lastFrameIdx = frame60Idx;
     data->frameIdx = frame60Idx;
 
+    // Run trajectory simulation only on this frame capture step
+    TrajectorySim::simulate(this);
+
     // Capture 640x480 screen pixels from Cocos2d-x frame buffer at 60Hz
     glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
 
@@ -111,6 +129,10 @@ class $modify(MyPlayLayer, PlayLayer) {
 
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
   void simulateClick(PlayerButton button, bool down, bool player2) {
+    if (button == PlayerButton::Jump) {
+      TrajectorySim::handleButtonPress(down, !player2);
+    }
+
     auto performButton = down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
     bool swapControls = GameManager::get()->getGameVariable(GameVar::Flip2PlayerControls);
     player2 = swapControls ? !player2 : player2;
@@ -138,6 +160,13 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
       if (button == PlayerButton::Jump)
         m_jumping = false;
     }
+  }
+
+  void handleButton(bool down, int button, bool isPlayer1) {
+    if (button == (int)PlayerButton::Jump || button == 1) {
+      TrajectorySim::handleButtonPress(down, isPlayer1);
+    }
+    GJBaseGameLayer::handleButton(down, button, isPlayer1);
   }
 
   void processBot() {

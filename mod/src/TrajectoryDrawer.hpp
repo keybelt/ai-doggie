@@ -22,7 +22,6 @@ public:
 
   void init(PlayLayer *pl);
   void quit();
-  void hide();
   void clear();
   void render(PlayLayer *pl, TrajectoryData const &data);
 

@@ -36,13 +36,6 @@ void TrajectoryDrawer::quit() {
   }
 }
 
-void TrajectoryDrawer::hide() {
-  if (m_drawNode) {
-    m_drawNode->setVisible(false);
-    m_drawNode->clear();
-  }
-}
-
 void TrajectoryDrawer::clear() {
   if (m_drawNode) {
     m_drawNode->clear();
