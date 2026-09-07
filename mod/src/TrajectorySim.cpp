@@ -4,6 +4,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/AchievementNotifier.hpp>
 #include <Geode/modify/CCNode.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 
 using namespace geode::prelude;
@@ -181,8 +182,11 @@ void simulate(PlayLayer *pl) {
 
 class $modify(TrajectoryNodeHook, cocos2d::CCNode) {
   void addChild(cocos2d::CCNode *child, int zOrder, int tag) {
-    if (TrajectorySim::isSimulating())
-      return;
+    if (TrajectorySim::isSimulating()) {
+      if (child) {
+        child->setVisible(false);
+      }
+    }
     CCNode::addChild(child, zOrder, tag);
   }
 };
@@ -202,3 +206,19 @@ class $modify(TrajectoryPOHook, PlayerObject) {
     isPressed ? this->pushButton(PlayerButton::Jump) : this->releaseButton(PlayerButton::Jump);
   }
 };
+
+class $modify(TrajectoryBGLHook, GJBaseGameLayer) {
+  void updateTimeMod(float speed, bool players, bool noEffects) {
+    if (TrajectorySim::isSimulating()) {
+      if (m_player1) {
+        m_player1->updateTimeMod(speed, true);
+      }
+      if (m_gameState.m_isDualMode && m_player2) {
+        m_player2->updateTimeMod(speed, true);
+      }
+      return;
+    }
+    GJBaseGameLayer::updateTimeMod(speed, players, noEffects);
+  }
+};
+
