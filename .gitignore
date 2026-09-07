@@ -10,3 +10,4 @@ CONTEXT.md
 checkpoints
 mod/*
 !mod/src
+test_shm.py
