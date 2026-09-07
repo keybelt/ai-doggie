@@ -2,10 +2,8 @@
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/AchievementNotifier.hpp>
-#include <Geode/modify/CCActionManager.hpp>
-#include <Geode/modify/CCCircleWave.hpp>
+#include <Geode/modify/CCNode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 
@@ -91,21 +89,6 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, bool down) {
   return branch;
 }
 
-static void restoreLivePlayer(PlayLayer *pl) {
-  PlayerObject *p1 = pl->m_player1;
-  PlayerObject *p2 = (pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
-
-  p1->m_isDead = false;
-  if (p2)
-    p2->m_isDead = false;
-  pl->m_playerDied = false;
-
-  s_player1Pressed ? p1->pushButton(PlayerButton::Jump) : p1->releaseButton(PlayerButton::Jump);
-  if (p2) {
-    s_player2Pressed ? p2->pushButton(PlayerButton::Jump) : p2->releaseButton(PlayerButton::Jump);
-  }
-}
-
 static void simulate(PlayLayer *pl) {
   if (!pl || !pl->m_player1 || s_simulating)
     return;
@@ -122,6 +105,9 @@ static void simulate(PlayLayer *pl) {
   float warp = (pl->m_gameState.m_timeWarp > 0.f) ? pl->m_gameState.m_timeWarp : 1.f;
   s_frameDt = (s_rawDt > 0.f ? s_rawDt : (1.0f / 240.0f)) / warp;
 
+  PlayerObject *p1 = pl->m_player1;
+  PlayerObject *p2 = (pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
+
   bool wasPractice = pl->m_isPracticeMode;
   pl->m_isPracticeMode = true;
 
@@ -136,6 +122,15 @@ static void simulate(PlayLayer *pl) {
     cp->m_physicalCheckpointObject->setVisible(false);
   }
   pl->storeCheckpoint(cp);
+
+  // Snapshot visual states
+  bool p1Effects = p1->m_playEffects;
+  bool p2Effects = p2 ? p2->m_playEffects : false;
+
+  // Suppress visual effects on player during simulation
+  p1->m_playEffects = false;
+  if (p2)
+    p2->m_playEffects = false;
 
   s_simulating = true;
 
@@ -154,7 +149,11 @@ static void simulate(PlayLayer *pl) {
   cp->release();
   pl->m_isPracticeMode = wasPractice;
 
-  restoreLivePlayer(pl);
+  // Restore live player state
+  p1->m_playEffects = p1Effects;
+  if (p2)
+    p2->m_playEffects = p2Effects;
+
   s_simulating = false;
 
   TrajectoryDrawer::get()->render(pl, data);
@@ -195,15 +194,6 @@ class $modify(TrajectoryPLHook, PlayLayer) {
     quitSimulation();
     PlayLayer::onQuit();
   }
-
-  void addCircle(CCCircleWave *cw) {
-    if (s_simulating) {
-      if (cw)
-        cw->removeFromParent();
-      return;
-    }
-    PlayLayer::addCircle(cw);
-  }
 };
 
 class $modify(TrajectoryBGLHook, GJBaseGameLayer) {
@@ -219,42 +209,13 @@ class $modify(TrajectoryBGLHook, GJBaseGameLayer) {
     }
     GJBaseGameLayer::handleButton(down, button, isPlayer1);
   }
-
-  cocos2d::CCParticleSystemQuad *spawnParticle(char const *plist, int zOrder, cocos2d::tCCPositionType positionType,
-                                               cocos2d::CCPoint position) {
-    if (s_simulating)
-      return nullptr;
-    return GJBaseGameLayer::spawnParticle(plist, zOrder, positionType, position);
-  }
 };
 
-class $modify(TrajectoryActionMgrHook, cocos2d::CCActionManager) {
-  void addAction(cocos2d::CCAction *action, cocos2d::CCNode *target, bool paused) {
-    if (s_simulating)
-      return; // Discard sprite animations (orb bounces, pad compressions, scales)
-    CCActionManager::addAction(action, target, paused);
-  }
-};
-
-class $modify(TrajectoryCircleWaveHook, CCCircleWave) {
-  void draw() {
+class $modify(TrajectoryNodeHook, cocos2d::CCNode) {
+  void addChild(cocos2d::CCNode *child, int zOrder, int tag) {
     if (s_simulating)
       return;
-    CCCircleWave::draw();
-  }
-
-  void updateTweenAction(float value, char const *key) {
-    if (s_simulating)
-      return;
-    CCCircleWave::updateTweenAction(value, key);
-  }
-};
-
-class $modify(TrajectoryHardStreakHook, HardStreak) {
-  void addPoint(cocos2d::CCPoint p0) {
-    if (s_simulating)
-      return;
-    HardStreak::addPoint(p0);
+    CCNode::addChild(child, zOrder, tag);
   }
 };
 
@@ -265,33 +226,11 @@ class $modify(TrajectoryAchievementHook, AchievementNotifier) {
 };
 
 class $modify(TrajectoryPOHook, PlayerObject) {
-  void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
-    if (s_simulating)
-      return;
-    PlayerObject::playSpiderDashEffect(from, to);
-  }
+  void loadFromCheckpoint(PlayerCheckpoint *cp) {
+    PlayerObject::loadFromCheckpoint(cp);
+    m_isDead = false;
 
-  void incrementJumps() {
-    if (s_simulating)
-      return;
-    PlayerObject::incrementJumps();
-  }
-
-  void spawnCircle() {
-    if (s_simulating)
-      return;
-    PlayerObject::spawnCircle();
-  }
-
-  void spawnCircle2() {
-    if (s_simulating)
-      return;
-    PlayerObject::spawnCircle2();
-  }
-
-  void spawnDualCircle() {
-    if (s_simulating)
-      return;
-    PlayerObject::spawnDualCircle();
+    bool isPressed = m_isSecondPlayer ? s_player2Pressed : s_player1Pressed;
+    isPressed ? this->pushButton(PlayerButton::Jump) : this->releaseButton(PlayerButton::Jump);
   }
 };
