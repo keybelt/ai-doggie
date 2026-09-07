@@ -13,16 +13,14 @@ static bool s_simulating = false;
 static bool s_simulationDead = false;
 static bool s_player1Pressed = false;
 static bool s_player2Pressed = false;
-static float s_frameDt = 1.0f / 240.0f;
-static constexpr size_t SIM_ITERATIONS = 300;
+// Geometry Dash 2.2 runs physics at 240 TPS, where dt is measured in 60Hz frame units:
+// 60.0f / 240.0f = 0.25f per tick
+static constexpr float BASE_FRAME_DT = 0.25f;
+static constexpr size_t SIM_ITERATIONS = 240;
 
-bool isSimulating() {
-  return s_simulating;
-}
+bool isSimulating() { return s_simulating; }
 
-void init(PlayLayer *pl) {
-  TrajectoryDrawer::get()->init(pl);
-}
+void init(PlayLayer *pl) { TrajectoryDrawer::get()->init(pl); }
 
 void quit() {
   s_simulating = false;
@@ -46,7 +44,7 @@ void handleSimulationDeath(PlayerObject *player) {
   }
 }
 
-static TrajectoryBranch simulateBranch(PlayLayer *pl, bool down) {
+static TrajectoryBranch simulateBranch(PlayLayer *pl, bool down, float dt) {
   s_simulationDead = false;
   PlayerObject *p1 = pl->m_player1;
   PlayerObject *p2 = (pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
@@ -62,18 +60,7 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, bool down) {
   }
 
   for (size_t i = 0; i < SIM_ITERATIONS; ++i) {
-    pl->checkCollisions(p1, s_frameDt, false);
-    if (s_simulationDead || p1->m_isDead)
-      break;
-
-    if (p2) {
-      pl->checkCollisions(p2, s_frameDt, false);
-      if (s_simulationDead || p2->m_isDead)
-        break;
-    }
-
     if (down) {
-      // Tap every frame: push then release so orbs see a fresh press each step
       p1->pushButton(PlayerButton::Jump);
       if (p2)
         p2->pushButton(PlayerButton::Jump);
@@ -83,11 +70,21 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, bool down) {
         p2->releaseButton(PlayerButton::Jump);
     }
 
-    p1->update(s_frameDt);
+    p1->update(dt);
+    pl->checkCollisions(p1, dt, false);
+    if (s_simulationDead || p1->m_isDead)
+      break;
+
+    if (p2) {
+      p2->update(dt);
+      pl->checkCollisions(p2, dt, false);
+      if (s_simulationDead || p2->m_isDead)
+        break;
+    }
+
     branch.p1.push_back(p1->getPosition());
 
     if (p2) {
-      p2->update(s_frameDt);
       branch.p2.push_back(p2->getPosition());
     }
   }
@@ -103,7 +100,7 @@ void simulate(PlayLayer *pl) {
   }
 
   float warp = (pl->m_gameState.m_timeWarp > 0.f) ? pl->m_gameState.m_timeWarp : 1.f;
-  s_frameDt = (1.0f / 240.0f) / warp;
+  float dt = BASE_FRAME_DT * warp;
 
   PlayerObject *p1 = pl->m_player1;
   PlayerObject *p2 = (pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
@@ -136,11 +133,11 @@ void simulate(PlayLayer *pl) {
 
   // 2. Step forward headlessly & reset level to checkpoint
   TrajectoryData data;
-  data.releaseBranch = simulateBranch(pl, false); // Release branch (Red)
+  data.releaseBranch = simulateBranch(pl, false, dt); // Release branch (Red)
   pl->resetLevel();
   pl->loadLastCheckpoint();
 
-  data.holdBranch = simulateBranch(pl, true); // Hold branch (Green)
+  data.holdBranch = simulateBranch(pl, true, dt); // Hold branch (Green)
   pl->resetLevel();
   pl->loadLastCheckpoint();
 
