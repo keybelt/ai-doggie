@@ -1,12 +1,16 @@
 #include "TrajectorySim.hpp"
 
 #include <Geode/Geode.hpp>
+#include <Geode/modify/CCDirector.hpp>
+#include <Geode/modify/CCScheduler.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
+#include <chrono>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace geode::prelude;
@@ -108,6 +112,12 @@ class $modify(MyPlayLayer, PlayLayer) {
     int frame60Idx = (m_gameState.m_currentProgress / 2) / 4;
     if (frame60Idx == lastFrameIdx)
       return;
+
+    // Lockstep handshake: wait for Python to consume the previous frame before writing the next
+    while (data->frameReadyBin == 1) {
+      std::this_thread::yield();
+    }
+
     lastFrameIdx = frame60Idx;
     data->frameIdx = frame60Idx;
 
@@ -127,7 +137,19 @@ class $modify(MyPlayLayer, PlayLayer) {
   }
 };
 
+static inline bool isLiveGameplayActive() {
+  auto pl = PlayLayer::get();
+  return pl && !pl->m_isPaused && pl->m_started && !pl->m_playerDied && !pl->m_hasCompletedLevel;
+}
+
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
+  void update(float dt) {
+    if (isLiveGameplayActive()) {
+      dt = 1.0f / 60.0f;
+    }
+    GJBaseGameLayer::update(dt);
+  }
+
   void simulateClick(PlayerButton button, bool down, bool player2) {
     if (button == PlayerButton::Jump) {
       TrajectorySim::handleButtonPress(down, !player2);
@@ -183,5 +205,24 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
   void processQueuedButtons(float dt, bool clearInputQueue) {
     GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
     this->processBot();
+  }
+};
+
+class $modify(MyDirector, cocos2d::CCDirector) {
+  void calculateDeltaTime() {
+    CCDirector::calculateDeltaTime();
+    if (isLiveGameplayActive()) {
+      m_fDeltaTime = 1.0f / 60.0f;
+      m_fActualDeltaTime = 1.0f / 60.0f;
+    }
+  }
+};
+
+class $modify(MyScheduler, cocos2d::CCScheduler) {
+  void update(float dt) {
+    if (isLiveGameplayActive()) {
+      dt = 1.0f / 60.0f;
+    }
+    CCScheduler::update(dt);
   }
 };
