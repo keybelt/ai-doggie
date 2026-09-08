@@ -17,7 +17,6 @@ static bool s_player2Pressed = false;
 // Geometry Dash 2.2 runs physics at 240 TPS, where dt is measured in 60Hz frame units:
 // 60.0f / 240.0f = 0.25f per tick
 static constexpr float BASE_FRAME_DT = 0.25f;
-static constexpr size_t SIM_ITERATIONS = 240;
 
 bool isSimulating() { return s_simulating; }
 
@@ -59,14 +58,25 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, TrajectoryMode mode, float
   if (!p1)
     return branch;
 
-  branch.p1.reserve(SIM_ITERATIONS + 1);
   branch.p1.push_back(p1->getPosition());
   if (p2) {
-    branch.p2.reserve(SIM_ITERATIONS + 1);
     branch.p2.push_back(p2->getPosition());
   }
 
-  for (size_t i = 0; i < SIM_ITERATIONS; ++i) {
+  cocos2d::CCNode *parent = p1->getParent() ? p1->getParent() : pl->m_objectLayer;
+  cocos2d::CCAffineTransform toWorld =
+      parent ? parent->nodeToWorldTransform() : cocos2d::CCAffineTransformMakeIdentity();
+  cocos2d::CCSize winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
+
+  auto isPastScreenHorizontal = [&](PlayerObject *player) -> bool {
+    cocos2d::CCPoint screenPos = cocos2d::CCPointApplyAffineTransform(player->getPosition(), toWorld);
+    if (player->m_isGoingLeft) {
+      return screenPos.x < 0.0f;
+    }
+    return screenPos.x > winSize.width;
+  };
+
+  for (size_t i = 0;; ++i) {
     if (mode == TrajectoryMode::Hold) {
       p1->pushButton(PlayerButton::Jump);
       if (p2)
@@ -103,6 +113,12 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, TrajectoryMode mode, float
 
     if (p2) {
       branch.p2.push_back(p2->getPosition());
+    }
+
+    bool p1Done = isPastScreenHorizontal(p1) || p1->m_isDead;
+    bool p2Done = !p2 || isPastScreenHorizontal(p2) || p2->m_isDead;
+    if (p1Done && p2Done) {
+      break;
     }
   }
 
@@ -221,4 +237,3 @@ class $modify(TrajectoryBGLHook, GJBaseGameLayer) {
     GJBaseGameLayer::updateTimeMod(speed, players, noEffects);
   }
 };
-
