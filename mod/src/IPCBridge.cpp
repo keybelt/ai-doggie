@@ -25,6 +25,10 @@ struct SharedData {
   volatile int32_t frameIdx;          // 60Hz frame counter
   volatile int32_t frameReadyBin;     // 1 when C++ writes frame, 0 when Python consumed
   volatile int32_t macroCount;        // Number of 240Hz macro events loaded
+  volatile float ttdRelease;          // Raw frames to death (Release)
+  volatile float ttdHold;             // Raw frames to death (Hold)
+  volatile float ttdImpulse;          // Raw frames to death (Impulse)
+  volatile float maxHorizon;          // Dynamic screen horizon (60Hz frames)
   uint8_t frameBuffer[640 * 480 * 3]; // 921,600 bytes
   MacroEvent macroBuffer[50000];      // 400,000 bytes
 };
@@ -114,8 +118,12 @@ class $modify(MyPlayLayer, PlayLayer) {
     lastFrameIdx = frame60Idx;
     data->frameIdx = frame60Idx;
 
-    // Run trajectory simulation only on this frame capture step
-    TrajectorySim::simulate(this);
+    // Run trajectory simulation to calculate frames to death and max horizon
+    auto sim = TrajectorySim::simulate(this);
+    data->ttdRelease = sim.ttdRelease;
+    data->ttdHold = sim.ttdHold;
+    data->ttdImpulse = sim.ttdImpulse;
+    data->maxHorizon = sim.maxHorizon;
 
     // Capture 640x480 screen pixels from Cocos2d-x frame buffer at 60Hz
     glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);
