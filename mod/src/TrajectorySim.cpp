@@ -3,7 +3,6 @@
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/AchievementNotifier.hpp>
-#include <Geode/modify/CCDrawNode.hpp>
 #include <Geode/modify/CCNode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -127,39 +126,6 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, TrajectoryMode mode, float
   return branch;
 }
 
-static cocos2d::CCDrawNode *s_dummyDrawNode = nullptr;
-
-cocos2d::CCDrawNode *getDummyDrawNode() {
-  if (!s_dummyDrawNode) {
-    s_dummyDrawNode = cocos2d::CCDrawNode::create();
-    s_dummyDrawNode->retain();
-    s_dummyDrawNode->setVisible(false);
-  }
-  return s_dummyDrawNode;
-}
-
-struct DebugDrawGuard {
-  PlayLayer *pl;
-  cocos2d::CCDrawNode *realNode;
-  cocos2d::CCDrawNode *dummyNode;
-
-  DebugDrawGuard(PlayLayer *p)
-      : pl(p), realNode(p ? p->m_debugDrawNode : nullptr), dummyNode(getDummyDrawNode()) {
-    if (pl && realNode) {
-      pl->m_debugDrawNode = dummyNode;
-    }
-  }
-
-  ~DebugDrawGuard() {
-    if (pl && realNode) {
-      pl->m_debugDrawNode = realNode;
-    }
-    if (dummyNode) {
-      dummyNode->clear();
-    }
-  }
-};
-
 void simulate(PlayLayer *pl) {
   if (!pl || !pl->m_player1 || s_simulating)
     return;
@@ -197,47 +163,42 @@ void simulate(PlayLayer *pl) {
   if (p2)
     p2->m_playEffects = false;
 
+  s_simulating = true;
+
+  // 2. Step forward headlessly & reset level to checkpoint
   TrajectoryData data;
-  {
-    // RAII guard swaps pl->m_debugDrawNode with an unparented dummy CCDrawNode for the
-    // entire duration of simulation, ensuring realNode is completely untouched.
-    DebugDrawGuard drawGuard(pl);
-    s_simulating = true;
+  data.releaseBranch = simulateBranch(pl, TrajectoryMode::Release, dt); // Release branch (Red)
+  pl->resetLevel();
+  pl->loadLastCheckpoint();
 
-    // 2. Step forward headlessly & reset level to checkpoint
-    data.releaseBranch = simulateBranch(pl, TrajectoryMode::Release, dt); // Release branch (Red)
-    pl->resetLevel();
-    pl->loadLastCheckpoint();
+  data.holdBranch = simulateBranch(pl, TrajectoryMode::Hold, dt); // Hold branch (Green)
+  pl->resetLevel();
+  pl->loadLastCheckpoint();
 
-    data.holdBranch = simulateBranch(pl, TrajectoryMode::Hold, dt); // Hold branch (Green)
-    pl->resetLevel();
-    pl->loadLastCheckpoint();
+  data.impulseBranch = simulateBranch(pl, TrajectoryMode::Impulse, dt); // Impulse branch (Yellow)
+  pl->resetLevel();
+  pl->loadLastCheckpoint();
 
-    data.impulseBranch = simulateBranch(pl, TrajectoryMode::Impulse, dt); // Impulse branch (Yellow)
-    pl->resetLevel();
-    pl->loadLastCheckpoint();
+  // 3. Clean up snapshot checkpoint
+  pl->removeCheckpoint(false);
+  cp->release();
+  pl->m_isPracticeMode = wasPractice;
 
-    // 3. Clean up snapshot checkpoint
-    pl->removeCheckpoint(false);
-    cp->release();
-    pl->m_isPracticeMode = wasPractice;
+  // Restore live player state
+  p1->m_playEffects = p1Effects;
+  if (p2)
+    p2->m_playEffects = p2Effects;
 
-    // Restore live player state
-    p1->m_playEffects = p1Effects;
-    if (p2)
-      p2->m_playEffects = p2Effects;
-
-    // Crucial: loadLastCheckpoint restored m_position, but did NOT recompute m_orientedBox!
-    // Without this, m_orientedBox remains stuck at the simulated death coordinates, causing
-    // Eclipse's rotated player hitbox to render at the death point (phantom dummy hitbox)
-    // while the live player loses the fill alpha contributed by the rotated box.
-    p1->updateOrientedBox();
-    if (p2) {
-      p2->updateOrientedBox();
-    }
-
-    s_simulating = false;
+  // Crucial: loadLastCheckpoint restored m_position, but did NOT recompute m_orientedBox!
+  // Without this, m_orientedBox remains stuck at the simulated death coordinates, causing
+  // Eclipse's rotated player hitbox to render at the death point (phantom dummy hitbox)
+  // while the live player loses the fill alpha contributed by the rotated box.
+  p1->updateOrientedBox();
+  if (p2) {
+    p2->updateOrientedBox();
   }
+
+  s_simulating = false;
 
   // Refresh Eclipse hitboxes for the live frame:
   // updateVisibility(0.0f) triggers Eclipse's ShowHitboxesPLHook::updateVisibility ->
@@ -251,91 +212,10 @@ void simulate(PlayLayer *pl) {
 
 // ================= Suppression & State Restoration Hooks =================
 
-class $modify(TrajectoryCCDNHook, cocos2d::CCDrawNode) {
-  static void onModify(auto &self) {
-    (void)self.setHookPriority("cocos2d::CCDrawNode::drawPolygon", geode::Priority::First);
-    (void)self.setHookPriority("cocos2d::CCDrawNode::drawRect", geode::Priority::First);
-    (void)self.setHookPriority("cocos2d::CCDrawNode::drawCircle", geode::Priority::First);
-    (void)self.setHookPriority("cocos2d::CCDrawNode::drawSegment", geode::Priority::First);
-    (void)self.setHookPriority("cocos2d::CCDrawNode::drawLines", geode::Priority::First);
-    (void)self.setHookPriority("cocos2d::CCDrawNode::clear", geode::Priority::First);
-    (void)self.setHookPriority("cocos2d::CCDrawNode::setVisible", geode::Priority::First);
-  }
-
-  void setVisible(bool visible) {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return;
-    }
-    CCDrawNode::setVisible(visible);
-  }
-
-  void clear() {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return;
-    }
-    CCDrawNode::clear();
-  }
-
-  bool drawPolygon(cocos2d::CCPoint *vertex, unsigned int count, const cocos2d::ccColor4F &fillColor,
-                   float borderWidth, const cocos2d::ccColor4F &borderColor, cocos2d::BorderAlignment alignment) {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return true;
-    }
-    return CCDrawNode::drawPolygon(vertex, count, fillColor, borderWidth, borderColor, alignment);
-  }
-
-  bool drawRect(const cocos2d::CCRect &rect, const cocos2d::ccColor4F &fillColor, float borderWidth,
-                const cocos2d::ccColor4F &borderColor, cocos2d::BorderAlignment alignment) {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return true;
-    }
-    return CCDrawNode::drawRect(rect, fillColor, borderWidth, borderColor, alignment);
-  }
-
-  bool drawRect(const cocos2d::CCPoint &from, const cocos2d::CCPoint &to, const cocos2d::ccColor4F &fillColor,
-                float borderWidth, const cocos2d::ccColor4F &borderColor, cocos2d::BorderAlignment alignment) {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return true;
-    }
-    return CCDrawNode::drawRect(from, to, fillColor, borderWidth, borderColor, alignment);
-  }
-
-  bool drawCircle(const cocos2d::CCPoint &position, float radius, const cocos2d::ccColor4F &color,
-                  float borderWidth, const cocos2d::ccColor4F &borderColor, unsigned int segments) {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return true;
-    }
-    return CCDrawNode::drawCircle(position, radius, color, borderWidth, borderColor, segments);
-  }
-
-  bool drawSegment(const cocos2d::CCPoint &from, const cocos2d::CCPoint &to, float radius,
-                   const cocos2d::ccColor4F &color) {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return true;
-    }
-    return CCDrawNode::drawSegment(from, to, radius, color);
-  }
-
-  bool drawLines(cocos2d::CCPoint *points, unsigned int count, float radius, const cocos2d::ccColor4F &color) {
-    if (TrajectorySim::isSimulating() && this != TrajectorySim::getDummyDrawNode()) {
-      return true;
-    }
-    return CCDrawNode::drawLines(points, count, radius, color);
-  }
-};
-
 class $modify(TrajectoryPLHook, PlayLayer) {
   static void onModify(auto &self) {
-    (void)self.setHookPriority("PlayLayer::updateProgressbar", geode::Priority::First);
     (void)self.setHookPriority("PlayLayer::updateVisibility", geode::Priority::First);
     (void)self.setHookPriority("PlayLayer::destroyPlayer", geode::Priority::First);
-  }
-
-  void updateProgressbar() {
-    if (TrajectorySim::isSimulating()) {
-      return;
-    }
-    PlayLayer::updateProgressbar();
   }
 
   void updateVisibility(float dt) {
@@ -355,19 +235,6 @@ class $modify(TrajectoryPLHook, PlayLayer) {
 };
 
 class $modify(TrajectoryPOHook, PlayerObject) {
-  static void onModify(auto &self) {
-    (void)self.setHookPriority("PlayerObject::playerDestroyed", geode::Priority::First);
-    (void)self.setHookPriority("PlayerObject::loadFromCheckpoint", geode::Priority::First);
-  }
-
-  void playerDestroyed(bool p0) {
-    if (TrajectorySim::isSimulating()) {
-      TrajectorySim::handleSimulationDeath(this);
-      return;
-    }
-    PlayerObject::playerDestroyed(p0);
-  }
-
   void loadFromCheckpoint(PlayerCheckpoint *cp) {
     PlayerObject::loadFromCheckpoint(cp);
     m_isDead = false;
@@ -396,17 +263,6 @@ class $modify(TrajectoryAchievementHook, AchievementNotifier) {
 };
 
 class $modify(TrajectoryBGLHook, GJBaseGameLayer) {
-  static void onModify(auto &self) {
-    (void)self.setHookPriority("GJBaseGameLayer::updateDebugDraw", geode::Priority::First);
-  }
-
-  void updateDebugDraw() {
-    if (TrajectorySim::isSimulating()) {
-      return;
-    }
-    GJBaseGameLayer::updateDebugDraw();
-  }
-
   void updateTimeMod(float speed, bool players, bool noEffects) {
     if (TrajectorySim::isSimulating()) {
       if (m_player1) {
