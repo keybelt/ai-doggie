@@ -83,13 +83,6 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
   }
 
-  void destroyPlayer(PlayerObject *player, GameObject *object) {
-    if (TrajectorySim::isSimulating()) {
-      TrajectorySim::handleSimulationDeath(player);
-      return;
-    }
-    PlayLayer::destroyPlayer(player, object);
-  }
 
   void onQuit() {
     TrajectorySim::quit();
