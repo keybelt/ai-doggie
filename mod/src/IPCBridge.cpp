@@ -37,6 +37,19 @@ static SharedData *data = nullptr;
 static int lastFrameIdx = -1;
 static int fileDescriptor = -1;
 static size_t s_macroIndex = 0;
+static bool s_ipcConnected = false;
+
+/// Unmap the shared memory buffer.
+static void closeShm() {
+  if (!data)
+    return;
+
+  munmap(data, sizeof(SharedData));
+  close(fileDescriptor);
+  fileDescriptor = -1;
+  data = nullptr;
+  s_ipcConnected = false;
+}
 
 /// Retrieve the shared memory buffer.
 static void initShm() {
@@ -50,19 +63,13 @@ static void initShm() {
       data = nullptr;
       close(fileDescriptor);
       fileDescriptor = -1;
+      s_ipcConnected = false;
+    } else {
+      s_ipcConnected = true;
     }
+  } else {
+    s_ipcConnected = false;
   }
-}
-
-/// Unmap the shared memory buffer on level exit.
-static void closeShm() {
-  if (!data)
-    return;
-
-  munmap(data, sizeof(SharedData));
-  close(fileDescriptor);
-  fileDescriptor = -1;
-  data = nullptr;
 }
 
 class $modify(MyPlayLayer, PlayLayer) {
@@ -71,6 +78,7 @@ class $modify(MyPlayLayer, PlayLayer) {
       return false;
     }
 
+    closeShm();
     initShm();
     TrajectorySim::init(this);
     lastFrameIdx = -1;
@@ -81,12 +89,13 @@ class $modify(MyPlayLayer, PlayLayer) {
   void resetLevel() {
     PlayLayer::resetLevel();
     if (!TrajectorySim::isSimulating()) {
+      closeShm();
+      initShm();
       TrajectorySim::init(this);
       lastFrameIdx = -1;
       s_macroIndex = 0;
     }
   }
-
 
   void onQuit() {
     TrajectorySim::quit();
@@ -99,10 +108,13 @@ class $modify(MyPlayLayer, PlayLayer) {
       return;
     }
 
-    if (!data) {
-      initShm();
-      if (!data)
-        return;
+    if (!s_ipcConnected || !data) {
+      return;
+    }
+
+    if (data->frameReadyBin == -1) {
+      closeShm();
+      return;
     }
 
     // GD 2.208 advances m_currentProgress by 8 per 60Hz frame (2 per 240Hz tick)
@@ -110,8 +122,12 @@ class $modify(MyPlayLayer, PlayLayer) {
     if (frame60Idx == lastFrameIdx)
       return;
 
-    // Lockstep handshake: wait for Python to consume the previous frame before writing the next
+    // Lockstep handshake: wait for Python to consume previous frame (or signal session end)
     while (data->frameReadyBin == 1) {
+      if (data->frameReadyBin == -1) {
+        closeShm();
+        return;
+      }
       std::this_thread::yield();
     }
 
@@ -140,7 +156,7 @@ class $modify(MyPlayLayer, PlayLayer) {
 
 static inline bool isLiveGameplayActive() {
   auto pl = PlayLayer::get();
-  return pl && !pl->m_isPaused && pl->m_started && !pl->m_playerDied && !pl->m_hasCompletedLevel;
+  return s_ipcConnected && pl && !pl->m_isPaused && pl->m_started && !pl->m_playerDied && !pl->m_hasCompletedLevel;
 }
 
 class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {

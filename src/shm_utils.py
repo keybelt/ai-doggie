@@ -24,7 +24,18 @@ SHM_SIZE = HEADER_SIZE + FRAME_SIZE + (MAX_MACRO_EVENTS * MACRO_EVENT_SIZE)
 MACRO_OFFSET = HEADER_SIZE + FRAME_SIZE
 
 
-def init_shm() -> SharedMemory:
+class GDSharedMemory(SharedMemory):
+    """SharedMemory wrapper that signals C++ mod on close."""
+
+    def close(self):
+        try:
+            pack_into("i", self.buf, 4, -1)
+        except Exception:
+            pass
+        super().close()
+
+
+def init_shm() -> GDSharedMemory:
     """Create or open POSIX shared memory buffer matching GDMem structure."""
     try:
         shm = SharedMemory(name=SHM_NAME)
@@ -33,7 +44,7 @@ def init_shm() -> SharedMemory:
     except FileNotFoundError:
         pass
 
-    shm = SharedMemory(
+    shm = GDSharedMemory(
         name=SHM_NAME,
         create=True,
         size=SHM_SIZE,
@@ -83,6 +94,14 @@ def get_frame(shm: SharedMemory, width: int, height: int) -> np.ndarray:
 def acknowledge_handshake(shm: SharedMemory) -> None:
     """Reset frameReadyBin to 0 to signal C++ that the frame was consumed."""
     pack_into("i", shm.buf, 4, 0)
+
+
+def close_session(shm: SharedMemory) -> None:
+    """Signal C++ mod that recording or inference session has ended."""
+    try:
+        pack_into("i", shm.buf, 4, -1)
+    except Exception:
+        pass
 
 
 def get_telemetry(shm: SharedMemory) -> dict[str, float]:

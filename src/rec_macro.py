@@ -11,7 +11,14 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
-from shm_utils import acknowledge_handshake, get_frame, init_shm, load_macro_to_shm, wait_for_next_frame
+from shm_utils import (
+    acknowledge_handshake,
+    close_session,
+    get_frame,
+    init_shm,
+    load_macro_to_shm,
+    wait_for_next_frame,
+)
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 with CONFIG_PATH.open() as f:
@@ -102,14 +109,14 @@ def run_recording_loop(
 
         is_dead = False
         if current_frame < last_frame:
-            print("\nDeath detected! Stopping recording...\n")
+            print("\r\033[KDeath detected! Stopping recording...\n")
             is_dead = True
-            acknowledge_handshake(shm)
+            close_session(shm)
             break
 
         if current_frame > max_frame_60:
-            print("\nMacro finished! Stopping recording...")
-            acknowledge_handshake(shm)
+            print("\r\033[KMacro finished! Stopping recording...\n")
+            close_session(shm)
             break
 
         last_frame = current_frame
@@ -117,7 +124,8 @@ def run_recording_loop(
         acknowledge_handshake(shm)
 
         if frame_idx >= RECORDING_BUFFER_SIZE:
-            print("Frame buffer exceeded.")
+            print("\r\033[KFrame buffer exceeded.")
+            close_session(shm)
             break
 
         ttd_rel = telem["ttd_release"]
@@ -132,8 +140,8 @@ def run_recording_loop(
 
         if frame_idx % log_interval == 0:
             print(
-                f"\rFrames: {frame_idx} | Horizon: {max_h:.1f}f | "
-                f"TTD [R/H/I]: [{ttd_rel:.1f}, {ttd_hold:.1f}, {ttd_imp:.1f}]",
+                f"\r\033[KFrames: {frame_idx} | Horizon: {max_h:.1f}f | "
+                f"TTD [R/H/I]: [{ttd_rel:5.1f}, {ttd_hold:5.1f}, {ttd_imp:5.1f}]",
                 end="",
                 flush=True,
             )
@@ -155,7 +163,7 @@ def record(filepath: Path):
     try:
         frames, raw_ttd, max_horizons, is_dead = run_recording_loop(shm, macro_events)
         if is_dead:
-            filepath.unlink()
+            filepath.unlink(missing_ok=True)
             return
 
         data_dir = Path(__file__).resolve().parents[1] / "data"
@@ -167,8 +175,9 @@ def record(filepath: Path):
             f.create_dataset("ttd", data=raw_ttd, compression="lzf")
             f.create_dataset("max_horizon", data=max_horizons, compression="lzf")
         print(f"\nSaved recording to {save_path}\n")
-        filepath.unlink()
+        filepath.unlink(missing_ok=True)
     finally:
+        close_session(shm)
         shm.close()
         shm.unlink()
 
