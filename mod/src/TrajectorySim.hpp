@@ -5,10 +5,17 @@
 using namespace geode::prelude;
 
 namespace TrajectorySim {
+struct SimResult {
+  float ttdRelease = 0.0f;
+  float ttdHold = 0.0f;
+  float ttdImpulse = 0.0f;
+  float maxHorizon = 0.0f;
+};
+
 void init(PlayLayer *pl);
 void quit();
 void handleButtonPress(bool down, bool isPlayer1);
 void handleSimulationDeath(PlayerObject *player);
 bool isSimulating();
-void simulate(PlayLayer *pl);
+SimResult simulate(PlayLayer *pl);
 } // namespace TrajectorySim

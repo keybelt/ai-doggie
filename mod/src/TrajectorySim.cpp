@@ -1,5 +1,4 @@
 #include "TrajectorySim.hpp"
-#include "TrajectoryDrawer.hpp"
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/AchievementNotifier.hpp>
@@ -7,6 +6,9 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+
+#include <algorithm>
+#include <cmath>
 
 using namespace geode::prelude;
 
@@ -19,15 +21,21 @@ static bool s_player2Pressed = false;
 // 60.0f / 240.0f = 0.25f per tick
 static constexpr float BASE_FRAME_DT = 0.25f;
 
+// Simulation ticks per 60Hz video frame (240 TPS / 60 FPS = 4 sub-ticks per frame).
+// Dividing raw 240 TPS iterations by TICKS_PER_FRAME normalizes telemetry into 60Hz video frame units.
+// Note: While discounting could mathematically operate on raw 240Hz ticks by adjusting gamma,
+// converting to 60Hz frames maintains strict consistency across the codebase (matching 60 FPS
+// video recording, model recurrent sequence timesteps T, and ttdGamma configured in config.json).
+static constexpr float TICKS_PER_FRAME = 4.0f;
+
 bool isSimulating() { return s_simulating; }
 
-void init(PlayLayer *pl) { TrajectoryDrawer::get()->init(pl); }
+void init(PlayLayer *pl) {}
 
 void quit() {
   s_simulating = false;
   s_player1Pressed = false;
   s_player2Pressed = false;
-  TrajectoryDrawer::get()->quit();
 }
 
 void handleButtonPress(bool down, bool isPlayer1) {
@@ -51,18 +59,12 @@ enum class TrajectoryMode {
   Impulse,
 };
 
-static TrajectoryBranch simulateBranch(PlayLayer *pl, TrajectoryMode mode, float dt) {
+static float simulateBranch(PlayLayer *pl, TrajectoryMode mode, float dt) {
   s_simulationDead = false;
   PlayerObject *p1 = pl->m_player1;
   PlayerObject *p2 = (pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
-  TrajectoryBranch branch;
   if (!p1)
-    return branch;
-
-  branch.p1.push_back(p1->getPosition());
-  if (p2) {
-    branch.p2.push_back(p2->getPosition());
-  }
+    return 0.0f;
 
   cocos2d::CCNode *parent = p1->getParent() ? p1->getParent() : pl->m_objectLayer;
   cocos2d::CCAffineTransform toWorld =
@@ -100,37 +102,32 @@ static TrajectoryBranch simulateBranch(PlayLayer *pl, TrajectoryMode mode, float
 
     p1->update(dt);
     pl->checkCollisions(p1, dt, false);
-    if (s_simulationDead || p1->m_isDead)
-      break;
+    if (s_simulationDead || p1->m_isDead) {
+      return static_cast<float>(i) / TICKS_PER_FRAME;
+    }
 
     if (p2) {
       p2->update(dt);
       pl->checkCollisions(p2, dt, false);
-      if (s_simulationDead || p2->m_isDead)
-        break;
+      if (s_simulationDead || p2->m_isDead) {
+        return static_cast<float>(i) / TICKS_PER_FRAME;
+      }
     }
 
-    branch.p1.push_back(p1->getPosition());
-
-    if (p2) {
-      branch.p2.push_back(p2->getPosition());
-    }
-
-    bool p1Done = isPastScreenHorizontal(p1) || p1->m_isDead;
-    bool p2Done = !p2 || isPastScreenHorizontal(p2) || p2->m_isDead;
+    bool p1Done = isPastScreenHorizontal(p1);
+    bool p2Done = !p2 || isPastScreenHorizontal(p2);
     if (p1Done && p2Done) {
-      break;
+      return static_cast<float>(i + 1) / TICKS_PER_FRAME;
     }
   }
-
-  return branch;
 }
 
-void simulate(PlayLayer *pl) {
+SimResult simulate(PlayLayer *pl) {
+  SimResult result;
   if (!pl || !pl->m_player1 || s_simulating)
-    return;
+    return result;
   if (!pl->m_started || pl->m_isPaused || pl->m_playerDied || pl->m_hasCompletedLevel || pl->m_player1->m_isDead) {
-    return;
+    return result;
   }
 
   float warp = (pl->m_gameState.m_timeWarp > 0.f) ? pl->m_gameState.m_timeWarp : 1.f;
@@ -146,7 +143,7 @@ void simulate(PlayLayer *pl) {
   CheckpointObject *cp = pl->createCheckpoint();
   if (!cp) {
     pl->m_isPracticeMode = wasPractice;
-    return;
+    return result;
   }
   cp->retain();
   if (cp->m_physicalCheckpointObject) {
@@ -165,19 +162,39 @@ void simulate(PlayLayer *pl) {
 
   s_simulating = true;
 
-  // 2. Step forward headlessly & reset level to checkpoint
-  TrajectoryData data;
-  data.releaseBranch = simulateBranch(pl, TrajectoryMode::Release, dt); // Release branch (Red)
+  // Baseline expected horizontal travel frames to screen edge
+  cocos2d::CCNode *parent = p1->getParent() ? p1->getParent() : pl->m_objectLayer;
+  cocos2d::CCAffineTransform toWorld =
+      parent ? parent->nodeToWorldTransform() : cocos2d::CCAffineTransformMakeIdentity();
+  cocos2d::CCSize winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
+  cocos2d::CCPoint screenPos = cocos2d::CCPointApplyAffineTransform(p1->getPosition(), toWorld);
+  float remainingDist = p1->m_isGoingLeft ? screenPos.x : (winSize.width - screenPos.x);
+  if (remainingDist < 0.0f)
+    remainingDist = 0.0f;
+
+  float startX = p1->getPositionX();
+  p1->update(dt);
+  float dx = std::abs(p1->getPositionX() - startX);
+  p1->setPositionX(startX);
+  float expectedFrames = (remainingDist / (dx > 0.0001f ? dx : 1.0f)) / TICKS_PER_FRAME;
+
+  // 2. Step forward headlessly & reset level to checkpoint for each action
+  result.ttdRelease = simulateBranch(pl, TrajectoryMode::Release, dt);
   pl->resetLevel();
   pl->loadLastCheckpoint();
 
-  data.holdBranch = simulateBranch(pl, TrajectoryMode::Hold, dt); // Hold branch (Green)
+  result.ttdHold = simulateBranch(pl, TrajectoryMode::Hold, dt);
   pl->resetLevel();
   pl->loadLastCheckpoint();
 
-  data.impulseBranch = simulateBranch(pl, TrajectoryMode::Impulse, dt); // Impulse branch (Yellow)
+  result.ttdImpulse = simulateBranch(pl, TrajectoryMode::Impulse, dt);
   pl->resetLevel();
   pl->loadLastCheckpoint();
+
+  result.maxHorizon = std::max({expectedFrames, result.ttdRelease, result.ttdHold, result.ttdImpulse});
+  result.ttdRelease = std::min(result.ttdRelease, result.maxHorizon);
+  result.ttdHold = std::min(result.ttdHold, result.maxHorizon);
+  result.ttdImpulse = std::min(result.ttdImpulse, result.maxHorizon);
 
   // 3. Clean up snapshot checkpoint
   pl->removeCheckpoint(false);
@@ -189,10 +206,6 @@ void simulate(PlayLayer *pl) {
   if (p2)
     p2->m_playEffects = p2Effects;
 
-  // Crucial: loadLastCheckpoint restored m_position, but did NOT recompute m_orientedBox!
-  // Without this, m_orientedBox remains stuck at the simulated death coordinates, causing
-  // Eclipse's rotated player hitbox to render at the death point (phantom dummy hitbox)
-  // while the live player loses the fill alpha contributed by the rotated box.
   p1->updateOrientedBox();
   if (p2) {
     p2->updateOrientedBox();
@@ -200,13 +213,10 @@ void simulate(PlayLayer *pl) {
 
   s_simulating = false;
 
-  // Refresh Eclipse hitboxes for the live frame:
-  // updateVisibility(0.0f) triggers Eclipse's ShowHitboxesPLHook::updateVisibility ->
-  // visitHitboxes(), which clears Eclipse's drawNode and redraws all hitboxes cleanly
-  // at the restored live player position and newly updated orientedBox.
+  // Refresh Eclipse hitboxes for the live frame
   pl->updateVisibility(0.0f);
 
-  TrajectoryDrawer::get()->render(pl, data);
+  return result;
 }
 } // namespace TrajectorySim
 
