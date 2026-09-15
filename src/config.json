@@ -3,8 +3,7 @@
         "hiddenDim": 64,
         "attnDim": 32,
         "numHeads": 8,
-        "actionDim": 2,
-        "numPolicyHeads": 8
+        "actionDim": 3
     },
     "training": {
         "batchSize": 16,
@@ -15,17 +14,7 @@
         "learningRate": 1e-3,
         "maxGradNorm": 1.0,
         "evalFreqSteps": 100,
-        "classWeights": [
-            1.0,
-            2.2759
-        ],
-        "timingToleranceWindows": [
-            1,
-            2,
-            3,
-            5
-        ],
-        "wtaTau": 0.1,
+        "ttdGamma": 0.95,
         "weightDecay": 0.01,
         "warmupRatio": 0.03,
         "decayRatio": 0.07,
