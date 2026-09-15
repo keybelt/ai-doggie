@@ -13,7 +13,10 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 SHM_NAME = "GDMem"
-HEADER_SIZE = 12  # 3 int32s: frameIdx, frameReadyBin, macroCount
+# 28 bytes header:
+# 3 int32s: frameIdx, frameReadyBin, macroCount
+# 4 float32s: ttdRelease, ttdHold, ttdImpulse, maxHorizon
+HEADER_SIZE = 28
 FRAME_SIZE = CONFIG["frame"]["width"] * CONFIG["frame"]["height"] * 3
 MAX_MACRO_EVENTS = CONFIG["data"]["recordingBufferSize"]
 MACRO_EVENT_SIZE = 8  # 2 int32s: frame, down
@@ -82,7 +85,22 @@ def acknowledge_handshake(shm: SharedMemory) -> None:
     pack_into("i", shm.buf, 4, 0)
 
 
-def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool]:
+def get_telemetry(shm: SharedMemory) -> dict[str, float]:
+    """Read survival telemetry and dynamic screen horizon from shared memory header.
+
+    Returns:
+        dict[str, float]: Dictionary with ttd_release, ttd_hold, ttd_impulse, max_horizon.
+    """
+    ttd_rel, ttd_hold, ttd_imp, max_h = unpack("4f", shm.buf[12:28])
+    return {
+        "ttd_release": float(ttd_rel),
+        "ttd_hold": float(ttd_hold),
+        "ttd_impulse": float(ttd_imp),
+        "max_horizon": float(max_h),
+    }
+
+
+def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool, dict[str, float]]:
     """Checks the shared memory header state to see if a new frame is ready.
 
     Args:
@@ -90,16 +108,17 @@ def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool]:
         last_tick: The last processed game tick.
 
     Returns:
-        tuple[int, bool]: (current_tick, is_new_frame_ready)
+        tuple[int, bool, dict[str, float]]: (current_tick, is_new_frame_ready, telemetry_dict)
     """
     current_tick, frame_ready = unpack("2i", shm.buf[0:8])
+    telemetry = get_telemetry(shm)
 
     if frame_ready != 1:
         time.sleep(0)
-        return current_tick, False
+        return current_tick, False, telemetry
 
     if current_tick == last_tick:
         acknowledge_handshake(shm)
-        return current_tick, False
+        return current_tick, False, telemetry
 
-    return current_tick, True
+    return current_tick, True, telemetry

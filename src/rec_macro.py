@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
-from shm_utils import acknowledge_handshake, get_frame, init_shm, wait_for_next_frame
+from shm_utils import acknowledge_handshake, get_frame, init_shm, load_macro_to_shm, wait_for_next_frame
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 with CONFIG_PATH.open() as f:
@@ -67,56 +67,33 @@ def process_macro(parsed_macro: dict) -> list[dict]:
     return raw_events
 
 
-def build_macro_actions_60(macro_events: list[dict]) -> tuple[np.ndarray, int]:
-    """Pre-populate a 60Hz binary action array from raw 240Hz macro events.
-
-    Returns:
-        Tuple of (dense_60hz_actions, max_frame_60).
-    """
-    max_tick_240 = max(e["frame"] for e in macro_events)
-    max_frame_60 = (max_tick_240 // 4) + 60
-    macro_actions_240 = np.zeros(max_tick_240 + 16, dtype=np.uint8)
-
-    prev_frame = 0
-    current_action = 0
-    for ev in macro_events:
-        frame = ev["frame"]
-        down = 1 if ev["down"] else 0
-        macro_actions_240[prev_frame:frame] = current_action
-        prev_frame = frame
-        current_action = down
-    macro_actions_240[prev_frame:] = current_action
-
-    num_frames = (len(macro_actions_240) + 3) // 4
-    macro_actions_60 = np.zeros(num_frames, dtype=np.uint8)
-    for f in range(num_frames):
-        macro_actions_60[f] = 1 if np.any(macro_actions_240[f * 4 : (f + 1) * 4] > 0) else 0
-
-    return macro_actions_60, max_frame_60
-
-
 def run_recording_loop(
     shm: SharedMemory,
-    macro_actions_60: np.ndarray,
-    max_frame_60: int,
-) -> tuple[np.ndarray, np.ndarray, bool]:
-    """Run 60Hz frame and action recording loop.
+    macro_events: list[dict],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Run 60Hz frame and raw TTD telemetry recording loop.
 
     Returns:
-        Tuple of (recorded_frames, recorded_actions, is_dead_flag).
+        Tuple of (recorded_frames, raw_ttd, max_horizons, is_dead_flag).
     """
     frame_w: int = CONFIG["frame"]["width"]
     frame_h: int = CONFIG["frame"]["height"]
     log_interval: int = max(1, round(CONFIG["logIntervalSec"] * CONFIG["fps"]))
 
+    max_tick_240 = max((e["frame"] for e in macro_events))
+    max_frame_60 = (max_tick_240 // 4) + 60
+
+    load_macro_to_shm(shm, macro_events)
+
     frames_buf = np.empty((RECORDING_BUFFER_SIZE, frame_h, frame_w, 3), dtype=np.uint8)
-    actions_buf = np.zeros(RECORDING_BUFFER_SIZE, dtype=np.uint8)
+    raw_ttd_buf = np.zeros((RECORDING_BUFFER_SIZE, 3), dtype=np.float32)
+    max_horizon_buf = np.zeros(RECORDING_BUFFER_SIZE, dtype=np.float32)
 
     frame_idx = 0
     last_frame = -1
 
     while True:
-        current_frame, is_ready = wait_for_next_frame(shm, last_frame)
+        current_frame, is_ready, telem = wait_for_next_frame(shm, last_frame)
         if not is_ready:
             continue
 
@@ -143,25 +120,40 @@ def run_recording_loop(
             print("Frame buffer exceeded.")
             break
 
-        action = macro_actions_60[current_frame] if current_frame < len(macro_actions_60) else 0
+        ttd_rel = telem["ttd_release"]
+        ttd_hold = telem["ttd_hold"]
+        ttd_imp = telem["ttd_impulse"]
+        max_h = telem["max_horizon"]
+
         frames_buf[frame_idx] = raw_frame
-        actions_buf[frame_idx] = action
+        raw_ttd_buf[frame_idx] = [ttd_rel, ttd_hold, ttd_imp]
+        max_horizon_buf[frame_idx] = max_h
         frame_idx += 1
 
         if frame_idx % log_interval == 0:
-            print(f"\rFrames recorded: {frame_idx}", end="", flush=True)
+            print(
+                f"\rFrames: {frame_idx} | Horizon: {max_h:.1f}f | "
+                f"TTD [R/H/I]: [{ttd_rel:.1f}, {ttd_hold:.1f}, {ttd_imp:.1f}]",
+                end="",
+                flush=True,
+            )
 
-    return frames_buf[:frame_idx], actions_bin_buf[:frame_idx], is_dead
+    return (
+        frames_buf[:frame_idx],
+        raw_ttd_buf[:frame_idx],
+        max_horizon_buf[:frame_idx],
+        is_dead,
+    )
 
 
 def record(filepath: Path):
-    """Parse macro, set up shared memory, and record frames into an HDF5 dataset file."""
+    """Parse macro, set up shared memory, and record frames paired with raw TTD into HDF5."""
     parsed_macro = parse_macro_file(filepath)
     macro_events = process_macro(parsed_macro)
     shm = init_shm()
 
     try:
-        frames, actions_bin, is_dead = run_recording_loop(shm, macro_events)
+        frames, raw_ttd, max_horizons, is_dead = run_recording_loop(shm, macro_events)
         if is_dead:
             filepath.unlink()
             return
@@ -172,8 +164,9 @@ def record(filepath: Path):
         save_path = data_dir / f"{filepath.name}-{time.strftime('%m%d%H%M%S')}.h5"
         with h5py.File(save_path, "w") as f:
             f.create_dataset("frames", data=frames, compression="gzip", compression_opts=4, chunks=(64, 480, 640, 3))
-            f.create_dataset("actions_bin", data=actions_bin, compression="lzf", compression_opts=4)
-        print(f"Saved recording to {save_path}\n")
+            f.create_dataset("ttd", data=raw_ttd, compression="lzf")
+            f.create_dataset("max_horizon", data=max_horizons, compression="lzf")
+        print(f"\nSaved recording to {save_path}\n")
         filepath.unlink()
     finally:
         shm.close()
