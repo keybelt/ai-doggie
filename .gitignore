@@ -11,3 +11,4 @@ checkpoints
 mod/*
 !mod/src
 test_shm.py
+stereo madness.gdr
