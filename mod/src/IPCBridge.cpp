@@ -162,13 +162,6 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     }
     GJBaseGameLayer::update(dt);
   }
-
-  void handleButton(bool down, int button, bool isPlayer1) {
-    if (button == (int)PlayerButton::Jump || button == 1) {
-      TrajectorySim::handleButtonPress(down, isPlayer1);
-    }
-    GJBaseGameLayer::handleButton(down, button, isPlayer1);
-  }
 };
 
 class $modify(MyDirector, cocos2d::CCDirector) {

@@ -15,8 +15,7 @@ using namespace geode::prelude;
 namespace TrajectorySim {
 static bool s_simulating = false;
 static bool s_simulationDead = false;
-static bool s_player1Pressed = false;
-static bool s_player2Pressed = false;
+
 // Geometry Dash 2.2 runs physics at 240 TPS, where dt is measured in 60Hz frame units:
 // 60.0f / 240.0f = 0.25f per tick
 static constexpr float BASE_FRAME_DT = 0.25f;
@@ -34,16 +33,6 @@ void init(PlayLayer *pl) {}
 
 void quit() {
   s_simulating = false;
-  s_player1Pressed = false;
-  s_player2Pressed = false;
-}
-
-void handleButtonPress(bool down, bool isPlayer1) {
-  if (isPlayer1) {
-    s_player1Pressed = down;
-  } else {
-    s_player2Pressed = down;
-  }
 }
 
 void handleSimulationDeath(PlayerObject *player) {
@@ -136,6 +125,13 @@ SimResult simulate(PlayLayer *pl) {
   PlayerObject *p1 = pl->m_player1;
   PlayerObject *p2 = (pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
 
+  // Preserve live holding buttons (the only input state not stored in PlayerCheckpoint)
+  auto p1HoldingButtons = p1->m_holdingButtons;
+  gd::map<int, bool> p2HoldingButtons;
+  if (p2) {
+    p2HoldingButtons = p2->m_holdingButtons;
+  }
+
   bool wasPractice = pl->m_isPracticeMode;
   pl->m_isPracticeMode = true;
 
@@ -172,24 +168,39 @@ SimResult simulate(PlayLayer *pl) {
   if (remainingDist < 0.0f)
     remainingDist = 0.0f;
 
-  float startX = p1->getPositionX();
-  p1->update(dt);
-  float dx = std::abs(p1->getPositionX() - startX);
-  p1->setPositionX(startX);
+  float dx = std::abs(p1->m_playerSpeed) * dt;
   float expectedFrames = (remainingDist / (dx > 0.0001f ? dx : 1.0f)) / TICKS_PER_FRAME;
 
   // 2. Step forward headlessly & reset level to checkpoint for each action
   result.ttdRelease = simulateBranch(pl, TrajectoryMode::Release, dt);
   pl->resetLevel();
   pl->loadLastCheckpoint();
+  p1->m_holdingButtons = p1HoldingButtons;
+  p1->m_isDead = false;
+  if (p2) {
+    p2->m_holdingButtons = p2HoldingButtons;
+    p2->m_isDead = false;
+  }
 
   result.ttdHold = simulateBranch(pl, TrajectoryMode::Hold, dt);
   pl->resetLevel();
   pl->loadLastCheckpoint();
+  p1->m_holdingButtons = p1HoldingButtons;
+  p1->m_isDead = false;
+  if (p2) {
+    p2->m_holdingButtons = p2HoldingButtons;
+    p2->m_isDead = false;
+  }
 
   result.ttdImpulse = simulateBranch(pl, TrajectoryMode::Impulse, dt);
   pl->resetLevel();
   pl->loadLastCheckpoint();
+  p1->m_holdingButtons = p1HoldingButtons;
+  p1->m_isDead = false;
+  if (p2) {
+    p2->m_holdingButtons = p2HoldingButtons;
+    p2->m_isDead = false;
+  }
 
   result.maxHorizon = std::max({expectedFrames, result.ttdRelease, result.ttdHold, result.ttdImpulse});
   result.ttdRelease = std::min(result.ttdRelease, result.maxHorizon);
@@ -202,6 +213,13 @@ SimResult simulate(PlayLayer *pl) {
   pl->m_isPracticeMode = wasPractice;
 
   // Restore live player state
+  p1->m_holdingButtons = p1HoldingButtons;
+  p1->m_isDead = false;
+  if (p2) {
+    p2->m_holdingButtons = p2HoldingButtons;
+    p2->m_isDead = false;
+  }
+
   p1->m_playEffects = p1Effects;
   if (p2)
     p2->m_playEffects = p2Effects;
@@ -241,17 +259,6 @@ class $modify(TrajectoryPLHook, PlayLayer) {
       return;
     }
     PlayLayer::destroyPlayer(player, object);
-  }
-};
-
-class $modify(TrajectoryPOHook, PlayerObject) {
-  void loadFromCheckpoint(PlayerCheckpoint *cp) {
-    PlayerObject::loadFromCheckpoint(cp);
-    m_isDead = false;
-    this->setPosition(this->m_position);
-
-    bool isPressed = m_isSecondPlayer ? TrajectorySim::s_player2Pressed : TrajectorySim::s_player1Pressed;
-    isPressed ? this->pushButton(PlayerButton::Jump) : this->releaseButton(PlayerButton::Jump);
   }
 };
 

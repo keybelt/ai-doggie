@@ -14,7 +14,6 @@ struct SimResult {
 
 void init(PlayLayer *pl);
 void quit();
-void handleButtonPress(bool down, bool isPlayer1);
 void handleSimulationDeath(PlayerObject *player);
 bool isSimulating();
 SimResult simulate(PlayLayer *pl);
