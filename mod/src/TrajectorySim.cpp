@@ -21,10 +21,7 @@ static bool s_simulationDead = false;
 static constexpr float BASE_FRAME_DT = 0.25f;
 
 // Simulation ticks per 60Hz video frame (240 TPS / 60 FPS = 4 sub-ticks per frame).
-// Dividing raw 240 TPS iterations by TICKS_PER_FRAME normalizes telemetry into 60Hz video frame units.
-// Note: While discounting could mathematically operate on raw 240Hz ticks by adjusting gamma,
-// converting to 60Hz frames maintains strict consistency across the codebase (matching 60 FPS
-// video recording, model recurrent sequence timesteps T, and ttdGamma configured in config.json).
+// Dividing raw 240 TPS iterations by TICKS_PER_FRAME converts telemetry directly into 60Hz video frame units.
 static constexpr float TICKS_PER_FRAME = 4.0f;
 
 bool isSimulating() { return s_simulating; }
@@ -158,19 +155,6 @@ SimResult simulate(PlayLayer *pl) {
 
   s_simulating = true;
 
-  // Baseline expected horizontal travel frames to screen edge
-  cocos2d::CCNode *parent = p1->getParent() ? p1->getParent() : pl->m_objectLayer;
-  cocos2d::CCAffineTransform toWorld =
-      parent ? parent->nodeToWorldTransform() : cocos2d::CCAffineTransformMakeIdentity();
-  cocos2d::CCSize winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-  cocos2d::CCPoint screenPos = cocos2d::CCPointApplyAffineTransform(p1->getPosition(), toWorld);
-  float remainingDist = p1->m_isGoingLeft ? screenPos.x : (winSize.width - screenPos.x);
-  if (remainingDist < 0.0f)
-    remainingDist = 0.0f;
-
-  float dx = std::abs(p1->m_playerSpeed) * dt;
-  float expectedFrames = (remainingDist / (dx > 0.0001f ? dx : 1.0f)) / TICKS_PER_FRAME;
-
   // 2. Step forward headlessly & reset level to checkpoint for each action
   result.ttdRelease = simulateBranch(pl, TrajectoryMode::Release, dt);
   pl->resetLevel();
@@ -201,11 +185,6 @@ SimResult simulate(PlayLayer *pl) {
     p2->m_holdingButtons = p2HoldingButtons;
     p2->m_isDead = false;
   }
-
-  result.maxHorizon = std::max({expectedFrames, result.ttdRelease, result.ttdHold, result.ttdImpulse});
-  result.ttdRelease = std::min(result.ttdRelease, result.maxHorizon);
-  result.ttdHold = std::min(result.ttdHold, result.maxHorizon);
-  result.ttdImpulse = std::min(result.ttdImpulse, result.maxHorizon);
 
   // 3. Clean up snapshot checkpoint
   pl->removeCheckpoint(false);

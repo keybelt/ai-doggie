@@ -22,7 +22,6 @@ struct SharedData {
   volatile float ttdRelease;          // Raw frames to death (Release)
   volatile float ttdHold;             // Raw frames to death (Hold)
   volatile float ttdImpulse;          // Raw frames to death (Impulse)
-  volatile float maxHorizon;          // Dynamic screen horizon (60Hz frames)
   uint8_t frameBuffer[640 * 480 * 3]; // 921,600 bytes
 };
 
@@ -135,7 +134,6 @@ class $modify(MyPlayLayer, PlayLayer) {
     data->ttdRelease = sim.ttdRelease;
     data->ttdHold = sim.ttdHold;
     data->ttdImpulse = sim.ttdImpulse;
-    data->maxHorizon = sim.maxHorizon;
 
     // Capture 640x480 screen pixels from Cocos2d-x frame buffer at 60Hz
     glReadPixels(0, 0, 640, 480, GL_RGB, GL_UNSIGNED_BYTE, (void *)data->frameBuffer);

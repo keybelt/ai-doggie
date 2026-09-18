@@ -27,10 +27,10 @@ RECORDING_BUFFER_SIZE = CONFIG["data"]["recordingBufferSize"]
 
 def run_recording_loop(
     shm: SharedMemory,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+) -> tuple[np.ndarray, np.ndarray, bool]:
     """
     Returns:
-        Tuple of (recorded_frames, raw_ttd, max_horizons, is_dead_flag).
+        Tuple of (recorded_frames, raw_ttd, is_dead_flag).
     """
     frame_w: int = CONFIG["frame"]["width"]
     frame_h: int = CONFIG["frame"]["height"]
@@ -38,7 +38,6 @@ def run_recording_loop(
 
     frames_buf = np.empty((RECORDING_BUFFER_SIZE, frame_h, frame_w, 3), dtype=np.uint8)
     raw_ttd_buf = np.zeros((RECORDING_BUFFER_SIZE, 3), dtype=np.float32)
-    max_horizon_buf = np.zeros(RECORDING_BUFFER_SIZE, dtype=np.float32)
 
     frame_idx = 0
     last_frame = -1
@@ -71,16 +70,14 @@ def run_recording_loop(
             ttd_rel = telem["ttd_release"]
             ttd_hold = telem["ttd_hold"]
             ttd_imp = telem["ttd_impulse"]
-            max_h = telem["max_horizon"]
 
             frames_buf[frame_idx] = raw_frame
             raw_ttd_buf[frame_idx] = [ttd_rel, ttd_hold, ttd_imp]
-            max_horizon_buf[frame_idx] = max_h
             frame_idx += 1
 
             if frame_idx % log_interval == 0:
                 print(
-                    f"\r\033[KFrames: {frame_idx} | Horizon: {max_h:.1f}f | "
+                    f"\r\033[KFrames: {frame_idx} | "
                     f"TTD [R/H/I]: [{ttd_rel:5.1f}, {ttd_hold:5.1f}, {ttd_imp:5.1f}]",
                     end="",
                     flush=True,
@@ -95,7 +92,6 @@ def run_recording_loop(
     return (
         frames_buf[:frame_idx],
         raw_ttd_buf[:frame_idx],
-        max_horizon_buf[:frame_idx],
         is_dead,
     )
 
@@ -104,7 +100,7 @@ def main(session_name: str):
     shm = init_shm()
 
     try:
-        frames, raw_ttd, max_horizons, is_dead = run_recording_loop(shm)
+        frames, raw_ttd, is_dead = run_recording_loop(shm)
         if is_dead:
             print("Recording discarded due to player death.")
             return
@@ -116,7 +112,6 @@ def main(session_name: str):
         with h5py.File(save_path, "w") as f:
             f.create_dataset("frames", data=frames, compression="gzip", compression_opts=4, chunks=(64, 480, 640, 3))
             f.create_dataset("ttd", data=raw_ttd, compression="lzf")
-            f.create_dataset("max_horizon", data=max_horizons, compression="lzf")
         print(f"\nSaved {len(frames)} frames to {save_path}\n")
     finally:
         close_session(shm)

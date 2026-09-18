@@ -27,22 +27,6 @@ with CONFIG_PATH.open() as f:
 DEVICE = torch.device("mps")
 
 
-def compute_q_targets(ttd: Tensor, max_horizon: Tensor) -> Tensor:
-    """Convert raw survival frames into normalized discounted survival values.
-
-    Args:
-        ttd: [N, T, 3]
-        max_horizon: [N, T]
-
-    Returns:
-        Normalized discounted target values of shape [N, T, 3] in [0, 1].
-    """
-    gamma = CONFIG["training"]["ttdGamma"]
-    max_return = 1.0 - torch.pow(gamma, max_horizon.unsqueeze(-1))  # [N, T, 1]
-    targets = (1.0 - torch.pow(gamma, ttd)) / max_return  # [N, T, 3]
-    return targets
-
-
 class DatasetGenerator(IterableDataset):
     """Yield training batches built from parallel gameplay streams."""
 
@@ -58,46 +42,42 @@ class DatasetGenerator(IterableDataset):
                 random.shuffle(self.dataset_files)
         return self.dataset_files.pop(0)
 
-    def stream_file(self, filepath: Path) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, bool]]:
-        """Stream frame, raw TTD, and max horizon chunks from HDF5 file."""
+    def stream_file(self, filepath: Path) -> Iterator[tuple[np.ndarray, np.ndarray, bool]]:
+        """Stream frame and raw TTD chunks from HDF5 file."""
         seq_len = CONFIG["training"]["seqLen"]
         with h5py.File(filepath, "r") as f:
             frames_ds = f["frames"]
             num_chunks = len(frames_ds) // seq_len
-
             ttd_ds = f["ttd"]
-            horizon_ds = f["max_horizon"]
 
             for chunk_idx in range(num_chunks):
                 start = chunk_idx * seq_len
                 end = start + seq_len
-                yield frames_ds[start:end], ttd_ds[start:end], horizon_ds[start:end], (chunk_idx == 0)
+                yield frames_ds[start:end], ttd_ds[start:end], (chunk_idx == 0)
 
-    def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Batch together mini batches from each file stream."""
         batch_size = CONFIG["training"]["batchSize"]
         self.dataset_files = []
         file_streams = [self.stream_file(self.get_next_file()) for _ in range(batch_size)]
 
         while True:
-            batch_frames, batch_ttd, batch_horizons, batch_are_first = [], [], [], []
+            batch_frames, batch_ttd, batch_are_first = [], [], []
 
             for i in range(batch_size):
                 try:
-                    frames, ttd, horizon, is_first = next(file_streams[i])
+                    frames, ttd, is_first = next(file_streams[i])
                 except StopIteration:
                     file_streams[i] = self.stream_file(self.get_next_file())
-                    frames, ttd, horizon, is_first = next(file_streams[i])
+                    frames, ttd, is_first = next(file_streams[i])
 
                 batch_frames.append(frames)
                 batch_ttd.append(ttd)
-                batch_horizons.append(horizon)
                 batch_are_first.append(is_first)
 
             yield (
                 np.stack(batch_frames),
                 np.stack(batch_ttd),
-                np.stack(batch_horizons),
                 np.stack(batch_are_first),
             )
 
@@ -105,16 +85,14 @@ class DatasetGenerator(IterableDataset):
 def preprocess_inputs(
     frames: Tensor,
     ttd: Tensor,
-    max_horizon: Tensor,
     are_first: Tensor,
     hidden: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Normalize frames, mask hidden states on reset, and compute discounted survival targets.
+    """Normalize frames, mask hidden states on reset, and load raw survival frames.
 
     Args:
         frames: [N, T, H, W, C]
         ttd: [N, T, 3]
-        max_horizon: [N, T]
         are_first: [N]
         hidden: [N, 1, D]
 
@@ -125,10 +103,7 @@ def preprocess_inputs(
     hidden_state = hidden * keep_hidden  # [N, 1, D]
     frames_gpu = frames.to(DEVICE, non_blocking=True)  # Compact uint8 host-to-device transfer
     frames_norm = frames_gpu.to(dtype=torch.float32).mul_(1.0 / 255.0)  # [N, T, H, W, C]
-
-    ttd_gpu = ttd.to(DEVICE, dtype=torch.float32)  # [N, T, 3]
-    horizon_gpu = max_horizon.to(DEVICE, dtype=torch.float32)  # [N, T]
-    target_values = compute_q_targets(ttd_gpu, horizon_gpu)  # [N, T, 3]
+    target_values = ttd.to(DEVICE, dtype=torch.float32)  # [N, T, 3] raw survival frames
 
     return frames_norm, target_values, hidden_state
 
@@ -137,16 +112,14 @@ def process_batch(
     model: Model,
     frames: Tensor,
     ttd: Tensor,
-    max_horizon: Tensor,
     are_first: Tensor,
     hidden: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Pass batch through model, compute discounted targets on the fly, and compute MSE loss.
+    """Pass batch through model and compute MSE loss against raw survival frames.
 
     Args:
         frames: [N, T, H, W, C]
         ttd: [N, T, 3]
-        max_horizon: [N, T]
         are_first: [N]
         hidden: [N, 1, D]
 
@@ -156,7 +129,6 @@ def process_batch(
     frames_norm, target_values, hidden_state = preprocess_inputs(
         frames=frames,
         ttd=ttd,
-        max_horizon=max_horizon,
         are_first=are_first,
         hidden=hidden,
     )
@@ -363,7 +335,7 @@ def run_train_epoch(state: dict, steps: int) -> float:
 
     for i in range(steps):
         try:
-            frames, ttd, max_horizon, are_first = next(train_iter)
+            frames, ttd, are_first = next(train_iter)
         except StopIteration:
             break
         num_batches = i + 1
@@ -372,7 +344,6 @@ def run_train_epoch(state: dict, steps: int) -> float:
             model=model,
             frames=frames,
             ttd=ttd,
-            max_horizon=max_horizon,
             are_first=are_first,
             hidden=state["train_hidden"],
         )
@@ -411,7 +382,7 @@ def run_val(state: dict) -> tuple[float, float]:
     with torch.no_grad():
         for i in range(val_steps):
             try:
-                frames, ttd, max_horizon, are_first = next(val_iter)
+                frames, ttd, are_first = next(val_iter)
             except StopIteration:
                 break
             num_batches = i + 1
@@ -420,7 +391,6 @@ def run_val(state: dict) -> tuple[float, float]:
                 model=model,
                 frames=frames,
                 ttd=ttd,
-                max_horizon=max_horizon,
                 are_first=are_first,
                 hidden=val_hidden,
             )

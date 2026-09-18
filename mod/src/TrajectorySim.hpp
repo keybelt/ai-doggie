@@ -9,7 +9,6 @@ struct SimResult {
   float ttdRelease = 0.0f;
   float ttdHold = 0.0f;
   float ttdImpulse = 0.0f;
-  float maxHorizon = 0.0f;
 };
 
 void init(PlayLayer *pl);

@@ -11,7 +11,7 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 SHM_NAME = "GDMem"
-HEADER_SIZE = 24
+HEADER_SIZE = 20
 FRAME_WIDTH = CONFIG["frame"]["width"]
 FRAME_HEIGHT = CONFIG["frame"]["height"]
 FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT * 3
@@ -73,14 +73,13 @@ def close_session(shm: SharedMemory) -> None:
 def get_telemetry(shm: SharedMemory) -> dict[str, float]:
     """
     Returns:
-        dict of ttd_release, ttd_hold, ttd_impulse, max_horizon.
+        dict of ttd_release, ttd_hold, ttd_impulse (raw 60Hz frames).
     """
-    ttd_rel, ttd_hold, ttd_imp, max_h = unpack("4f", shm.buf[8:24])
+    ttd_rel, ttd_hold, ttd_imp = unpack("3f", shm.buf[8:20])
     return {
         "ttd_release": float(ttd_rel),
         "ttd_hold": float(ttd_hold),
         "ttd_impulse": float(ttd_imp),
-        "max_horizon": float(max_h),
     }
 
 
