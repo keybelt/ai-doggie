@@ -16,7 +16,6 @@ from shm_utils import (
     close_session,
     get_frame,
     init_shm,
-    load_macro_to_shm,
     wait_for_next_frame,
 )
 
@@ -89,8 +88,6 @@ def run_recording_loop(
 
     max_tick_240 = max((e["frame"] for e in macro_events))
     max_frame_60 = (max_tick_240 // 4) + 60
-
-    load_macro_to_shm(shm, macro_events)
 
     frames_buf = np.empty((RECORDING_BUFFER_SIZE, frame_h, frame_w, 3), dtype=np.uint8)
     raw_ttd_buf = np.zeros((RECORDING_BUFFER_SIZE, 3), dtype=np.float32)
