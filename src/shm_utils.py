@@ -1,5 +1,3 @@
-"""Shared memory utilities for communication between Python scripts and Geometry Dash."""
-
 import json
 import time
 from multiprocessing.shared_memory import SharedMemory
@@ -13,20 +11,14 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 SHM_NAME = "GDMem"
-# 28 bytes header:
-# 3 int32s: frameIdx, frameReadyBin, macroCount
-# 4 float32s: ttdRelease, ttdHold, ttdImpulse, maxHorizon
-HEADER_SIZE = 28
-FRAME_SIZE = CONFIG["frame"]["width"] * CONFIG["frame"]["height"] * 3
-MAX_MACRO_EVENTS = CONFIG["data"]["recordingBufferSize"]
-MACRO_EVENT_SIZE = 8  # 2 int32s: frame, down
-SHM_SIZE = HEADER_SIZE + FRAME_SIZE + (MAX_MACRO_EVENTS * MACRO_EVENT_SIZE)
-MACRO_OFFSET = HEADER_SIZE + FRAME_SIZE
+HEADER_SIZE = 24
+FRAME_WIDTH = CONFIG["frame"]["width"]
+FRAME_HEIGHT = CONFIG["frame"]["height"]
+FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT * 3
+SHM_SIZE = HEADER_SIZE + FRAME_SIZE
 
 
 class GDSharedMemory(SharedMemory):
-    """SharedMemory wrapper that signals C++ mod on close."""
-
     def close(self):
         try:
             pack_into("i", self.buf, 4, -1)
@@ -36,7 +28,6 @@ class GDSharedMemory(SharedMemory):
 
 
 def init_shm() -> GDSharedMemory:
-    """Create or open POSIX shared memory buffer matching GDMem structure."""
     try:
         shm = SharedMemory(name=SHM_NAME)
         shm.close()
@@ -53,51 +44,26 @@ def init_shm() -> GDSharedMemory:
     return shm
 
 
-def load_macro_to_shm(shm: SharedMemory, macro_events: list[dict]) -> None:
-    """Write raw 240Hz macro events (frame, down) into the shared memory macro buffer."""
-    count = min(len(macro_events), MAX_MACRO_EVENTS)
-    for i in range(count):
-        ev = macro_events[i]
-        offset = MACRO_OFFSET + (i * MACRO_EVENT_SIZE)
-        pack_into(
-            "2i",
-            shm.buf,
-            offset,
-            int(ev["frame"]),
-            1 if ev["down"] else 0,
-        )
-    pack_into("i", shm.buf, 8, count)
-
-
-def get_frame(shm: SharedMemory, width: int, height: int) -> np.ndarray:
-    """Read a frame buffer from shared memory starting at offset HEADER_SIZE and reshape it.
-
-    Args:
-        shm: The SharedMemory object.
-        width: Width of the frame.
-        height: Height of the frame.
-
-    Returns:
-        np.ndarray: The reshaped frame copy.
+def get_frame(shm: SharedMemory) -> np.ndarray:
     """
-    frame_size = width * height * 3
+    Returns:
+        ndarray representation of frame in height,width,alpha
+    """
     return (
         np.frombuffer(
-            shm.buf[HEADER_SIZE : HEADER_SIZE + frame_size],
+            shm.buf[HEADER_SIZE : HEADER_SIZE + FRAME_SIZE],
             dtype=np.uint8,
         )
-        .reshape((height, width, 3))
+        .reshape((FRAME_HEIGHT, FRAME_WIDTH, 3))
         .copy()
     )
 
 
 def acknowledge_handshake(shm: SharedMemory) -> None:
-    """Reset frameReadyBin to 0 to signal C++ that the frame was consumed."""
     pack_into("i", shm.buf, 4, 0)
 
 
 def close_session(shm: SharedMemory) -> None:
-    """Signal C++ mod that recording or inference session has ended."""
     try:
         pack_into("i", shm.buf, 4, -1)
     except Exception:
@@ -105,12 +71,11 @@ def close_session(shm: SharedMemory) -> None:
 
 
 def get_telemetry(shm: SharedMemory) -> dict[str, float]:
-    """Read survival telemetry and dynamic screen horizon from shared memory header.
-
-    Returns:
-        dict[str, float]: Dictionary with ttd_release, ttd_hold, ttd_impulse, max_horizon.
     """
-    ttd_rel, ttd_hold, ttd_imp, max_h = unpack("4f", shm.buf[12:28])
+    Returns:
+        dict of ttd_release, ttd_hold, ttd_impulse, max_horizon.
+    """
+    ttd_rel, ttd_hold, ttd_imp, max_h = unpack("4f", shm.buf[8:24])
     return {
         "ttd_release": float(ttd_rel),
         "ttd_hold": float(ttd_hold),
@@ -119,15 +84,14 @@ def get_telemetry(shm: SharedMemory) -> dict[str, float]:
     }
 
 
+def is_session_active(shm: SharedMemory) -> bool:
+    return unpack("i", shm.buf[4:8])[0] != -1
+
+
 def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool, dict[str, float]]:
-    """Checks the shared memory header state to see if a new frame is ready.
-
-    Args:
-        shm: SharedMemory object.
-        last_tick: The last processed game tick.
-
+    """
     Returns:
-        tuple[int, bool, dict[str, float]]: (current_tick, is_new_frame_ready, telemetry_dict)
+        current_tick, is_new_frame_ready, telemetry_dict
     """
     current_tick, frame_ready = unpack("2i", shm.buf[0:8])
     telemetry = get_telemetry(shm)

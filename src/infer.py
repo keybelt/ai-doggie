@@ -42,8 +42,6 @@ def init_model() -> Model:
 def run_inference_loop(model: Model, shm: SharedMemory):
     """Run real-time game frame capture, model forward pass, and latency benchmark."""
     hidden_dim: int = CONFIG["model"]["hiddenDim"]
-    frame_w: int = CONFIG["frame"]["width"]
-    frame_h: int = CONFIG["frame"]["height"]
     log_interval: int = CONFIG["logIntervalSec"] * CONFIG["fps"]
 
     hidden_state = torch.zeros(1, 1, hidden_dim, device=DEVICE)
@@ -52,7 +50,7 @@ def run_inference_loop(model: Model, shm: SharedMemory):
 
     with torch.inference_mode():
         while not is_shutdown:
-            current_tick, is_ready = wait_for_next_frame(shm, last_tick)
+            current_tick, is_ready, _ = wait_for_next_frame(shm, last_tick)
             if not is_ready:
                 continue
 
@@ -64,7 +62,7 @@ def run_inference_loop(model: Model, shm: SharedMemory):
                 hidden_state = torch.zeros(1, 1, hidden_dim, device=DEVICE)
 
             last_tick = current_tick
-            frame = get_frame(shm, frame_w, frame_h)
+            frame = get_frame(shm)
             acknowledge_handshake(shm)
 
             frame_tensor = (
@@ -78,9 +76,7 @@ def run_inference_loop(model: Model, shm: SharedMemory):
                 print(f"\rInference latency: {latency:.2f}ms", end="", flush=True)
 
 
-def infer():
-    """Coordinate shared memory, launch keyboard listener, and run inference."""
-
+def main():
     def on_press(key):
         global is_shutdown
         exit_key = Key[CONFIG["keys"]["exitKeyName"]]
@@ -102,4 +98,4 @@ def infer():
 
 
 if __name__ == "__main__":
-    infer()
+    main()

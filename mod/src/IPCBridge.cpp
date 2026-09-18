@@ -15,28 +15,20 @@
 
 using namespace geode::prelude;
 
-struct MacroEvent {
-  int32_t frame;
-  int32_t down;
-};
-
 // POSIX shared memory buffer layout for IPC between C++ mod and Python
 struct SharedData {
   volatile int32_t frameIdx;          // 60Hz frame counter
   volatile int32_t frameReadyBin;     // 1 when C++ writes frame, 0 when Python consumed
-  volatile int32_t macroCount;        // Number of 240Hz macro events loaded
   volatile float ttdRelease;          // Raw frames to death (Release)
   volatile float ttdHold;             // Raw frames to death (Hold)
   volatile float ttdImpulse;          // Raw frames to death (Impulse)
   volatile float maxHorizon;          // Dynamic screen horizon (60Hz frames)
   uint8_t frameBuffer[640 * 480 * 3]; // 921,600 bytes
-  MacroEvent macroBuffer[50000];      // 400,000 bytes
 };
 
 static SharedData *data = nullptr;
 static int lastFrameIdx = -1;
 static int fileDescriptor = -1;
-static size_t s_macroIndex = 0;
 static bool s_ipcConnected = false;
 
 /// Unmap the shared memory buffer.
@@ -82,7 +74,6 @@ class $modify(MyPlayLayer, PlayLayer) {
     initShm();
     TrajectorySim::init(this);
     lastFrameIdx = -1;
-    s_macroIndex = 0;
     return true;
   }
 
@@ -93,7 +84,6 @@ class $modify(MyPlayLayer, PlayLayer) {
       initShm();
       TrajectorySim::init(this);
       lastFrameIdx = -1;
-      s_macroIndex = 0;
     }
   }
 
@@ -104,16 +94,22 @@ class $modify(MyPlayLayer, PlayLayer) {
   }
 
   void processRecording() {
-    if (!m_started || m_playerDied || m_isPaused || m_hasCompletedLevel || !m_player1 || m_player1->m_isDead) {
-      return;
-    }
-
     if (!s_ipcConnected || !data) {
       return;
     }
 
     if (data->frameReadyBin == -1) {
       closeShm();
+      return;
+    }
+
+    if (m_hasCompletedLevel) {
+      data->frameReadyBin = -1;
+      closeShm();
+      return;
+    }
+
+    if (!m_started || m_playerDied || m_isPaused || !m_player1 || m_player1->m_isDead) {
       return;
     }
 
@@ -167,61 +163,11 @@ class $modify(MyGJBaseGameLayer, GJBaseGameLayer) {
     GJBaseGameLayer::update(dt);
   }
 
-  void simulateClick(PlayerButton button, bool down, bool player2) {
-    if (button == PlayerButton::Jump) {
-      TrajectorySim::handleButtonPress(down, !player2);
-    }
-
-    auto performButton = down ? &PlayerObject::pushButton : &PlayerObject::releaseButton;
-    bool swapControls = GameManager::get()->getGameVariable(GameVar::Flip2PlayerControls);
-    player2 = swapControls ? !player2 : player2;
-
-    if (m_levelSettings->m_twoPlayerMode) {
-      PlayerObject *plr = player2 ? m_player2 : m_player1;
-      if (plr)
-        (plr->*performButton)(button);
-    } else {
-      if (m_player1)
-        (m_player1->*performButton)(button);
-
-      if (m_gameState.m_isDualMode && m_player2) {
-        (m_player2->*performButton)(button);
-      }
-    }
-
-    m_effectManager->playerButton(down, !player2);
-
-    if (down) {
-      m_clicks++;
-      if (button == PlayerButton::Jump)
-        m_jumping = true;
-    } else {
-      if (button == PlayerButton::Jump)
-        m_jumping = false;
-    }
-  }
-
   void handleButton(bool down, int button, bool isPlayer1) {
     if (button == (int)PlayerButton::Jump || button == 1) {
       TrajectorySim::handleButtonPress(down, isPlayer1);
     }
     GJBaseGameLayer::handleButton(down, button, isPlayer1);
-  }
-
-  void processBot() {
-    if (!data || data->macroCount <= 0)
-      return;
-
-    int32_t progress = m_gameState.m_currentProgress / 2;
-    while (s_macroIndex < (size_t)data->macroCount && data->macroBuffer[s_macroIndex].frame <= progress) {
-      const auto &ev = data->macroBuffer[s_macroIndex++];
-      this->simulateClick(PlayerButton::Jump, ev.down != 0, false);
-    }
-  }
-
-  void processQueuedButtons(float dt, bool clearInputQueue) {
-    GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
-    this->processBot();
   }
 };
 
