@@ -188,7 +188,7 @@ static bool stepRollout(PlayLayer *pl, float &outFtd, int &outActionLength) {
 
     if (died || reachedEdge || s_frame >= maxFrames) {
         outFtd = died ? static_cast<float>(s_frame) : static_cast<float>(maxFrames);
-        outActionLength = s_frame;
+        outActionLength = maxFrames;
         return true;
     }
 
