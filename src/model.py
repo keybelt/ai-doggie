@@ -11,14 +11,12 @@ with CONFIG_PATH.open() as f:
 
 
 class Model(nn.Module):
-    """CNN + GRU policy value model with learned-query cross-attention pooling."""
 
     def __init__(self):
         super().__init__()
         self.hidden_dim: int = CONFIG["model"]["hiddenDim"]
         self.attn_dim: int = CONFIG["model"]["attnDim"]
         self.num_heads: int = CONFIG["model"]["numHeads"]
-        self.action_dim: int = CONFIG["model"]["actionDim"]
 
         # 3-layer CNN backbone with CoordConv on first layer
         self.conv1 = nn.Conv2d(3 + 2, 32, kernel_size=5, stride=4)
@@ -51,13 +49,6 @@ class Model(nn.Module):
         )
         self.ln2 = nn.LayerNorm(attn_total_dim)
 
-        self.out_proj = nn.Linear(2 * attn_total_dim, self.hidden_dim)
-        self.ln = nn.LayerNorm(self.hidden_dim)
-
-        # Temporal processing and continuous value output head
-        self.gru = nn.GRU(self.hidden_dim, self.hidden_dim, batch_first=True)
-        self.value_head = nn.Linear(self.hidden_dim, self.action_dim)
-
         # Pre-compute spatial CoordConv meshgrid buffers
         h, w = CONFIG["frame"]["height"], CONFIG["frame"]["width"]
         y_coords = torch.linspace(-1, 1, h).view(1, 1, h, 1).expand(1, 1, h, w)
@@ -65,9 +56,20 @@ class Model(nn.Module):
         self.register_buffer("y_coords", y_coords, persistent=False)
         self.register_buffer("x_coords", x_coords, persistent=False)
 
-    def conv_forward(self, X: Tensor) -> Tensor:
-        """Applies CoordConv using cached grid buffers and sequential conv layers.
+        self.seq_len: int = CONFIG["training"]["seqLen"]
+        visual_dim = 2 * attn_total_dim
+        fusion_dim = visual_dim + 4 + self.seq_len
+        self.aux_ln = nn.LayerNorm(4)
+        self.loss_head = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
 
+    def conv_forward(self, X: Tensor) -> Tensor:
+        """
         Args:
             X: [N, C, H, W]
 
@@ -94,7 +96,6 @@ class Model(nn.Module):
             Projected attention context tensor of shape [B, D].
         """
         B, C_in, _, _ = X_conv.shape
-
         X_flat = X_conv.view(B, C_in, -1).transpose(1, 2)  # [B, H_conv*W_conv, C_in]
 
         # Stage 1: Extract Player
@@ -107,31 +108,26 @@ class Model(nn.Module):
         z2, _ = self.mha2(query=q1, key=X_flat, value=X_flat, need_weights=False)
         z2 = self.ln2(z2.squeeze(1))  # [B, attn_total_dim]
 
-        # Concatenate player state and trajectory hazard context
-        combined = torch.cat([z1, z2], dim=-1)  # [B, 2 * attn_total_dim]
+        return torch.cat([z1, z2], dim=-1)  # [B, 2 * attn_total_dim]
 
-        # Linear Projection + LayerNorm into GRU
-        X_proj = self.ln(self.out_proj(combined))
-        return X_proj
-
-    def forward(self, X: Tensor, prev_h: Tensor) -> tuple[Tensor, Tensor]:
-        """Pass inputs through CNN + GRU + value head.
-
+    def forward(
+        self,
+        X: Tensor,
+        aux_state: Tensor,
+        actions: Tensor,
+    ) -> Tensor:
+        """
         Args:
-            X: [N, T, H, W, C]
-            prev_h: [N, L, D]
+            X: [B, C, H, W] raw RGB frame I_0 at spawn.
+            aux_state: [B, 4] physical state [vx, vy, gravityDir, isHolding].
+            actions: [B, MAX_H] raw candidate action sequence (0.0=release, 1.0=jump, -1.0=pad).
 
         Returns:
-            Predicted action Q-values and new hidden state of shapes [N, T, action_dim] and [N, L, D].
+            Tensor of shape [B, 1] containing predicted frames to death.
         """
-        N, T, H, W, C = X.shape
+        X_conv = self.conv_forward(X)  # [B, C', H', W']
+        z_0 = self.cross_attention_pooling(X_conv)  # [B, D]
 
-        X = X.view(N * T, H, W, C).permute(0, 3, 1, 2).contiguous()
-        X_conv = self.conv_forward(X)
-
-        X_proj = self.cross_attention_pooling(X_conv).view(N, T, self.hidden_dim)
-
-        gru_out, h = self.gru(X_proj, prev_h.transpose(0, 1).contiguous())  # [N, T, D]
-
-        values = self.value_head(gru_out)  # [N, T, action_dim]
-        return values, h.transpose(0, 1).contiguous()
+        fused = torch.cat([z_0, self.aux_ln(aux_state), actions], dim=-1)  # [B, D + 4 + MAX_H]
+        pred_ftd = self.loss_head(fused)  # [B, 1]
+        return pred_ftd
