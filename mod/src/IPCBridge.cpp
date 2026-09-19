@@ -120,6 +120,16 @@ static void startRollout(PlayLayer *pl) {
 
 static void forward(PlayLayer *pl) {
     auto p1 = pl->m_player1;
+    auto p2 = pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr;
+
+    // Pause the game if the player dies during the forward pass
+    if (p1->m_isDead || (p2 && p2->m_isDead)) {
+        if (!pl->m_isPaused) {
+            pl->pauseGame(false);
+        }
+        return;
+    }
+
     s_frame++;
 
     bool reachedEdge = p1->m_isGoingLeft ? (p1->getPositionX() <= s_edgeX) : (p1->getPositionX() >= s_edgeX);
