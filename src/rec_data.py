@@ -14,12 +14,25 @@ from shm_utils import (
 )
 
 
+def update_display(rollouts: int, first: bool = False):
+    if rollouts == 0:
+        stage = "Forward"
+    else:
+        rollout_type = "Golden" if rollouts % 2 == 1 else "Perturbed"
+        stage = f"Backward ({rollout_type})"
+
+    if first:
+        print(f"[STAGE] {stage}\n[DATA]  Rollouts: {rollouts}", end="", flush=True)
+    else:
+        print(f"\033[A\r\033[K[STAGE] {stage}\n\033[K[DATA]  Rollouts: {rollouts}", end="", flush=True)
+
+
 def main(session_name: str):
     data_dir = Path(__file__).resolve().parents[1] / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
     save_path = data_dir / f"{session_name}.h5"
-    print(f"\nTarget HDF5 dataset: {save_path}")
+    print(f"\nTarget HDF5 dataset: {save_path}\n")
 
     shm = init_shm()
     rollout_idx = 0
@@ -28,7 +41,7 @@ def main(session_name: str):
         with h5py.File(save_path, "a") as f:
             f.require_group("rollouts")
 
-            print("Listening for completed rollout packages from C++...")
+            update_display(rollout_idx, first=True)
 
             while is_session_active(shm):
                 if not wait_for_rollout_package(shm):
@@ -52,15 +65,15 @@ def main(session_name: str):
 
                 f.flush()
 
-                print(f"\r\033[KRollouts saved: {rollout_idx + 1}", end="", flush=True)
                 rollout_idx += 1
+                update_display(rollout_idx)
 
     except KeyboardInterrupt:
-        print("\nRecording stopped by user (Ctrl+C).")
+        print("\n\nRecording stopped by user (Ctrl+C).")
     finally:
         shm.close()
         shm.unlink()
-        print(f"\nSession finished. Total rollouts saved: {rollout_idx}\n")
+        print(f"\n\nSession finished. Total rollouts saved: {rollout_idx}\n")
 
 
 if __name__ == "__main__":
