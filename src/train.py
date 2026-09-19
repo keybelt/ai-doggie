@@ -1,9 +1,7 @@
 import json
 import math
-import random
 import sys
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import h5py
@@ -13,7 +11,7 @@ import torch.nn.functional as F
 import wandb
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
@@ -25,237 +23,68 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 DEVICE = torch.device("mps")
+MAX_HORIZON = CONFIG["training"]["seqLen"]
 
 
-class DatasetGenerator(IterableDataset):
-    """Yield training batches built from parallel gameplay streams."""
+def load_dataset(h5_files: list[Path], max_horizon: int) -> TensorDataset:
+    all_frames: list[Tensor] = []
+    all_states: list[Tensor] = []
+    all_actions: list[Tensor] = []
+    all_targets: list[Tensor] = []
 
-    def __init__(self, src_files: list[Path], is_val: bool):
-        self.src_files = src_files
-        self.is_val = is_val
-        self.dataset_files: list[Path] = []
+    for fpath in h5_files:
+        with h5py.File(fpath, "r") as f:
+            for grp in f["rollouts"].values():
+                frame = torch.from_numpy(grp["frame_0"][:]).permute(2, 0, 1)
+                state = torch.from_numpy(grp["aux_state"][:])
 
-    def get_next_file(self) -> Path:
-        if not self.dataset_files:
-            self.dataset_files = self.src_files.copy()
-            if not self.is_val:
-                random.shuffle(self.dataset_files)
-        return self.dataset_files.pop(0)
+                act = torch.from_numpy(grp["actions"][:max_horizon]).float()
+                if len(act) < max_horizon:
+                    act = F.pad(act, (0, max_horizon - len(act)), value=-1.0)
 
-    def stream_file(self, filepath: Path) -> Iterator[tuple[np.ndarray, np.ndarray, bool]]:
-        """Stream frame and raw TTD chunks from HDF5 file."""
-        seq_len = CONFIG["training"]["seqLen"]
-        with h5py.File(filepath, "r") as f:
-            frames_ds = f["frames"]
-            num_chunks = len(frames_ds) // seq_len
-            ttd_ds = f["ttd"]
+                all_frames.append(frame)
+                all_states.append(state)
+                all_actions.append(act)
+                all_targets.append(torch.tensor(float(grp.attrs["ftd"]), dtype=torch.float32))
 
-            for chunk_idx in range(num_chunks):
-                start = chunk_idx * seq_len
-                end = start + seq_len
-                yield frames_ds[start:end], ttd_ds[start:end], (chunk_idx == 0)
+    if not all_frames:
+        raise ValueError(f"No rollouts found in provided files: {h5_files}")
 
-    def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Batch together mini batches from each file stream."""
-        batch_size = CONFIG["training"]["batchSize"]
-        self.dataset_files = []
-        file_streams = [self.stream_file(self.get_next_file()) for _ in range(batch_size)]
+    frames_tensor = torch.stack(all_frames)
+    states_tensor = torch.stack(all_states)
+    actions_tensor = torch.stack(all_actions)
+    targets_tensor = torch.stack(all_targets)
 
-        while True:
-            batch_frames, batch_ttd, batch_are_first = [], [], []
-
-            for i in range(batch_size):
-                try:
-                    frames, ttd, is_first = next(file_streams[i])
-                except StopIteration:
-                    file_streams[i] = self.stream_file(self.get_next_file())
-                    frames, ttd, is_first = next(file_streams[i])
-
-                batch_frames.append(frames)
-                batch_ttd.append(ttd)
-                batch_are_first.append(is_first)
-
-            yield (
-                np.stack(batch_frames),
-                np.stack(batch_ttd),
-                np.stack(batch_are_first),
-            )
+    print(f"Loaded {len(frames_tensor)} rollouts into in-memory TensorDataset.")
+    return TensorDataset(frames_tensor, states_tensor, actions_tensor, targets_tensor)
 
 
-def preprocess_inputs(
-    frames: Tensor,
-    ttd: Tensor,
-    are_first: Tensor,
-    hidden: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Normalize frames, mask hidden states on reset, and load raw survival frames.
-
-    Args:
-        frames: [N, T, H, W, C]
-        ttd: [N, T, 3]
-        are_first: [N]
-        hidden: [N, 1, D]
-
-    Returns:
-        Tuple of (frames_norm [N, T, H, W, C], target_values [N, T, 3], masked_hidden [N, 1, D]).
-    """
-    keep_hidden = (~are_first).to(DEVICE, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1)  # [N, 1, 1]
-    hidden_state = hidden * keep_hidden  # [N, 1, D]
-    frames_gpu = frames.to(DEVICE, non_blocking=True)  # Compact uint8 host-to-device transfer
-    frames_norm = frames_gpu.to(dtype=torch.float32).mul_(1.0 / 255.0)  # [N, T, H, W, C]
-    target_values = ttd.to(DEVICE, dtype=torch.float32)  # [N, T, 3] raw survival frames
-
-    return frames_norm, target_values, hidden_state
-
-
-def process_batch(
-    model: Model,
-    frames: Tensor,
-    ttd: Tensor,
-    are_first: Tensor,
-    hidden: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Pass batch through model and compute MSE loss against raw survival frames.
-
-    Args:
-        frames: [N, T, H, W, C]
-        ttd: [N, T, 3]
-        are_first: [N]
-        hidden: [N, 1, D]
-
-    Returns:
-        Tuple of (loss, hidden [N, 1, D]).
-    """
-    frames_norm, target_values, hidden_state = preprocess_inputs(
-        frames=frames,
-        ttd=ttd,
-        are_first=are_first,
-        hidden=hidden,
-    )
-    pred_values, hidden_state = model(frames_norm, hidden_state)  # [N, T, 3], [N, 1, D]
-    hidden_state = hidden_state.detach()
-
-    loss = F.mse_loss(pred_values, target_values)
-    return loss, hidden_state
-
-
-def prepare_data_files() -> tuple[list[Path], list[Path], int, int, int]:
-    """Scan dataset directory files and compute steps per epoch.
-
-    Returns:
-        Tuple of (train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch).
-    """
-    seq_len = CONFIG["training"]["seqLen"]
-    batch_size = CONFIG["training"]["batchSize"]
-    accumulation_steps = CONFIG["training"]["accumulationSteps"]
-
-    train_dir = PROJECT_ROOT / "data" / "training"
-    val_dir = PROJECT_ROOT / "data" / "validation"
-
-    train_files = list(train_dir.glob("*.h5"))
-    val_files = list(val_dir.glob("*.h5"))
-
-    def get_chunks(f: Path) -> int:
-        with h5py.File(f, "r") as data:
-            return len(data["frames"]) // seq_len
-
-    total_train_chunks = sum(get_chunks(f) for f in train_files)
-    train_steps_per_epoch = max(1, total_train_chunks // batch_size)
-
-    total_val_chunks = sum(get_chunks(f) for f in val_files)
-    val_steps_per_epoch = max(1, total_val_chunks // batch_size)
-
-    opt_steps_per_epoch = (train_steps_per_epoch + accumulation_steps - 1) // accumulation_steps
-    return train_files, val_files, train_steps_per_epoch, val_steps_per_epoch, opt_steps_per_epoch
-
-
-def get_wsd_scheduler(
-    optimizer: torch.optim.Optimizer,
+def get_lr_lambda(
+    step: int,
     total_steps: int,
-) -> LambdaLR:
-    """Warmup-Stable-Decay Learning Rate Scheduler."""
-    warmup_ratio = CONFIG["training"]["warmupRatio"]
-    decay_ratio = CONFIG["training"]["decayRatio"]
-    min_lr_ratio = CONFIG["training"]["minLrRatio"]
-
-    warmup_steps = int(total_steps * warmup_ratio)
-    decay_steps = int(total_steps * decay_ratio)
-    stable_steps = total_steps - warmup_steps - decay_steps
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return step / warmup_steps
-        elif step < warmup_steps + stable_steps:
-            return 1.0
-        else:
-            decay_step = step - (warmup_steps + stable_steps)
-            progress = decay_step / decay_steps
-            progress = min(1.0, max(0.0, progress))
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-
-    return LambdaLR(optimizer, lr_lambda)
-
-
-def init_model_and_optimizer(
-    opt_steps_per_epoch: int,
-) -> tuple[Model, torch.optim.Optimizer, LambdaLR]:
-    """Instantiate Model, AdamW optimizer, and Warmup-Stable-Decay scheduler.
-
-    Returns:
-        Tuple of (model, optimizer, scheduler).
-    """
-    model = Model().to(DEVICE)
-    lr = CONFIG["training"]["learningRate"]
-    weight_decay = CONFIG["training"]["weightDecay"]
-    total_steps = CONFIG["training"]["epochs"] * opt_steps_per_epoch
-
-    decay_params = [p for p in model.parameters() if p.ndim >= 2]
-    no_decay_params = [p for p in model.parameters() if p.ndim < 2]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=lr,
-    )
-    scheduler = get_wsd_scheduler(optimizer, total_steps=total_steps)
-    return model, optimizer, scheduler
-
-
-def load_checkpoint(checkpoint_file: str, state: dict) -> int:
-    """Load model weights and training state if specified.
-
-    Returns:
-        Starting epoch number.
-    """
-    if not checkpoint_file:
-        return 1
-
-    checkpoint = torch.load(Path(checkpoint_file), map_location=DEVICE)
-    state["model"].load_state_dict(checkpoint["model_state"])
-    state["optimizer"].load_state_dict(checkpoint["optimizer_state"])
-    state["scheduler"].load_state_dict(checkpoint["scheduler_state"])
-
-    print(f"Loaded checkpoint {checkpoint_file}.")
-    return checkpoint["epoch"] + 1
+    warmup_steps: int,
+    decay_steps: int,
+    min_lr_ratio: float,
+) -> float:
+    if step < warmup_steps:
+        return float(step) / float(max(1, warmup_steps))
+    if step < (total_steps - decay_steps):
+        return 1.0
+    progress = float(step - (total_steps - decay_steps)) / float(max(1, decay_steps))
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
 def log_diagnostics(
-    state: dict,
+    model: Model,
     stats: dict,
     grad_rms: dict[str, float],
     update_ratios: dict[str, float],
 ):
-    """Log training metrics, weight/gradient RMS values, and true Adam update ratios to WandB."""
-    stats["global_step"] = state["global_step"]
-    opt_steps = state["opt_steps"]
-    stats["epoch"] = state["global_step"] / opt_steps
-    model = state["model"]
-
     with torch.no_grad():
         for name, param in model.named_parameters():
-            if "bias" in name:
+            if not param.requires_grad or "weight" not in name:
                 continue
             parts = name.rsplit(".", 1)
             layer = parts[0] if len(parts) == 2 else name
@@ -268,208 +97,169 @@ def log_diagnostics(
     wandb.log(stats)
 
 
-def optimize_and_evaluate(state: dict, loss: Tensor):
-    """Step optimizer/scheduler, clip gradients, and run periodic evaluation."""
-    eval_freq = CONFIG["training"]["evalFreqSteps"]
-    max_grad_norm = CONFIG["training"]["maxGradNorm"]
-
-    model, optimizer, scheduler = state["model"], state["optimizer"], state["scheduler"]
-    is_eval_step = (state["global_step"] + 1) % eval_freq == 0
-    grad_rms = {}
-    old_params = {}
-    update_ratios = {}
-
-    if is_eval_step:
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                if "bias" in name:
-                    continue
-                if param.grad is not None:
-                    grad_rms[name] = (param.grad.norm() / (param.grad.numel() ** 0.5)).item()
-                old_params[name] = param.detach().clone()
-
-    total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm).item()
-    optimizer.step()
-    scheduler.step()
-
-    if is_eval_step:
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                if name in old_params:
-                    delta = param - old_params[name]
-                    delta_rms = (delta.norm() / (delta.numel() ** 0.5)).item()
-                    w_rms = (param.norm() / (param.numel() ** 0.5)).item()
-                    if w_rms > 0:
-                        update_ratios[name] = delta_rms / w_rms
-
-    optimizer.zero_grad(set_to_none=True)
-    state["global_step"] += 1
-
-    if is_eval_step:
-        val_loss, val_latency = run_val(state)
-        val_stats = {
-            "loss/train": loss.item(),
-            "lr": scheduler.get_last_lr()[0],
-            "loss/val": val_loss,
-            "total_grad_norm": total_grad_norm,
-            "inf_latency_ms": val_latency,
-        }
-        log_diagnostics(
-            state=state,
-            stats=val_stats,
-            grad_rms=grad_rms,
-            update_ratios=update_ratios,
-        )
-        model.train()
-
-
-def run_train_epoch(state: dict, steps: int) -> float:
-    """Run one training epoch over step count and return average train loss."""
-    model, train_iter = state["model"], state["train_iter"]
-    accum_steps = CONFIG["training"]["accumulationSteps"]
-
-    model.train()
-    num_batches = 0
-    train_loss_tensor = torch.zeros(1, device=DEVICE)
-    loss = None
-
-    for i in range(steps):
-        try:
-            frames, ttd, are_first = next(train_iter)
-        except StopIteration:
-            break
-        num_batches = i + 1
-
-        loss, state["train_hidden"] = process_batch(
-            model=model,
-            frames=frames,
-            ttd=ttd,
-            are_first=are_first,
-            hidden=state["train_hidden"],
-        )
-
-        (loss / accum_steps).backward()
-
-        if num_batches % accum_steps == 0:
-            optimize_and_evaluate(state, loss)
-
-        train_loss_tensor += loss.detach()
-
-    if num_batches % accum_steps != 0 and loss is not None:
-        optimize_and_evaluate(state, loss)
-
-    return train_loss_tensor.item() / num_batches
-
-
-def run_val(state: dict) -> tuple[float, float]:
-    """Run validation steps dynamically over full validation dataset.
-
-    Returns:
-        Tuple of (avg_val_loss, inference_latency_ms).
-    """
-    model = state["model"]
-    val_loader = state["val_loader"]
-    val_steps = state["val_steps"]
-    batch_size = CONFIG["training"]["batchSize"]
-
-    model.eval()
-    val_iter = iter(val_loader)
-    val_hidden = torch.zeros(batch_size, 1, model.hidden_dim, device=DEVICE)
-
-    num_batches = 0
-    val_loss_tensor = torch.zeros(1, device=DEVICE)
-
+def measure_inference_latency(model: Model) -> float:
+    dummy_x = torch.zeros(1, 3, 480, 640, device=DEVICE)
+    dummy_s = torch.zeros(1, 4, device=DEVICE)
+    dummy_a = torch.zeros(1, MAX_HORIZON, device=DEVICE)
     with torch.no_grad():
-        for i in range(val_steps):
-            try:
-                frames, ttd, are_first = next(val_iter)
-            except StopIteration:
-                break
-            num_batches = i + 1
-
-            loss, val_hidden = process_batch(
-                model=model,
-                frames=frames,
-                ttd=ttd,
-                are_first=are_first,
-                hidden=val_hidden,
-            )
-            val_loss_tensor += loss.detach()
-
-        dummy_x = torch.zeros(1, 1, 480, 640, 3, device=DEVICE)
-        dummy_h = torch.zeros(1, 1, model.hidden_dim, device=DEVICE)
-        model(dummy_x, dummy_h)
+        model(dummy_x, dummy_s, dummy_a)
         torch.mps.synchronize()
-
         t0 = time.perf_counter()
-        model(dummy_x, dummy_h)
+        for _ in range(10):
+            model(dummy_x, dummy_s, dummy_a)
         torch.mps.synchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-
-    avg_val_loss = val_loss_tensor.item() / num_batches
-    return avg_val_loss, elapsed_ms
+        elapsed_ms = ((time.perf_counter() - t0) / 10.0) * 1000.0
+    return elapsed_ms
 
 
-def save_checkpoint(epoch: int, state: dict, train_loss: float, val_loss: float | None = None):
-    """Save epoch model, optimizer, and scheduler state to checkpoint file."""
-    checkpoint_data = {
-        "epoch": epoch,
-        "model_state": state["model"].state_dict(),
-        "optimizer_state": state["optimizer"].state_dict(),
-        "scheduler_state": state["scheduler"].state_dict(),
-        "train_loss": train_loss,
-        "val_loss": val_loss,
-    }
-    checkpoints_dir = PROJECT_ROOT / "checkpoints"
-    checkpoint_path = checkpoints_dir / f"epoch_{epoch}.pt"
-    torch.save(checkpoint_data, checkpoint_path)
-    print(f"Saved checkpoint to {checkpoint_path}")
+def run_val(model: Model, val_loader: DataLoader) -> tuple[float, float]:
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for frames, states, actions, targets in val_loader:
+            frames = frames.to(DEVICE).float() / 255.0
+            states = states.to(DEVICE)
+            actions = actions.to(DEVICE)
+            targets = targets.to(DEVICE)
+
+            preds = model(frames, states, actions).squeeze(-1)
+            val_loss += F.smooth_l1_loss(preds, targets).item()
+
+    avg_val_loss = val_loss / len(val_loader)
+    inf_latency = measure_inference_latency(model)
+    return avg_val_loss, inf_latency
 
 
-def train():
-    cfg_tr = CONFIG["training"]
-    batch_size = cfg_tr["batchSize"]
-    epochs = cfg_tr["epochs"]
+def main():
+    train_dir = PROJECT_ROOT / "data" / "train"
+    val_dir = PROJECT_ROOT / "data" / "val"
+    train_files = sorted(list(train_dir.glob("*.h5")))
+    val_files = sorted(list(val_dir.glob("*.h5")))
 
-    train_files, val_files, train_steps, val_steps, opt_steps = prepare_data_files()
+    train_dataset = load_dataset(train_files, max_horizon=MAX_HORIZON)
+    val_dataset = load_dataset(val_files, max_horizon=MAX_HORIZON)
 
-    train_loader = DataLoader(DatasetGenerator(train_files, is_val=False), batch_size=None)
-    val_loader = DataLoader(DatasetGenerator(val_files, is_val=True), batch_size=None)
+    batch_size = CONFIG["training"]["batchSize"]
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+    )
 
-    model, optimizer, scheduler = init_model_and_optimizer(opt_steps)
-    hidden_dim = CONFIG["model"]["hiddenDim"]
+    model = Model().to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=CONFIG["training"]["learningRate"],
+        weight_decay=CONFIG["training"]["weightDecay"],
+    )
 
-    state = {
-        "model": model,
-        "optimizer": optimizer,
-        "scheduler": scheduler,
-        "train_iter": iter(train_loader),
-        "val_loader": val_loader,
-        "val_steps": val_steps,
-        "global_step": 0,
-        "opt_steps": opt_steps,
-        "train_hidden": torch.zeros(batch_size, 1, hidden_dim, device=DEVICE),
-    }
+    epochs = CONFIG["training"]["epochs"]
+    total_steps = len(train_loader) * epochs
+    warmup_steps = int(total_steps * CONFIG["training"]["warmupRatio"])
+    decay_steps = int(total_steps * CONFIG["training"]["decayRatio"])
+    min_lr_ratio = CONFIG["training"]["minLrRatio"]
+    eval_freq = CONFIG["training"]["evalFreqSteps"]
 
-    start_epoch = load_checkpoint(CONFIG["checkpointFile"], state)
-    state["global_step"] = (start_epoch - 1) * opt_steps
+    scheduler = LambdaLR(
+        optimizer,
+        lr_lambda=lambda s: get_lr_lambda(s, total_steps, warmup_steps, decay_steps, min_lr_ratio),
+    )
 
     wandb.init(
         project="ai-doggie",
-        name="ttd 3-action value learning",
-        config=cfg_tr,
+        name=f"ftd training baby",
+        config=CONFIG["training"],
     )
-    wandb.define_metric("epoch", hidden=True)
-    wandb.define_metric("*", step_metric="epoch")
+    wandb.define_metric("global_step", hidden=True)
+    wandb.define_metric("*", step_metric="global_step")
 
-    for epoch in range(start_epoch, epochs + 1):
-        avg_train_loss = run_train_epoch(state, train_steps)
+    global_step = 0
+    last_train_loss = 0.0
 
-        if epoch % 5 == 0 or epoch == epochs:
-            save_checkpoint(epoch, state, avg_train_loss)
+    for _ in range(epochs):
+        model.train()
+
+        for frames, states, actions, targets in train_loader:
+            global_step += 1
+
+            frames = frames.to(DEVICE).float() / 255.0
+            states = states.to(DEVICE)
+            actions = actions.to(DEVICE)
+            targets = targets.to(DEVICE)
+
+            preds = model(frames, states, actions).squeeze(-1)
+            loss = F.smooth_l1_loss(preds, targets)
+            last_train_loss = loss.item()
+
+            optimizer.zero_grad()
+            loss.backward()
+
+            is_eval_step = (global_step % eval_freq == 0)
+            grad_rms = {}
+            old_params = {}
+
+            if is_eval_step:
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if "bias" in name:
+                            continue
+                        if param.grad is not None:
+                            grad_rms[name] = (param.grad.norm() / (param.grad.numel() ** 0.5)).item()
+                        old_params[name] = param.detach().clone()
+
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                CONFIG["training"]["maxGradNorm"],
+            ).item()
+
+            optimizer.step()
+            scheduler.step()
+
+            if is_eval_step:
+                update_ratios = {}
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if name in old_params:
+                            delta = param - old_params[name]
+                            delta_rms = (delta.norm() / (delta.numel() ** 0.5)).item()
+                            w_rms = (param.norm() / (param.numel() ** 0.5)).item()
+                            if w_rms > 0:
+                                update_ratios[name] = delta_rms / w_rms
+
+                val_loss, inf_latency = run_val(model, val_loader)
+                stats = {
+                    "train/step_loss": last_train_loss,
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "total_grad_norm": total_grad_norm,
+                    "val/loss": val_loss,
+                    "inf_latency_ms": inf_latency,
+                    "global_step": global_step,
+                }
+                log_diagnostics(model, stats, grad_rms, update_ratios)
+                model.train()
+
+    # Save model
+    final_val_loss, _ = run_val(model, val_loader)
+    ckpt_dir = PROJECT_ROOT / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    save_path = ckpt_dir / f"model_pretrain_{time.strftime('%Y%m%d_%H%M%S')}.pt"
+    checkpoint_data = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "train_loss": last_train_loss,
+        "val_loss": final_val_loss,
+    }
+    torch.save(checkpoint_data, save_path)
+    print(f"\nModel checkpoint saved successfully to {save_path}\n")
 
     wandb.finish()
 
 
 if __name__ == "__main__":
-    train()
+    main()
