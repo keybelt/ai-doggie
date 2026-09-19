@@ -11,17 +11,18 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 SHM_NAME = "GDMem"
-HEADER_SIZE = 20
+HEADER_SIZE = 28
+ACTIONS_BUFFER_SIZE = 256
 FRAME_WIDTH = CONFIG["frame"]["width"]
 FRAME_HEIGHT = CONFIG["frame"]["height"]
 FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT * 3
-SHM_SIZE = HEADER_SIZE + FRAME_SIZE
+SHM_SIZE = HEADER_SIZE + ACTIONS_BUFFER_SIZE + FRAME_SIZE  # 921,884 bytes
 
 
 class GDSharedMemory(SharedMemory):
     def close(self):
         try:
-            pack_into("i", self.buf, 4, -1)
+            pack_into("i", self.buf, 0, -1)
         except Exception:
             pass
         super().close()
@@ -44,63 +45,65 @@ def init_shm() -> GDSharedMemory:
     return shm
 
 
-def get_frame(shm: SharedMemory) -> np.ndarray:
-    """
+def acknowledge_handshake(shm: SharedMemory) -> None:
+    pack_into("i", shm.buf, 0, 0)
+
+
+def close_session(shm: SharedMemory) -> None:
+    try:
+        pack_into("i", shm.buf, 0, -1)
+    except Exception:
+        pass
+
+
+def is_session_active(shm: SharedMemory) -> bool:
+    return unpack("i", shm.buf[0:4])[0] != -1
+
+
+def wait_for_rollout_package(shm: SharedMemory) -> bool:
+    """Poll for a completed rollout package from C++.
+
     Returns:
-        ndarray representation of frame in height,width,alpha
+        True if a new rollout package is ready, False otherwise.
     """
-    return (
+    data_ready = unpack("i", shm.buf[0:4])[0]
+    if data_ready != 1:
+        time.sleep(0.001)
+        return False
+    return True
+
+
+def get_rollout_package(shm: SharedMemory) -> dict:
+    """Extract the complete atomic rollout package from shared memory.
+
+    Returns:
+        dict containing ftd, aux_state [4], actions [L], frame_0 [H, W, 3].
+    """
+    _, ftd, vx, vy, gravity_dir, is_holding, action_len = unpack(
+        "i4f2i", shm.buf[0:HEADER_SIZE]
+    )
+
+    action_len = max(0, min(action_len, ACTIONS_BUFFER_SIZE))
+    actions = np.frombuffer(
+        shm.buf[HEADER_SIZE : HEADER_SIZE + action_len],
+        dtype=np.int8,
+    ).copy()
+
+    frame_offset = HEADER_SIZE + ACTIONS_BUFFER_SIZE
+    frame_0 = (
         np.frombuffer(
-            shm.buf[HEADER_SIZE : HEADER_SIZE + FRAME_SIZE],
+            shm.buf[frame_offset : frame_offset + FRAME_SIZE],
             dtype=np.uint8,
         )
         .reshape((FRAME_HEIGHT, FRAME_WIDTH, 3))
         .copy()
     )
 
+    aux_state = np.array([vx, vy, gravity_dir, float(is_holding)], dtype=np.float32)
 
-def acknowledge_handshake(shm: SharedMemory) -> None:
-    pack_into("i", shm.buf, 4, 0)
-
-
-def close_session(shm: SharedMemory) -> None:
-    try:
-        pack_into("i", shm.buf, 4, -1)
-    except Exception:
-        pass
-
-
-def get_telemetry(shm: SharedMemory) -> dict[str, float]:
-    """
-    Returns:
-        dict of ttd_release, ttd_hold, ttd_impulse (raw 60Hz frames).
-    """
-    ttd_rel, ttd_hold, ttd_imp = unpack("3f", shm.buf[8:20])
     return {
-        "ttd_release": float(ttd_rel),
-        "ttd_hold": float(ttd_hold),
-        "ttd_impulse": float(ttd_imp),
+        "ftd": float(ftd),
+        "aux_state": aux_state,
+        "actions": actions,
+        "frame_0": frame_0,
     }
-
-
-def is_session_active(shm: SharedMemory) -> bool:
-    return unpack("i", shm.buf[4:8])[0] != -1
-
-
-def wait_for_next_frame(shm: SharedMemory, last_tick: int) -> tuple[int, bool, dict[str, float]]:
-    """
-    Returns:
-        current_tick, is_new_frame_ready, telemetry_dict
-    """
-    current_tick, frame_ready = unpack("2i", shm.buf[0:8])
-    telemetry = get_telemetry(shm)
-
-    if frame_ready != 1:
-        time.sleep(0)
-        return current_tick, False, telemetry
-
-    if current_tick == last_tick:
-        acknowledge_handshake(shm)
-        return current_tick, False, telemetry
-
-    return current_tick, True, telemetry
