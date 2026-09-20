@@ -1,5 +1,4 @@
 #include <Geode/Geode.hpp>
-#include <Geode/modify/CCScheduler.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
 #include <algorithm>
@@ -62,20 +61,16 @@ static void initShm() {
 }
 
 static float getScreenEdgeGameX(PlayLayer *pl) {
-    cocos2d::CCAffineTransform worldToNode = pl->m_objectLayer->worldToNodeTransform();
-    cocos2d::CCSize winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-
-    bool goingLeft = pl->m_player1->m_isGoingLeft;
-    cocos2d::CCPoint screenEdge = cocos2d::CCPoint(goingLeft ? 0.0f : winSize.width, 0.0f);
-    cocos2d::CCPoint gameEdge = cocos2d::CCPointApplyAffineTransform(screenEdge, worldToNode);
-
-    return gameEdge.x;
+    float cameraX = pl->m_gameState.m_cameraPosition.x;
+    float winWidth = cocos2d::CCDirector::sharedDirector()->getWinSize().width;
+    float zoom = pl->m_gameState.m_cameraZoom;
+    float cameraWidth = winWidth / (zoom > 0.0f ? zoom : 1.0f);
+    return pl->m_player1->m_isGoingLeft ? cameraX : (cameraX + cameraWidth);
 }
 
 static void addCheckpoint(PlayLayer *pl) {
     CheckpointObject *cp = pl->createCheckpoint();
     if (cp) {
-        cp->retain();
         if (cp->m_physicalCheckpointObject) {
             cp->m_physicalCheckpointObject->setVisible(false);
         }
@@ -88,6 +83,8 @@ static bool s_isPerturbed = false;
 static bool s_rolloutActive = false;
 static float s_edgeX = 0.0f;
 static int s_frame = 0;
+static int s_lastFrameIdx = -1;
+static int s_maxFrames = 0;
 static int s_perturbFrame = -1;
 static std::vector<int> s_checkpointFrames;
 
@@ -97,55 +94,37 @@ static void resetPassState() {
     s_rolloutActive = false;
     s_edgeX = 0.0f;
     s_frame = 0;
+    s_lastFrameIdx = -1;
+    s_maxFrames = 0;
     s_perturbFrame = -1;
     s_checkpointFrames.clear();
 }
 
 static void startRollout(PlayLayer *pl) {
-    auto p1 = pl->m_player1;
-    auto p2 = pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr;
-
     pl->loadLastCheckpoint();
-    p1->m_isDead = false;
-    if (p2)
-        p2->m_isDead = false;
-
     s_frame = 0;
-    s_edgeX = getScreenEdgeGameX(pl);
-
-    int maxFrames = std::clamp(s_checkpointFrames.back(), 1, MAX_ACTIONS - 1);
-
-    s_perturbFrame = s_isPerturbed ? (rand() % maxFrames) : -1;
+    s_maxFrames = std::clamp(s_checkpointFrames.back(), 1, MAX_ACTIONS - 1);
+    s_perturbFrame = s_isPerturbed ? (rand() % s_maxFrames) : -1;
 }
 
 static void forward(PlayLayer *pl) {
-    auto p1 = pl->m_player1;
-    auto p2 = pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr;
-
-    // Pause the game if the player dies during the forward pass
-    if (p1->m_isDead || (p2 && p2->m_isDead)) {
-        if (!pl->m_isPaused) {
-            pl->pauseGame(false);
-        }
+    if (s_edgeX == 0.0f) {
+        addCheckpoint(pl);
+        s_edgeX = getScreenEdgeGameX(pl);
+        s_frame = 0;
         return;
     }
 
     s_frame++;
 
+    auto p1 = pl->m_player1;
     bool reachedEdge = p1->m_isGoingLeft ? (p1->getPositionX() <= s_edgeX) : (p1->getPositionX() >= s_edgeX);
 
-    // Drop checkpoint initially or when reaching screen edge
-    if (reachedEdge) {
+    if (reachedEdge || s_frame >= (MAX_ACTIONS - 1)) {
         addCheckpoint(pl);
         s_checkpointFrames.push_back(s_frame);
         s_frame = 0;
         s_edgeX = getScreenEdgeGameX(pl);
-    }
-
-    // When level completes, prepare for backward pass
-    if (pl->m_hasCompletedLevel) {
-        s_checkpointFrames.push_back(s_frame);
-        s_isBackward = true;
     }
 }
 
@@ -181,14 +160,11 @@ static bool stepRollout(PlayLayer *pl, float &outFtd, int &outActionLength) {
     data->actionsBuffer[s_frame] = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)] ? 1 : 0;
     s_frame++;
 
-    bool died = p1->m_isDead || (p2 && p2->m_isDead);
-    bool reachedEdge = p1->m_isGoingLeft ? (p1->getPositionX() <= s_edgeX) : (p1->getPositionX() >= s_edgeX);
+    bool died = pl->m_playerDied;
 
-    int maxFrames = std::clamp(s_checkpointFrames.back(), 1, MAX_ACTIONS - 1);
-
-    if (died || reachedEdge || s_frame >= maxFrames) {
-        outFtd = died ? static_cast<float>(s_frame) : static_cast<float>(maxFrames);
-        outActionLength = maxFrames;
+    if (died || s_frame >= s_maxFrames) {
+        outFtd = died ? static_cast<float>(s_frame) : static_cast<float>(s_maxFrames);
+        outActionLength = s_maxFrames;
         return true;
     }
 
@@ -196,6 +172,13 @@ static bool stepRollout(PlayLayer *pl, float &outFtd, int &outActionLength) {
 }
 
 static void backward(PlayLayer *pl) {
+    if (s_checkpointFrames.empty()) {
+        s_isBackward = false;
+        resetPassState();
+        pl->levelComplete();
+        return;
+    }
+
     if (!s_rolloutActive) {
         startRollout(pl);
         s_rolloutActive = true;
@@ -229,15 +212,16 @@ static void backward(PlayLayer *pl) {
         pl->removeCheckpoint(false);
         s_checkpointFrames.pop_back();
         s_isPerturbed = false;
-        if (pl->m_checkpointArray->count() == 0) {
+        if (s_checkpointFrames.empty()) {
             s_isBackward = false;
+            resetPassState();
+            pl->levelComplete();
         }
     }
 }
 
 class $modify(MyPlayLayer, PlayLayer) {
     void setupSession() {
-        cocos2d::CCDirector::sharedDirector()->setAnimationInterval(1.0 / 60.0);
         m_isPracticeMode = true;
         resetPassState();
         closeShm();
@@ -257,9 +241,34 @@ class $modify(MyPlayLayer, PlayLayer) {
         setupSession();
     }
 
+    void destroyPlayer(PlayerObject *player, GameObject *gameObject) {
+        PlayLayer::destroyPlayer(player, gameObject);
+        if (m_playerDied && !s_isBackward && data) {
+            this->pauseGame(false);
+        }
+    }
+
     void onQuit() {
         closeShm();
         PlayLayer::onQuit();
+    }
+
+    void playEndAnimationToPos(cocos2d::CCPoint pos) {
+        if (data && !s_isBackward) {
+            return;
+        }
+        PlayLayer::playEndAnimationToPos(pos);
+    }
+
+    void levelComplete() {
+        if (data && !s_isBackward) {
+            if (s_frame > 0) {
+                s_checkpointFrames.push_back(s_frame);
+            }
+            s_isBackward = true;
+            return;
+        }
+        PlayLayer::levelComplete();
     }
 
     void postUpdate(float dt) {
@@ -271,19 +280,17 @@ class $modify(MyPlayLayer, PlayLayer) {
             return;
         }
 
+        // GD 2.2 advances m_currentProgress by 8 per 60Hz frame (2 per 240Hz tick)
+        int frame60Idx = (m_gameState.m_currentProgress / 2) / 4;
+        if (frame60Idx == s_lastFrameIdx) {
+            return;
+        }
+        s_lastFrameIdx = frame60Idx;
+
         if (!s_isBackward) {
             forward(this);
         } else {
             backward(this);
         }
-    }
-};
-
-class $modify(MyScheduler, cocos2d::CCScheduler) {
-    void update(float dt) {
-        if (auto pl = PlayLayer::get(); pl && !pl->m_isPaused) {
-            dt = 1.0f / 60.0f;
-        }
-        CCScheduler::update(dt);
     }
 };
