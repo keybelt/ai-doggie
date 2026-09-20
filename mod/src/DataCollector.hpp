@@ -70,6 +70,7 @@ class DataCollector {
                 s_checkpointFrameDeltas.push_back(s_frame);
             }
             s_isBackward = true;
+            s_data->dataReadyBin = 2;
             return;
         }
 
@@ -122,13 +123,13 @@ class DataCollector {
             s_isPerturbed = true;
         } else {
             // Perturbed rollout done -> pop checkpoint and move to previous one
-            pl->removeCheckpoint(true);
+            pl->removeCheckpoint(false);
             s_checkpointFrameDeltas.pop_back();
             s_isPerturbed = false;
             if (s_checkpointFrameDeltas.empty()) {
                 s_isBackward = false;
                 resetPassState();
-                pl->levelComplete();
+                pl->onQuit();
             }
         }
     }
@@ -143,6 +144,7 @@ class DataCollector {
     }
 
     static void addCheckpoint(PlayLayer *pl) {
+
         CheckpointObject *cp = pl->createCheckpoint();
         if (cp) {
             if (cp->m_physicalCheckpointObject) {
@@ -153,6 +155,7 @@ class DataCollector {
     }
 
     static void startRollout(PlayLayer *pl) {
+        pl->resetLevel();
         pl->loadLastCheckpoint();
         s_frame = 0;
         s_maxFrames = std::clamp(s_checkpointFrameDeltas.back(), 1, MAX_ACTIONS - 1);
