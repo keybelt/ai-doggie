@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from struct import unpack
 
 import h5py
 
@@ -14,17 +15,11 @@ from shm_utils import (
 )
 
 
-def update_display(rollouts: int, first: bool = False):
-    if rollouts == 0:
-        stage = "Forward"
-    else:
-        rollout_type = "Golden" if rollouts % 2 == 1 else "Perturbed"
-        stage = f"Backward ({rollout_type})"
-
+def update_display(stage_str: str, rollouts: int, first: bool = False):
     if first:
-        print(f"[STAGE] {stage}\n[DATA]  Rollouts: {rollouts}", end="", flush=True)
+        print(f"[STAGE] {stage_str}\n[DATA]  Rollouts: {rollouts}", end="", flush=True)
     else:
-        print(f"\033[A\r\033[K[STAGE] {stage}\n\033[K[DATA]  Rollouts: {rollouts}", end="", flush=True)
+        print(f"\033[A\r\033[K[STAGE] {stage_str}\n\033[K[DATA]  Rollouts: {rollouts}", end="", flush=True)
 
 
 def main(session_name: str):
@@ -41,9 +36,15 @@ def main(session_name: str):
         with h5py.File(save_path, "a") as f:
             f.require_group("rollouts")
 
-            update_display(rollout_idx, first=True)
+            update_display("Forward", rollout_idx, first=True)
 
             while is_session_active(shm):
+                data_ready = unpack("i", shm.buf[0:4])[0]
+                if data_ready == 2:
+                    acknowledge_handshake(shm)
+                    update_display("Backward (Golden)", rollout_idx)
+                    continue
+
                 if not wait_for_rollout_package(shm):
                     continue
 
@@ -66,7 +67,10 @@ def main(session_name: str):
                 f.flush()
 
                 rollout_idx += 1
-                update_display(rollout_idx)
+                next_stage = "Golden" if rollout_idx % 2 == 0 else "Perturbed"
+                update_display(f"Backward ({next_stage})", rollout_idx)
+
+            update_display("Completed", rollout_idx)
 
     except KeyboardInterrupt:
         print("\n\nRecording stopped by user (Ctrl+C).")
