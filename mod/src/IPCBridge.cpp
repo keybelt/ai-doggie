@@ -96,12 +96,4 @@ class $modify(MyPlayLayer, PlayLayer) {
         closeShm();
         PlayLayer::onQuit();
     }
-
-    void levelComplete() {
-        if (s_data && !DataCollector::isBackward()) {
-            DataCollector::setBackward(true);
-            return;
-        }
-        PlayLayer::levelComplete();
-    }
 };
