@@ -20,6 +20,7 @@ constexpr int FRAME_CHANNELS = 3;
 constexpr int FRAME_BUFFER_SIZE = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS;
 
 constexpr int MAX_ACTIONS = 256;
+constexpr float END_WALL_DIST_TOLERANCE = 1000.0f;
 
 struct SharedData {
     volatile int32_t dataReadyBin;          // 1=ready for Python, 0=consumed by Python, -1=closed
@@ -118,6 +119,15 @@ static void forward(PlayLayer *pl) {
     s_frame++;
 
     auto p1 = pl->m_player1;
+
+    if (pl->m_levelLength > 0.0f && (pl->m_levelLength - p1->getPositionX()) <= END_WALL_DIST_TOLERANCE) {
+        if (s_frame > 0) {
+            s_checkpointFrames.push_back(s_frame);
+        }
+        s_isBackward = true;
+        return;
+    }
+
     bool reachedEdge = p1->m_isGoingLeft ? (p1->getPositionX() <= s_edgeX) : (p1->getPositionX() >= s_edgeX);
 
     if (reachedEdge || s_frame >= (MAX_ACTIONS - 1)) {
@@ -209,7 +219,7 @@ static void backward(PlayLayer *pl) {
     if (!s_isPerturbed) {
         s_isPerturbed = true;
     } else {
-        pl->removeCheckpoint(false);
+        pl->removeCheckpoint(true);
         s_checkpointFrames.pop_back();
         s_isPerturbed = false;
         if (s_checkpointFrames.empty()) {
@@ -251,13 +261,6 @@ class $modify(MyPlayLayer, PlayLayer) {
     void onQuit() {
         closeShm();
         PlayLayer::onQuit();
-    }
-
-    void playEndAnimationToPos(cocos2d::CCPoint pos) {
-        if (data && !s_isBackward) {
-            return;
-        }
-        PlayLayer::playEndAnimationToPos(pos);
     }
 
     void levelComplete() {
