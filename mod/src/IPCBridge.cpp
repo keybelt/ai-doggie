@@ -1,4 +1,5 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
 #include <algorithm>
@@ -19,7 +20,7 @@ constexpr int FRAME_HEIGHT = 480;
 constexpr int FRAME_CHANNELS = 3;
 constexpr int FRAME_BUFFER_SIZE = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS;
 
-constexpr int MAX_ACTIONS = 256;
+constexpr int MAX_ACTIONS = 1024;
 constexpr float END_WALL_DIST_TOLERANCE = 1000.0f;
 
 struct SharedData {
@@ -84,10 +85,11 @@ static bool s_isPerturbed = false;
 static bool s_rolloutActive = false;
 static float s_edgeX = 0.0f;
 static int s_frame = 0;
-static int s_lastFrameIdx = -1;
 static int s_maxFrames = 0;
 static int s_perturbFrame = -1;
-static std::vector<int> s_checkpointFrames;
+
+static std::vector<int8_t> s_macroTape;
+static std::vector<int> s_checkpointFrameDeltas;
 
 static void resetPassState() {
     s_isBackward = false;
@@ -95,20 +97,26 @@ static void resetPassState() {
     s_rolloutActive = false;
     s_edgeX = 0.0f;
     s_frame = 0;
-    s_lastFrameIdx = -1;
     s_maxFrames = 0;
     s_perturbFrame = -1;
-    s_checkpointFrames.clear();
+    s_macroTape.clear();
+    s_checkpointFrameDeltas.clear();
 }
 
 static void startRollout(PlayLayer *pl) {
     pl->loadLastCheckpoint();
     s_frame = 0;
-    s_maxFrames = std::clamp(s_checkpointFrames.back(), 1, MAX_ACTIONS - 1);
+    s_maxFrames = std::clamp(s_checkpointFrameDeltas.back(), 1, MAX_ACTIONS - 1);
     s_perturbFrame = s_isPerturbed ? (rand() % s_maxFrames) : -1;
 }
 
 static void forward(PlayLayer *pl) {
+    auto p1 = pl->m_player1;
+
+    // Record the native 240Hz button state directly into s_macroTape
+    int8_t isHeld = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)] ? 1 : 0;
+    s_macroTape.push_back(isHeld);
+
     if (s_edgeX == 0.0f) {
         addCheckpoint(pl);
         s_edgeX = getScreenEdgeGameX(pl);
@@ -118,11 +126,9 @@ static void forward(PlayLayer *pl) {
 
     s_frame++;
 
-    auto p1 = pl->m_player1;
-
     if (pl->m_levelLength > 0.0f && (pl->m_levelLength - p1->getPositionX()) <= END_WALL_DIST_TOLERANCE) {
         if (s_frame > 0) {
-            s_checkpointFrames.push_back(s_frame);
+            s_checkpointFrameDeltas.push_back(s_frame);
         }
         s_isBackward = true;
         return;
@@ -132,13 +138,13 @@ static void forward(PlayLayer *pl) {
 
     if (reachedEdge || s_frame >= (MAX_ACTIONS - 1)) {
         addCheckpoint(pl);
-        s_checkpointFrames.push_back(s_frame);
+        s_checkpointFrameDeltas.push_back(s_frame);
         s_frame = 0;
         s_edgeX = getScreenEdgeGameX(pl);
     }
 }
 
-// Executes one in-game tick of the rollout. Returns true when the rollout completes.
+// Executes one in-game 240Hz tick of the rollout. Returns true when the rollout completes.
 static bool stepRollout(PlayLayer *pl, float &outFtd, int &outActionLength) {
     auto p1 = pl->m_player1;
     auto p2 = pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr;
@@ -152,21 +158,27 @@ static bool stepRollout(PlayLayer *pl, float &outFtd, int &outActionLength) {
         data->isHolding = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)] ? 1 : 0;
     }
 
-    // Apply perturbation: flip button state at perturbFrame
-    if (s_frame == s_perturbFrame) {
-        bool isHeld = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)];
-        if (isHeld) {
-            p1->releaseButton(PlayerButton::Jump);
-            if (p2)
-                p2->releaseButton(PlayerButton::Jump);
-        } else {
-            p1->pushButton(PlayerButton::Jump);
-            if (p2)
-                p2->pushButton(PlayerButton::Jump);
-        }
+    // Current 240Hz tick index = m_currentProgress / 2
+    size_t tick240 = static_cast<size_t>(pl->m_gameState.m_currentProgress / 2);
+    bool shouldHold = (s_macroTape[tick240] == 1);
+
+    // Apply perturbation if this is the perturbation frame
+    if (s_isPerturbed && s_frame == s_perturbFrame) {
+        shouldHold = !shouldHold;
     }
 
-    // Record action directly into shared memory buffer
+    bool currentlyHeld = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)];
+    if (shouldHold && !currentlyHeld) {
+        p1->pushButton(PlayerButton::Jump);
+        if (p2)
+            p2->pushButton(PlayerButton::Jump);
+    } else if (!shouldHold && currentlyHeld) {
+        p1->releaseButton(PlayerButton::Jump);
+        if (p2)
+            p2->releaseButton(PlayerButton::Jump);
+    }
+
+    // Record the live button state into shared memory for Python
     data->actionsBuffer[s_frame] = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)] ? 1 : 0;
     s_frame++;
 
@@ -182,7 +194,7 @@ static bool stepRollout(PlayLayer *pl, float &outFtd, int &outActionLength) {
 }
 
 static void backward(PlayLayer *pl) {
-    if (s_checkpointFrames.empty()) {
+    if (s_checkpointFrameDeltas.empty()) {
         s_isBackward = false;
         resetPassState();
         pl->levelComplete();
@@ -205,24 +217,22 @@ static void backward(PlayLayer *pl) {
     // End of rollout: send packet to Python
     data->ftd = ftd;
     data->actionLength = actionLength;
-    std::atomic_thread_fence(std::memory_order_release);
     data->dataReadyBin = 1;
-    while (data->dataReadyBin == 1) {
-        if (data->dataReadyBin == -1) {
-            closeShm();
-            return;
-        }
-        std::this_thread::yield();
+
+    // Wait for Python acknowledgment before stepping physics again
+    while (data && data->dataReadyBin == 1) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
-    // Advance to perturbed rollout or pop checkpoint
     if (!s_isPerturbed) {
+        // Golden rollout done -> run perturbed rollout from same checkpoint
         s_isPerturbed = true;
     } else {
+        // Perturbed rollout done -> pop checkpoint and move to previous one
         pl->removeCheckpoint(true);
-        s_checkpointFrames.pop_back();
+        s_checkpointFrameDeltas.pop_back();
         s_isPerturbed = false;
-        if (s_checkpointFrames.empty()) {
+        if (s_checkpointFrameDeltas.empty()) {
             s_isBackward = false;
             resetPassState();
             pl->levelComplete();
@@ -230,14 +240,36 @@ static void backward(PlayLayer *pl) {
     }
 }
 
-class $modify(MyPlayLayer, PlayLayer) {
-    void setupSession() {
-        m_isPracticeMode = true;
-        resetPassState();
-        closeShm();
-        initShm();
-    }
+static void setupSession() {
+    initShm();
+    if (!data)
+        return;
+    resetPassState();
+}
 
+class $modify(MyBaseGameLayer, GJBaseGameLayer) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        if (isHalfTick)
+            return;
+
+        auto pl = typeinfo_cast<PlayLayer *>(this);
+        if (!pl || !data || !m_started || pl->m_isPaused || !m_player1)
+            return;
+        if (data->dataReadyBin == -1) {
+            closeShm();
+            return;
+        }
+
+        if (!s_isBackward) {
+            forward(pl);
+        } else {
+            backward(pl);
+        }
+    }
+};
+
+class $modify(MyPlayLayer, PlayLayer) {
     bool init(GJGameLevel *level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
             return false;
@@ -265,35 +297,9 @@ class $modify(MyPlayLayer, PlayLayer) {
 
     void levelComplete() {
         if (data && !s_isBackward) {
-            if (s_frame > 0) {
-                s_checkpointFrames.push_back(s_frame);
-            }
             s_isBackward = true;
             return;
         }
         PlayLayer::levelComplete();
-    }
-
-    void postUpdate(float dt) {
-        PlayLayer::postUpdate(dt);
-        if (!m_started || m_isPaused || !m_player1 || !data)
-            return;
-        if (data->dataReadyBin == -1) {
-            closeShm();
-            return;
-        }
-
-        // GD 2.2 advances m_currentProgress by 8 per 60Hz frame (2 per 240Hz tick)
-        int frame60Idx = (m_gameState.m_currentProgress / 2) / 4;
-        if (frame60Idx == s_lastFrameIdx) {
-            return;
-        }
-        s_lastFrameIdx = frame60Idx;
-
-        if (!s_isBackward) {
-            forward(this);
-        } else {
-            backward(this);
-        }
     }
 };
