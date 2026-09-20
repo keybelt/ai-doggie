@@ -7,7 +7,7 @@
     },
     "training": {
         "batchSize": 16,
-        "seqLen": 64,
+        "seqLen": 1024,
         "accumulationSteps": 8,
         "epochs": 15,
         "learningRate": 1e-3,
