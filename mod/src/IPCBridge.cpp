@@ -18,6 +18,7 @@ static int s_fd = -1;
 static void closeShm() {
     if (!s_data)
         return;
+    s_data->dataReadyBin = -1;
     munmap(s_data, sizeof(SharedData));
     close(s_fd);
     s_fd = -1;
@@ -50,10 +51,8 @@ static void setupSession(PlayLayer *pl) {
 }
 
 class $modify(MyBaseGameLayer, GJBaseGameLayer) {
-    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-        if (isHalfTick)
-            return;
+    void processQueuedButtons(float dt, bool clearInputQueue) {
+        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
 
         auto pl = PlayLayer::get();
         if (!pl || !s_data || pl->m_isPaused || !pl->m_player1)
@@ -81,8 +80,11 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        bool wasBackward = DataCollector::isBackward();
         PlayLayer::resetLevel();
-        setupSession(this);
+        if (!wasBackward) {
+            setupSession(this);
+        }
     }
 
     void destroyPlayer(PlayerObject *player, GameObject *gameObject) {
