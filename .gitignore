@@ -12,3 +12,4 @@ mod/*
 !mod/src
 test_shm.py
 stereo madness.gdr
+unpack_rollout.py
