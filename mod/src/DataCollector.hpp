@@ -153,13 +153,17 @@ class DataCollector {
             pl->m_checkpointArray->addObject(cp);
             if (cp->m_physicalCheckpointObject) {
                 cp->m_physicalCheckpointObject->setVisible(false);
+                pl->addToSection(cp->m_physicalCheckpointObject);
             }
         }
     }
 
     static void startRollout(PlayLayer *pl) {
         pl->resetLevel();
-        pl->loadLastCheckpoint();
+        auto cp = pl->loadLastCheckpoint();
+        if (cp && cp->m_physicalCheckpointObject) {
+            cp->m_physicalCheckpointObject->setVisible(false);
+        }
         s_frame = 0;
         s_maxFrames = std::clamp(s_checkpointFrameDeltas.back(), 1, MAX_ACTIONS - 1);
         s_perturbFrame = (s_perturbCount > 0) ? (rand() % s_maxFrames) : -1;
