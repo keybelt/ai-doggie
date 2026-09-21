@@ -153,7 +153,6 @@ class DataCollector {
             pl->m_checkpointArray->addObject(cp);
             if (cp->m_physicalCheckpointObject) {
                 cp->m_physicalCheckpointObject->setVisible(false);
-                pl->addToSection(cp->m_physicalCheckpointObject);
             }
         }
     }
