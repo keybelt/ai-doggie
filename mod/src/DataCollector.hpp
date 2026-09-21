@@ -151,19 +151,22 @@ class DataCollector {
         CheckpointObject *cp = pl->createCheckpoint();
         if (cp) {
             pl->m_checkpointArray->addObject(cp);
-            if (cp->m_physicalCheckpointObject) {
-                cp->m_physicalCheckpointObject->setVisible(false);
-                pl->addToSection(cp->m_physicalCheckpointObject);
+            if (auto phys = cp->m_physicalCheckpointObject) {
+                phys->setTextureRect(cocos2d::CCRectMake(0, 0, 0, 0));
+                phys->setContentSize(cocos2d::CCSizeMake(0, 0));
+                phys->removeAllChildrenWithCleanup(false);
+                if (phys->m_glowSprite) {
+                    phys->m_glowSprite->setTextureRect(cocos2d::CCRectMake(0, 0, 0, 0));
+                    phys->m_glowSprite->setContentSize(cocos2d::CCSizeMake(0, 0));
+                }
+                pl->addToSection(phys);
             }
         }
     }
 
     static void startRollout(PlayLayer *pl) {
         pl->resetLevel();
-        auto cp = pl->loadLastCheckpoint();
-        if (cp && cp->m_physicalCheckpointObject) {
-            cp->m_physicalCheckpointObject->setVisible(false);
-        }
+        pl->loadLastCheckpoint();
         s_frame = 0;
         s_maxFrames = std::clamp(s_checkpointFrameDeltas.back(), 1, MAX_ACTIONS - 1);
         s_perturbFrame = (s_perturbCount > 0) ? (rand() % s_maxFrames) : -1;

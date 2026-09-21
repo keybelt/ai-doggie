@@ -103,3 +103,4 @@ class $modify(MyPlayLayer, PlayLayer) {
         PlayLayer::onQuit();
     }
 };
+
