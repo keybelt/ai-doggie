@@ -15,7 +15,7 @@ constexpr int FRAME_HEIGHT = 480;
 constexpr int FRAME_CHANNELS = 3;
 constexpr int FRAME_BUFFER_SIZE = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS;
 constexpr int MAX_ACTIONS = 1024;
-constexpr float END_WALL_DIST_TOLERANCE = 1000.0f;
+constexpr float END_WALL_DIST_TOLERANCE = 500.0f;
 
 struct SharedData {
     volatile int32_t dataReadyBin;          // 1=ready for Python, 0=consumed by Python, -1=closed
@@ -66,9 +66,7 @@ class DataCollector {
         s_frame++;
 
         if ((pl->m_levelLength - p1->getPositionX()) <= END_WALL_DIST_TOLERANCE) {
-            if (s_frame > 0) {
-                s_checkpointFrameDeltas.push_back(s_frame);
-            }
+            pl->removeCheckpoint(false);
             s_isBackward = true;
             s_data->dataReadyBin = 2;
             return;
@@ -84,53 +82,53 @@ class DataCollector {
         }
     }
 
-    static void backward(PlayLayer *pl) {
-        if (s_checkpointFrameDeltas.empty()) {
-            s_isBackward = false;
-            resetPassState();
-            pl->levelComplete();
-            return;
+    static void onPlayerDied(PlayLayer *pl) {
+        if (s_rolloutActive && s_isBackward) {
+            finishRollout(pl, static_cast<float>(s_frame));
+        }
+    }
+
+    static void finishRollout(PlayLayer *pl, float ftd) {
+        s_rolloutActive = false;
+
+        if (s_data) {
+            s_data->ftd = ftd;
+            s_data->actionLength = s_maxFrames;
+            s_data->dataReadyBin = 1;
+
+            while (s_data && s_data->dataReadyBin == 1) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
         }
 
+        if (!s_isPerturbed) {
+            s_isPerturbed = true;
+        } else {
+            pl->removeCheckpoint(false);
+            s_checkpointFrameDeltas.pop_back();
+            s_isPerturbed = false;
+
+            // Discard the last backward segment (CP 0 spawn): quit before rolling it
+            if (s_checkpointFrameDeltas.size() <= 1) {
+                s_isBackward = false;
+                resetPassState();
+                pl->onQuit();
+                return;
+            }
+        }
+
+        startRollout(pl);
+        s_rolloutActive = true;
+    }
+
+    static void backward(PlayLayer *pl) {
         if (!s_rolloutActive) {
             startRollout(pl);
             s_rolloutActive = true;
         }
 
-        float ftd = 0.0f;
-        int actionLength = 0;
-        if (!stepRollout(pl, ftd, actionLength)) {
-            return;
-        }
-
-        s_rolloutActive = false;
-
-        if (!s_data)
-            return;
-
-        // End of rollout: send packet to Python
-        s_data->ftd = ftd;
-        s_data->actionLength = actionLength;
-        s_data->dataReadyBin = 1;
-
-        // Wait for Python acknowledgment before stepping physics again
-        while (s_data && s_data->dataReadyBin == 1) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-
-        if (!s_isPerturbed) {
-            // Golden rollout done -> run perturbed rollout from same checkpoint
-            s_isPerturbed = true;
-        } else {
-            // Perturbed rollout done -> pop checkpoint and move to previous one
-            pl->removeCheckpoint(false);
-            s_checkpointFrameDeltas.pop_back();
-            s_isPerturbed = false;
-            if (s_checkpointFrameDeltas.empty()) {
-                s_isBackward = false;
-                resetPassState();
-                pl->onQuit();
-            }
+        if (stepRollout(pl)) {
+            finishRollout(pl, static_cast<float>(s_maxFrames));
         }
     }
 
@@ -144,7 +142,6 @@ class DataCollector {
     }
 
     static void addCheckpoint(PlayLayer *pl) {
-
         CheckpointObject *cp = pl->createCheckpoint();
         if (cp) {
             if (cp->m_physicalCheckpointObject) {
@@ -162,7 +159,7 @@ class DataCollector {
         s_perturbFrame = s_isPerturbed ? (rand() % s_maxFrames) : -1;
     }
 
-    static bool stepRollout(PlayLayer *pl, float &outFtd, int &outActionLength) {
+    static bool stepRollout(PlayLayer *pl) {
         auto p1 = pl->m_player1;
         auto p2 = pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr;
 
@@ -201,15 +198,7 @@ class DataCollector {
         }
         s_frame++;
 
-        bool died = pl->m_playerDied;
-
-        if (died || s_frame >= s_maxFrames) {
-            outFtd = died ? static_cast<float>(s_frame) : static_cast<float>(s_maxFrames);
-            outActionLength = s_maxFrames;
-            return true;
-        }
-
-        return false;
+        return s_frame >= s_maxFrames;
     }
 
     inline static SharedData *s_data = nullptr;
