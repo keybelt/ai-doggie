@@ -19,12 +19,16 @@ constexpr float END_WALL_DIST_TOLERANCE = 500.0f;
 constexpr int NUM_PERTURBATIONS = 3;
 
 struct SharedData {
-    volatile int32_t dataReadyBin;          // 1=ready for Python, 0=consumed by Python, -1=closed
+    volatile int32_t dataReadyBin;          // 1=ready for Python, 0=consumed by Python, 2=golden start, -1=closed
     volatile float ftd;                     // Raw frames to death (target)
-    volatile float vx;                      // Player horizontal velocity
-    volatile float vy;                      // Player vertical velocity (m_yAccel)
-    volatile float gravityDir;              // 1.0=normal, -1.0=inverted
-    volatile int32_t isHolding;             // 1 if jump held at spawn, 0 otherwise
+    volatile float p1_vx;                   // Player 1 horizontal velocity
+    volatile float p1_vy;                   // Player 1 vertical velocity
+    volatile float p1_gravity;              // 1.0=normal, -1.0=inverted
+    volatile float p2_vx;                   // Player 2 horizontal velocity (0.0 if not dual)
+    volatile float p2_vy;                   // Player 2 vertical velocity (0.0 if not dual)
+    volatile float p2_gravity;              // Player 2 gravity (0.0 if not dual)
+    volatile int32_t isDual;                // 1 if dual mode, 0 otherwise
+    volatile int32_t isHolding;             // 1 if jump held at spawn, 0 otherwise (universal)
     volatile int32_t actionLength;          // Number of actions in actionsBuffer
     int8_t actionsBuffer[MAX_ACTIONS];      // Recorded action sequence (0=release, 1=jump)
     uint8_t frameBuffer[FRAME_BUFFER_SIZE]; // RGB pixels of I_0 at spawn (921,600 bytes)
@@ -171,10 +175,23 @@ class DataCollector {
 
         // Capture I_0 and initial telemetry at frame 0 of golden rollout
         if (s_perturbCount == 0 && s_frame == 0 && s_data) {
+            cocos2d::CCDirector::sharedDirector()->drawScene();
             glReadPixels(0, 0, FRAME_WIDTH, FRAME_HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, (void *)s_data->frameBuffer);
-            s_data->vx = p1->m_isGoingLeft ? -p1->m_playerSpeed : p1->m_playerSpeed;
-            s_data->vy = static_cast<float>(p1->m_yVelocity);
-            s_data->gravityDir = p1->m_isUpsideDown ? -1.0f : 1.0f;
+            s_data->p1_vx = p1->m_isGoingLeft ? -p1->m_playerSpeed : p1->m_playerSpeed;
+            s_data->p1_vy = static_cast<float>(p1->m_yVelocity);
+            s_data->p1_gravity = p1->m_isUpsideDown ? -1.0f : 1.0f;
+
+            if (p2) {
+                s_data->isDual = 1;
+                s_data->p2_vx = p2->m_isGoingLeft ? -p2->m_playerSpeed : p2->m_playerSpeed;
+                s_data->p2_vy = static_cast<float>(p2->m_yVelocity);
+                s_data->p2_gravity = p2->m_isUpsideDown ? -1.0f : 1.0f;
+            } else {
+                s_data->isDual = 0;
+                s_data->p2_vx = 0.0f;
+                s_data->p2_vy = 0.0f;
+                s_data->p2_gravity = 0.0f;
+            }
             s_data->isHolding = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)] ? 1 : 0;
         }
 
