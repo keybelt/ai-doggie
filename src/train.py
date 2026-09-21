@@ -99,7 +99,7 @@ def log_diagnostics(
 
 def measure_inference_latency(model: Model) -> float:
     dummy_x = torch.zeros(1, 3, 480, 640, device=DEVICE)
-    dummy_s = torch.zeros(1, 4, device=DEVICE)
+    dummy_s = torch.zeros(1, 8, device=DEVICE)
     dummy_a = torch.zeros(1, MAX_HORIZON, device=DEVICE)
     with torch.no_grad():
         model(dummy_x, dummy_s, dummy_a)

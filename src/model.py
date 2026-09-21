@@ -58,8 +58,9 @@ class Model(nn.Module):
 
         self.seq_len: int = CONFIG["training"]["seqLen"]
         visual_dim = 2 * attn_total_dim
-        fusion_dim = visual_dim + 4 + self.seq_len
-        self.aux_ln = nn.LayerNorm(4)
+        aux_dim = 8
+        fusion_dim = visual_dim + aux_dim + self.seq_len
+        self.aux_ln = nn.LayerNorm(aux_dim)
         self.loss_head = nn.Sequential(
             nn.Linear(fusion_dim, 128),
             nn.GELU(),
@@ -128,6 +129,6 @@ class Model(nn.Module):
         X_conv = self.conv_forward(X)  # [B, C', H', W']
         z_0 = self.cross_attention_pooling(X_conv)  # [B, D]
 
-        fused = torch.cat([z_0, self.aux_ln(aux_state), actions], dim=-1)  # [B, D + 4 + MAX_H]
+        fused = torch.cat([z_0, self.aux_ln(aux_state), actions], dim=-1)  # [B, D + 8 + MAX_H]
         pred_ftd = self.loss_head(fused)  # [B, 1]
         return pred_ftd
