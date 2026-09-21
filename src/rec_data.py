@@ -17,9 +17,9 @@ from shm_utils import (
 
 def update_display(stage_str: str, rollouts: int, first: bool = False):
     if first:
-        print(f"[STAGE] {stage_str}\n[DATA]  Rollouts: {rollouts}", end="", flush=True)
+        print(f"[STAGE] {stage_str}\n[DATA]  Rollout: {rollouts}", end="", flush=True)
     else:
-        print(f"\033[A\r\033[K[STAGE] {stage_str}\n\033[K[DATA]  Rollouts: {rollouts}", end="", flush=True)
+        print(f"\033[A\r\033[K[STAGE] {stage_str}\n\033[K[DATA]  Rollout: {rollouts}", end="", flush=True)
 
 
 def main(session_name: str):
@@ -30,13 +30,13 @@ def main(session_name: str):
     print(f"\nTarget HDF5 dataset: {save_path}\n")
 
     shm = init_shm()
-    rollout_idx = 0
+    rollout_idx = 1
 
     try:
         with h5py.File(save_path, "a") as f:
             f.require_group("rollouts")
 
-            update_display("Forward", rollout_idx, first=True)
+            update_display("Forward", 0, first=True)
 
             while is_session_active(shm):
                 data_ready = unpack("i", shm.buf[0:4])[0]
@@ -51,7 +51,6 @@ def main(session_name: str):
                 pkg = get_rollout_package(shm)
                 acknowledge_handshake(shm)
 
-                # Save rollout as a self-contained group
                 grp = f.create_group(f"rollouts/rollout_{rollout_idx:05d}")
                 grp.create_dataset(
                     "frame_0",
@@ -67,17 +66,17 @@ def main(session_name: str):
                 f.flush()
 
                 rollout_idx += 1
-                next_stage = "Golden" if rollout_idx % 2 == 0 else "Perturbed"
+                next_stage = "Golden" if rollout_idx % 2 == 1 else "Perturbed"
                 update_display(f"Backward ({next_stage})", rollout_idx)
 
-            update_display("Completed", rollout_idx)
+            update_display("Completed", rollout_idx - 1)
 
     except KeyboardInterrupt:
         print("\n\nRecording stopped by user (Ctrl+C).")
     finally:
         shm.close()
         shm.unlink()
-        print(f"\n\nSession finished. Total rollouts saved: {rollout_idx}\n")
+        print(f"\n\nSession finished. Total rollouts saved: {rollout_idx - 1}\n")
 
 
 if __name__ == "__main__":
