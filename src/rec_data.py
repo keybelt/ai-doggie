@@ -14,6 +14,8 @@ from shm_utils import (
     wait_for_rollout_package,
 )
 
+NUM_PERTURBATIONS = 3
+
 
 def update_display(stage_str: str, rollouts: int, first: bool = False):
     if first:
@@ -66,7 +68,11 @@ def main(session_name: str):
                 f.flush()
 
                 rollout_idx += 1
-                next_stage = "Golden" if rollout_idx % 2 == 1 else "Perturbed"
+                cycle = (rollout_idx - 1) % (1 + NUM_PERTURBATIONS)
+                if cycle == 0:
+                    next_stage = "Golden"
+                else:
+                    next_stage = f"Perturbed #{cycle}"
                 update_display(f"Backward ({next_stage})", rollout_idx)
 
             update_display("Completed", rollout_idx - 1)

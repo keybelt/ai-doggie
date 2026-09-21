@@ -16,6 +16,7 @@ constexpr int FRAME_CHANNELS = 3;
 constexpr int FRAME_BUFFER_SIZE = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS;
 constexpr int MAX_ACTIONS = 8192;
 constexpr float END_WALL_DIST_TOLERANCE = 500.0f;
+constexpr int NUM_PERTURBATIONS = 3;
 
 struct SharedData {
     volatile int32_t dataReadyBin;          // 1=ready for Python, 0=consumed by Python, -1=closed
@@ -35,7 +36,7 @@ class DataCollector {
 
     static void resetPassState() {
         s_isBackward = false;
-        s_isPerturbed = false;
+        s_perturbCount = 0;
         s_rolloutActive = false;
         s_edgeX = 0.0f;
         s_frame = 0;
@@ -103,12 +104,12 @@ class DataCollector {
             }
         }
 
-        if (!s_isPerturbed) {
-            s_isPerturbed = true;
+        if (s_perturbCount < NUM_PERTURBATIONS) {
+            s_perturbCount++;
         } else {
             pl->removeCheckpoint(false);
             s_checkpointFrameDeltas.pop_back();
-            s_isPerturbed = false;
+            s_perturbCount = 0;
 
             // Discard the last backward segment (CP 0 spawn): quit before rolling it
             if (s_checkpointFrameDeltas.size() <= 1) {
@@ -159,7 +160,7 @@ class DataCollector {
         pl->loadLastCheckpoint();
         s_frame = 0;
         s_maxFrames = std::clamp(s_checkpointFrameDeltas.back(), 1, MAX_ACTIONS - 1);
-        s_perturbFrame = s_isPerturbed ? (rand() % s_maxFrames) : -1;
+        s_perturbFrame = (s_perturbCount > 0) ? (rand() % s_maxFrames) : -1;
         s_perturbActive = false;
         s_perturbOriginalState = -1;
     }
@@ -169,7 +170,7 @@ class DataCollector {
         auto p2 = pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr;
 
         // Capture I_0 and initial telemetry at frame 0 of golden rollout
-        if (!s_isPerturbed && s_frame == 0 && s_data) {
+        if (s_perturbCount == 0 && s_frame == 0 && s_data) {
             glReadPixels(0, 0, FRAME_WIDTH, FRAME_HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, (void *)s_data->frameBuffer);
             s_data->vx = p1->m_isGoingLeft ? -p1->m_playerSpeed : p1->m_playerSpeed;
             s_data->vy = static_cast<float>(p1->m_yVelocity);
@@ -182,7 +183,7 @@ class DataCollector {
         bool shouldHold = (s_macroTape[tick240] == 1);
 
         // Apply persistent perturbation until next macro transition
-        if (s_isPerturbed && s_frame == s_perturbFrame) {
+        if (s_perturbCount > 0 && s_frame == s_perturbFrame) {
             s_perturbActive = true;
             s_perturbOriginalState = s_macroTape[tick240];
         }
@@ -217,7 +218,7 @@ class DataCollector {
 
     inline static SharedData *s_data = nullptr;
     inline static bool s_isBackward = false;
-    inline static bool s_isPerturbed = false;
+    inline static int s_perturbCount = 0;
     inline static bool s_rolloutActive = false;
     inline static float s_edgeX = 0.0f;
     inline static int s_frame = 0;
