@@ -36,7 +36,7 @@ def load_dataset(h5_files: list[Path], max_horizon: int) -> TensorDataset:
         with h5py.File(fpath, "r") as f:
             for grp in f["rollouts"].values():
                 frame = torch.from_numpy(grp["frame_0"][:]).permute(2, 0, 1)
-                state = torch.from_numpy(grp["aux_state"][:])
+                state = torch.from_numpy(grp["aux_state"][:]).float()
 
                 act = torch.from_numpy(grp["actions"][:max_horizon]).float()
                 if len(act) < max_horizon:
@@ -99,7 +99,7 @@ def log_diagnostics(
 
 def measure_inference_latency(model: Model) -> float:
     dummy_x = torch.zeros(1, 3, 480, 640, device=DEVICE)
-    dummy_s = torch.zeros(1, 8, device=DEVICE)
+    dummy_s = torch.zeros(1, 7, device=DEVICE)
     dummy_a = torch.zeros(1, MAX_HORIZON, device=DEVICE)
     with torch.no_grad():
         model(dummy_x, dummy_s, dummy_a)

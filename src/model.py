@@ -58,7 +58,7 @@ class Model(nn.Module):
 
         self.seq_len: int = CONFIG["training"]["seqLen"]
         visual_dim = 2 * attn_total_dim
-        aux_dim = 8
+        aux_dim = 7
         fusion_dim = visual_dim + aux_dim + self.seq_len
         self.aux_ln = nn.LayerNorm(aux_dim)
         self.loss_head = nn.Sequential(
@@ -120,7 +120,7 @@ class Model(nn.Module):
         """
         Args:
             X: [B, C, H, W] raw RGB frame I_0 at spawn.
-            aux_state: [B, 4] physical state [vx, vy, gravityDir, isHolding].
+            aux_state: [B, 7] physical state [p1_vx, p1_vy, p1_grav, p2_vx, p2_vy, p2_grav, is_holding].
             actions: [B, MAX_H] raw candidate action sequence (0.0=release, 1.0=jump, -1.0=pad).
 
         Returns:
@@ -129,6 +129,6 @@ class Model(nn.Module):
         X_conv = self.conv_forward(X)  # [B, C', H', W']
         z_0 = self.cross_attention_pooling(X_conv)  # [B, D]
 
-        fused = torch.cat([z_0, self.aux_ln(aux_state), actions], dim=-1)  # [B, D + 8 + MAX_H]
+        fused = torch.cat([z_0, self.aux_ln(aux_state), actions], dim=-1)  # [B, D + 7 + MAX_H]
         pred_ftd = self.loss_head(fused)  # [B, 1]
         return pred_ftd

@@ -11,7 +11,7 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 SHM_NAME = "GDMem"
-HEADER_SIZE = 44
+HEADER_SIZE = 40
 ACTIONS_BUFFER_SIZE = 8192
 FRAME_WIDTH = CONFIG["frame"]["width"]
 FRAME_HEIGHT = CONFIG["frame"]["height"]
@@ -77,11 +77,11 @@ def get_rollout_package(shm: SharedMemory) -> dict:
     """Extract the complete atomic rollout package from shared memory.
 
     Returns:
-        dict containing ftd, aux_state [8], actions [L], frame_0 [H, W, 3].
-        aux_state: [p1_vx, p1_vy, p1_gravity, p2_vx, p2_vy, p2_gravity, is_dual, is_holding]
+        dict containing ftd, aux_state [7], actions [L], frame_0 [H, W, 3].
+        aux_state: [p1_vx, p1_vy, p1_gravity, p2_vx, p2_vy, p2_gravity, is_holding]
     """
-    _, ftd, p1_vx, p1_vy, p1_grav, p2_vx, p2_vy, p2_grav, is_dual, is_holding, action_len = (
-        unpack("i7f3i", shm.buf[0:HEADER_SIZE])
+    _, ftd, p1_vx, p1_vy, p1_grav, p2_vx, p2_vy, p2_grav, is_holding, action_len = unpack(
+        "i7f2i", shm.buf[0:HEADER_SIZE]
     )
 
     action_len = max(0, min(action_len, ACTIONS_BUFFER_SIZE))
@@ -108,7 +108,6 @@ def get_rollout_package(shm: SharedMemory) -> dict:
             p2_vx,
             p2_vy,
             p2_grav,
-            float(is_dual),
             float(is_holding),
         ],
         dtype=np.float32,

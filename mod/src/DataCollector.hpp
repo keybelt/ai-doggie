@@ -27,7 +27,6 @@ struct SharedData {
     volatile float p2_vx;                   // Player 2 horizontal velocity (0.0 if not dual)
     volatile float p2_vy;                   // Player 2 vertical velocity (0.0 if not dual)
     volatile float p2_gravity;              // Player 2 gravity (0.0 if not dual)
-    volatile int32_t isDual;                // 1 if dual mode, 0 otherwise
     volatile int32_t isHolding;             // 1 if jump held at spawn, 0 otherwise (universal)
     volatile int32_t actionLength;          // Number of actions in actionsBuffer
     int8_t actionsBuffer[MAX_ACTIONS];      // Recorded action sequence (0=release, 1=jump)
@@ -211,12 +210,10 @@ class DataCollector {
             s_data->p1_gravity = p1->m_isUpsideDown ? -1.0f : 1.0f;
 
             if (p2) {
-                s_data->isDual = 1;
                 s_data->p2_vx = p2->m_isGoingLeft ? -p2->m_playerSpeed : p2->m_playerSpeed;
                 s_data->p2_vy = static_cast<float>(p2->m_yVelocity);
                 s_data->p2_gravity = p2->m_isUpsideDown ? -1.0f : 1.0f;
             } else {
-                s_data->isDual = 0;
                 s_data->p2_vx = 0.0f;
                 s_data->p2_vy = 0.0f;
                 s_data->p2_gravity = 0.0f;
