@@ -13,3 +13,4 @@ mod/*
 test_shm.py
 stereo madness.gdr
 unpack_rollout.py
+count_rollouts.py
