@@ -173,28 +173,6 @@ class DataCollector {
         auto p1 = pl->m_player1;
         auto p2 = pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr;
 
-        // Capture I_0 and initial telemetry at frame 0 of golden rollout
-        if (s_perturbCount == 0 && s_frame == 0 && s_data) {
-            cocos2d::CCDirector::sharedDirector()->drawScene();
-            glReadPixels(0, 0, FRAME_WIDTH, FRAME_HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, (void *)s_data->frameBuffer);
-            s_data->p1_vx = p1->m_isGoingLeft ? -p1->m_playerSpeed : p1->m_playerSpeed;
-            s_data->p1_vy = static_cast<float>(p1->m_yVelocity);
-            s_data->p1_gravity = p1->m_isUpsideDown ? -1.0f : 1.0f;
-
-            if (p2) {
-                s_data->isDual = 1;
-                s_data->p2_vx = p2->m_isGoingLeft ? -p2->m_playerSpeed : p2->m_playerSpeed;
-                s_data->p2_vy = static_cast<float>(p2->m_yVelocity);
-                s_data->p2_gravity = p2->m_isUpsideDown ? -1.0f : 1.0f;
-            } else {
-                s_data->isDual = 0;
-                s_data->p2_vx = 0.0f;
-                s_data->p2_vy = 0.0f;
-                s_data->p2_gravity = 0.0f;
-            }
-            s_data->isHolding = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)] ? 1 : 0;
-        }
-
         // Current 240Hz tick index = m_currentProgress / 2
         size_t tick240 = static_cast<size_t>(pl->m_gameState.m_currentProgress / 2);
         bool shouldHold = (s_macroTape[tick240] == 1);
@@ -222,6 +200,28 @@ class DataCollector {
             p1->releaseButton(PlayerButton::Jump);
             if (p2)
                 p2->releaseButton(PlayerButton::Jump);
+        }
+
+        // Capture I_0 and initial telemetry at frame 0 of golden rollout (after applying input)
+        if (s_perturbCount == 0 && s_frame == 0 && s_data) {
+            cocos2d::CCDirector::sharedDirector()->drawScene();
+            glReadPixels(0, 0, FRAME_WIDTH, FRAME_HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, (void *)s_data->frameBuffer);
+            s_data->p1_vx = p1->m_isGoingLeft ? -p1->m_playerSpeed : p1->m_playerSpeed;
+            s_data->p1_vy = static_cast<float>(p1->m_yVelocity);
+            s_data->p1_gravity = p1->m_isUpsideDown ? -1.0f : 1.0f;
+
+            if (p2) {
+                s_data->isDual = 1;
+                s_data->p2_vx = p2->m_isGoingLeft ? -p2->m_playerSpeed : p2->m_playerSpeed;
+                s_data->p2_vy = static_cast<float>(p2->m_yVelocity);
+                s_data->p2_gravity = p2->m_isUpsideDown ? -1.0f : 1.0f;
+            } else {
+                s_data->isDual = 0;
+                s_data->p2_vx = 0.0f;
+                s_data->p2_vy = 0.0f;
+                s_data->p2_gravity = 0.0f;
+            }
+            s_data->isHolding = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)] ? 1 : 0;
         }
 
         // Record the live button state into shared memory for Python
