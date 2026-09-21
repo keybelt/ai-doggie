@@ -14,7 +14,7 @@ constexpr int FRAME_WIDTH = 640;
 constexpr int FRAME_HEIGHT = 480;
 constexpr int FRAME_CHANNELS = 3;
 constexpr int FRAME_BUFFER_SIZE = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS;
-constexpr int MAX_ACTIONS = 1024;
+constexpr int MAX_ACTIONS = 8192;
 constexpr float END_WALL_DIST_TOLERANCE = 500.0f;
 
 struct SharedData {
@@ -146,10 +146,11 @@ class DataCollector {
     static void addCheckpoint(PlayLayer *pl) {
         CheckpointObject *cp = pl->createCheckpoint();
         if (cp) {
+            pl->m_checkpointArray->addObject(cp);
             if (cp->m_physicalCheckpointObject) {
                 cp->m_physicalCheckpointObject->setVisible(false);
+                pl->addToSection(cp->m_physicalCheckpointObject);
             }
-            pl->storeCheckpoint(cp);
         }
     }
 
