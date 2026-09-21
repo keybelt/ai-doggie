@@ -41,6 +41,8 @@ class DataCollector {
         s_frame = 0;
         s_maxFrames = 0;
         s_perturbFrame = -1;
+        s_perturbActive = false;
+        s_perturbOriginalState = -1;
         s_macroTape.clear();
         s_checkpointFrameDeltas.clear();
     }
@@ -157,6 +159,8 @@ class DataCollector {
         s_frame = 0;
         s_maxFrames = std::clamp(s_checkpointFrameDeltas.back(), 1, MAX_ACTIONS - 1);
         s_perturbFrame = s_isPerturbed ? (rand() % s_maxFrames) : -1;
+        s_perturbActive = false;
+        s_perturbOriginalState = -1;
     }
 
     static bool stepRollout(PlayLayer *pl) {
@@ -176,9 +180,18 @@ class DataCollector {
         size_t tick240 = static_cast<size_t>(pl->m_gameState.m_currentProgress / 2);
         bool shouldHold = (s_macroTape[tick240] == 1);
 
-        // Apply perturbation if this is the perturbation frame
+        // Apply persistent perturbation until next macro transition
         if (s_isPerturbed && s_frame == s_perturbFrame) {
-            shouldHold = !shouldHold;
+            s_perturbActive = true;
+            s_perturbOriginalState = s_macroTape[tick240];
+        }
+
+        if (s_perturbActive) {
+            if (s_macroTape[tick240] != s_perturbOriginalState) {
+                s_perturbActive = false;
+            } else {
+                shouldHold = !shouldHold;
+            }
         }
 
         bool currentlyHeld = p1->m_holdingButtons[static_cast<int>(PlayerButton::Jump)];
@@ -209,6 +222,8 @@ class DataCollector {
     inline static int s_frame = 0;
     inline static int s_maxFrames = 0;
     inline static int s_perturbFrame = -1;
+    inline static bool s_perturbActive = false;
+    inline static int8_t s_perturbOriginalState = -1;
 
     inline static std::vector<int8_t> s_macroTape;
     inline static std::vector<int> s_checkpointFrameDeltas;
