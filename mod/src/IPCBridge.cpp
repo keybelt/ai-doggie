@@ -88,9 +88,13 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject *player, GameObject *gameObject) {
-        PlayLayer::destroyPlayer(player, gameObject);
-        if (m_playerDied && !DataCollector::isBackward() && s_data) {
-            this->pauseGame(false);
+        if (!DataCollector::isBackward()) {
+            PlayLayer::destroyPlayer(player, gameObject);
+            if (m_playerDied) {
+                this->pauseGame(false);
+            }
+        } else {
+            DataCollector::onPlayerDied(this);
         }
     }
 
