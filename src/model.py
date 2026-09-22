@@ -61,13 +61,9 @@ class Model(nn.Module):
         aux_dim = 7
         fusion_dim = visual_dim + aux_dim + self.seq_len
         self.aux_ln = nn.LayerNorm(aux_dim)
-        self.loss_head = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
-            nn.GELU(),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
-        )
+        self.fc1 = nn.Linear(fusion_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
 
     def conv_forward(self, X: Tensor) -> Tensor:
         """
@@ -130,5 +126,7 @@ class Model(nn.Module):
         z_0 = self.cross_attention_pooling(X_conv)  # [B, D]
 
         fused = torch.cat([z_0, self.aux_ln(aux_state), actions], dim=-1)  # [B, D + 7 + MAX_H]
-        pred_ftd = self.loss_head(fused)  # [B, 1]
+        h = F.gelu(self.fc1(fused))
+        h = F.gelu(self.fc2(h))
+        pred_ftd = self.fc3(h)  # [B, 1]
         return pred_ftd
