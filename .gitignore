@@ -1,16 +1,9 @@
-wandb
 data
 .venv
-.src_old
-.ds_store
-__pycache__
-macro_parser
 .eclipse
 CONTEXT.md
 checkpoints
 mod/*
 !mod/src
-test_shm.py
-stereo madness.gdr
-unpack_rollout.py
-count_rollouts.py
+pure_vibe_coded_helpers
+.DS_Store
