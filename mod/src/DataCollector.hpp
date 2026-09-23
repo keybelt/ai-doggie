@@ -16,7 +16,7 @@ constexpr int FRAME_CHANNELS = 3;
 constexpr int FRAME_BUFFER_SIZE = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS;
 constexpr int MAX_ACTIONS = 8192;
 constexpr float END_WALL_DIST_TOLERANCE = 500.0f;
-constexpr int NUM_PERTURBATIONS = 3;
+constexpr int NUM_PERTURBATIONS = 5;
 
 struct SharedData {
     volatile int32_t dataReadyBin;          // 1=ready for Python, 0=consumed by Python, 2=golden start, -1=closed

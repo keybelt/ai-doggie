@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 
 import h5py
-import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
@@ -262,4 +261,5 @@ def main():
 
 
 if __name__ == "__main__":
+    raise Exception("dont forget to calc the seq len + deduplicate + find a good balance between dead and alive rollouts")
     main()

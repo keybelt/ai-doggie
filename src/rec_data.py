@@ -14,7 +14,7 @@ from shm_utils import (
     wait_for_rollout_package,
 )
 
-NUM_PERTURBATIONS = 3
+NUM_PERTURBATIONS = 5
 
 
 def update_display(stage_str: str, rollouts: int, first: bool = False):
