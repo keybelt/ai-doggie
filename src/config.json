@@ -1,29 +1,15 @@
 {
-    "model": {
-        "attnDim": 32,
-        "numHeads": 8
-    },
     "training": {
-        "batchSize": 64,
         "dynamic": {
             "seqLen": 303,
             "targetOffset": 215.75
         },
-        "epochs": 100,
-        "learningRate": 5e-4,
-        "maxGradNorm": 10.0,
-        "evalFreqSteps": 50,
-        "weightDecay": 0.01,
-        "warmupRatio": 0.03,
-        "decayRatio": 0.07,
-        "minLrRatio": 0.01,
-        "smoothL1Beta": 50.0
+        "evalFreqSteps": 50
     },
     "frame": {
         "width": 640,
         "height": 480
     },
-    "checkpointFile": "",
     "keys": {
         "exitKeyName": "backspace",
         "recordKeyName": "space"
