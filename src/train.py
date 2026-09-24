@@ -269,5 +269,5 @@ def main():
 
 
 if __name__ == "__main__":
-    raise Exception("dont forget to calc the seq len + deduplicate + find a good balance between dead and alive rollouts")
+    # raise Exception("dont forget to calc the seq len + deduplicate + find a good balance between dead and alive rollouts")
     main()
