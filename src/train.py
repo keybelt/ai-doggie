@@ -94,7 +94,9 @@ def log_diagnostics(
                 stats[f"grad_rms/{layer}"] = grad_rms[name]
             if name in update_ratios:
                 stats[f"update_ratio/{layer}"] = update_ratios[name]
-    wandb.log(stats)
+        
+    if wandb.run:
+        wandb.log(stats)
 
 
 def measure_inference_latency(model: Model) -> float:
