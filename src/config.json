@@ -1,18 +1,18 @@
 {
     "model": {
-        "hiddenDim": 64,
         "attnDim": 32,
-        "numHeads": 8,
-        "actionDim": 3
+        "numHeads": 8
     },
     "training": {
-        "batchSize": 16,
-        "seqLen": -1,
-        "accumulationSteps": 8,
+        "batchSize": 64,
+        "dynamic": {
+            "seqLen": 303,
+            "targetOffset": 215.75
+        },
         "epochs": 15,
-        "learningRate": 1e-3,
+        "learningRate": 5e-4,
         "maxGradNorm": 1.0,
-        "evalFreqSteps": 100,
+        "evalFreqSteps": 50,
         "weightDecay": 0.01,
         "warmupRatio": 0.03,
         "decayRatio": 0.07,
