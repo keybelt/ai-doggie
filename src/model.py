@@ -12,10 +12,10 @@ with CONFIG_PATH.open() as f:
 
 class Model(nn.Module):
 
-    def __init__(self):
+    def __init__(self, attn_dim: int, num_heads: int):
         super().__init__()
-        self.attn_dim: int = CONFIG["model"]["attnDim"]
-        self.num_heads: int = CONFIG["model"]["numHeads"]
+        self.attn_dim = attn_dim
+        self.num_heads = num_heads
 
         # 3-layer CNN backbone with CoordConv on first layer
         self.conv1 = nn.Conv2d(3 + 2, 32, kernel_size=5, stride=4)
