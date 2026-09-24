@@ -22,6 +22,7 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 DEVICE = torch.device("mps")
+SMOOTH_L1_BETA = CONFIG["training"]["smoothL1Beta"]
 dynamic_cfg = CONFIG["training"]["dynamic"]
 MAX_HORIZON = dynamic_cfg["seqLen"]
 
@@ -125,7 +126,7 @@ def run_val(model: Model, val_loader: DataLoader) -> tuple[float, float]:
             targets = targets.to(DEVICE)
 
             preds = model(frames, states, actions).squeeze(-1)
-            val_loss += F.smooth_l1_loss(preds, targets).item()
+            val_loss += F.smooth_l1_loss(preds, targets, beta=SMOOTH_L1_BETA).item()
 
     avg_val_loss = val_loss / len(val_loader)
     inf_latency = measure_inference_latency(model)
@@ -184,8 +185,8 @@ def main():
         name=f"ftd training baby",
         config=CONFIG["training"],
     )
-    wandb.define_metric("global_step", hidden=True)
-    wandb.define_metric("*", step_metric="global_step")
+    wandb.define_metric("epoch")
+    wandb.define_metric("*", step_metric="epoch")
 
     global_step = 0
     last_train_loss = 0.0
@@ -202,7 +203,7 @@ def main():
             targets = targets.to(DEVICE)
 
             preds = model(frames, states, actions).squeeze(-1)
-            loss = F.smooth_l1_loss(preds, targets)
+            loss = F.smooth_l1_loss(preds, targets, beta=SMOOTH_L1_BETA)
             last_train_loss = loss.item()
 
             optimizer.zero_grad()
@@ -242,12 +243,12 @@ def main():
 
                 val_loss, inf_latency = run_val(model, val_loader)
                 stats = {
-                    "train/step_loss": last_train_loss,
+                    "train/loss": last_train_loss,
                     "train/lr": scheduler.get_last_lr()[0],
                     "total_grad_norm": total_grad_norm,
                     "val/loss": val_loss,
                     "inf_latency_ms": inf_latency,
-                    "global_step": global_step,
+                    "epoch": global_step / len(train_loader),
                 }
                 log_diagnostics(model, stats, grad_rms, update_ratios)
                 model.train()
