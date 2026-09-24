@@ -14,7 +14,6 @@ class Model(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.hidden_dim: int = CONFIG["model"]["hiddenDim"]
         self.attn_dim: int = CONFIG["model"]["attnDim"]
         self.num_heads: int = CONFIG["model"]["numHeads"]
 
@@ -56,7 +55,10 @@ class Model(nn.Module):
         self.register_buffer("y_coords", y_coords, persistent=False)
         self.register_buffer("x_coords", x_coords, persistent=False)
 
-        self.seq_len: int = CONFIG["training"]["seqLen"]
+        dynamic_cfg = CONFIG["training"]["dynamic"]
+        self.seq_len: int = dynamic_cfg["seqLen"]
+        self.target_offset: float = float(dynamic_cfg["targetOffset"])
+
         visual_dim = 2 * attn_total_dim
         aux_dim = 7
         fusion_dim = visual_dim + aux_dim + self.seq_len
@@ -64,6 +66,9 @@ class Model(nn.Module):
         self.fc1 = nn.Linear(fusion_dim, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, 1)
+
+        self.fc3.bias.data.fill_(self.target_offset)
+        self.fc3.weight.data.zero_()
 
     def conv_forward(self, X: Tensor) -> Tensor:
         """

@@ -22,7 +22,8 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 DEVICE = torch.device("mps")
-MAX_HORIZON = CONFIG["training"]["seqLen"]
+dynamic_cfg = CONFIG["training"]["dynamic"]
+MAX_HORIZON = dynamic_cfg["seqLen"]
 
 
 def load_dataset(h5_files: list[Path], max_horizon: int) -> TensorDataset:
@@ -151,10 +152,17 @@ def main():
     )
 
     model = Model().to(DEVICE)
+
+    # Exclude 1D parameters (biases, normalization vectors) from weight decay
+    decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    no_decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [
+            {"params": decay_params, "weight_decay": CONFIG["training"]["weightDecay"]},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
         lr=CONFIG["training"]["learningRate"],
-        weight_decay=CONFIG["training"]["weightDecay"],
     )
 
     epochs = CONFIG["training"]["epochs"]
