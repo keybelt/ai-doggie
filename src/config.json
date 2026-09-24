@@ -9,14 +9,15 @@
             "seqLen": 303,
             "targetOffset": 215.75
         },
-        "epochs": 15,
+        "epochs": 100,
         "learningRate": 5e-4,
-        "maxGradNorm": 1.0,
+        "maxGradNorm": 10.0,
         "evalFreqSteps": 50,
         "weightDecay": 0.01,
         "warmupRatio": 0.03,
         "decayRatio": 0.07,
-        "minLrRatio": 0.01
+        "minLrRatio": 0.01,
+        "smoothL1Beta": 50.0
     },
     "frame": {
         "width": 640,
