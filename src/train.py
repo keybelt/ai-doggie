@@ -85,10 +85,9 @@ def log_diagnostics(
 ):
     with torch.no_grad():
         for name, param in model.named_parameters():
-            if not param.requires_grad or "weight" not in name:
+            if not param.requires_grad or param.ndim < 2:
                 continue
-            parts = name.rsplit(".", 1)
-            layer = parts[0] if len(parts) == 2 else name
+            layer = name.removesuffix(".weight").removesuffix("_weight")
             w_rms = (param.norm() / (param.numel() ** 0.5)).item()
             stats[f"weight_rms/{layer}"] = w_rms
             if name in grad_rms:
@@ -216,7 +215,7 @@ def main():
             if is_eval_step:
                 with torch.no_grad():
                     for name, param in model.named_parameters():
-                        if "bias" in name:
+                        if param.ndim < 2:
                             continue
                         if param.grad is not None:
                             grad_rms[name] = (param.grad.norm() / (param.grad.numel() ** 0.5)).item()
