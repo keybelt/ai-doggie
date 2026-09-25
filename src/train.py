@@ -22,9 +22,11 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 
 DEVICE = torch.device("mps")
-SMOOTH_L1_BETA = CONFIG["training"]["smoothL1Beta"]
 dynamic_cfg = CONFIG["training"]["dynamic"]
 MAX_HORIZON = dynamic_cfg["seqLen"]
+
+
+_GLOBAL_BEST_VAL_LOSS = float("inf")
 
 
 def load_dataset(h5_files: list[Path], max_horizon: int) -> TensorDataset:
@@ -94,9 +96,7 @@ def log_diagnostics(
                 stats[f"grad_rms/{layer}"] = grad_rms[name]
             if name in update_ratios:
                 stats[f"update_ratio/{layer}"] = update_ratios[name]
-        
-    if wandb.run:
-        wandb.log(stats)
+    wandb.log(stats)
 
 
 def measure_inference_latency(model: Model) -> float:
@@ -114,7 +114,7 @@ def measure_inference_latency(model: Model) -> float:
     return elapsed_ms
 
 
-def run_val(model: Model, val_loader: DataLoader) -> tuple[float, float]:
+def run_val(model: Model, val_loader: DataLoader, beta: float) -> tuple[float, float]:
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
@@ -125,7 +125,7 @@ def run_val(model: Model, val_loader: DataLoader) -> tuple[float, float]:
             targets = targets.to(DEVICE)
 
             preds = model(frames, states, actions).squeeze(-1)
-            val_loss += F.smooth_l1_loss(preds, targets, beta=SMOOTH_L1_BETA).item()
+            val_loss += F.smooth_l1_loss(preds, targets, beta=beta).item()
 
     avg_val_loss = val_loss / len(val_loader)
     inf_latency = measure_inference_latency(model)
@@ -133,6 +133,23 @@ def run_val(model: Model, val_loader: DataLoader) -> tuple[float, float]:
 
 
 def main():
+    global _GLOBAL_BEST_VAL_LOSS
+
+    wandb.init()
+    cfg = wandb.config
+
+    batch_size = cfg.batchSize
+    learning_rate = cfg.learningRate
+    weight_decay = cfg.weightDecay
+    smooth_l1_beta = cfg.smoothL1Beta
+    epochs = cfg.epochs
+    attn_dim = cfg.attnDim
+    num_heads = cfg.numHeads
+    warmup_ratio = cfg.warmupRatio
+    decay_ratio = cfg.decayRatio
+    min_lr_ratio = cfg.minLrRatio
+    max_grad_norm = cfg.maxGradNorm
+
     train_dir = PROJECT_ROOT / "data" / "train"
     val_dir = PROJECT_ROOT / "data" / "val"
     train_files = sorted(list(train_dir.glob("*.h5")))
@@ -141,7 +158,6 @@ def main():
     train_dataset = load_dataset(train_files, max_horizon=MAX_HORIZON)
     val_dataset = load_dataset(val_files, max_horizon=MAX_HORIZON)
 
-    batch_size = CONFIG["training"]["batchSize"]
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -153,7 +169,7 @@ def main():
         shuffle=False,
     )
 
-    model = Model().to(DEVICE)
+    model = Model(attn_dim=attn_dim, num_heads=num_heads).to(DEVICE)
 
     # Exclude 1D parameters (biases, normalization vectors) from weight decay
     decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
@@ -161,17 +177,15 @@ def main():
 
     optimizer = torch.optim.AdamW(
         [
-            {"params": decay_params, "weight_decay": CONFIG["training"]["weightDecay"]},
+            {"params": decay_params, "weight_decay": weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
         ],
-        lr=CONFIG["training"]["learningRate"],
+        lr=learning_rate,
     )
 
-    epochs = CONFIG["training"]["epochs"]
     total_steps = len(train_loader) * epochs
-    warmup_steps = int(total_steps * CONFIG["training"]["warmupRatio"])
-    decay_steps = int(total_steps * CONFIG["training"]["decayRatio"])
-    min_lr_ratio = CONFIG["training"]["minLrRatio"]
+    warmup_steps = int(total_steps * warmup_ratio)
+    decay_steps = int(total_steps * decay_ratio)
     eval_freq = CONFIG["training"]["evalFreqSteps"]
 
     scheduler = LambdaLR(
@@ -179,11 +193,6 @@ def main():
         lr_lambda=lambda s: get_lr_lambda(s, total_steps, warmup_steps, decay_steps, min_lr_ratio),
     )
 
-    wandb.init(
-        project="ai-doggie",
-        name=f"ftd training baby",
-        config=CONFIG["training"],
-    )
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
 
@@ -202,7 +211,7 @@ def main():
             targets = targets.to(DEVICE)
 
             preds = model(frames, states, actions).squeeze(-1)
-            loss = F.smooth_l1_loss(preds, targets, beta=SMOOTH_L1_BETA)
+            loss = F.smooth_l1_loss(preds, targets, beta=smooth_l1_beta)
             last_train_loss = loss.item()
 
             optimizer.zero_grad()
@@ -223,7 +232,7 @@ def main():
 
             total_grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
-                CONFIG["training"]["maxGradNorm"],
+                max_grad_norm,
             ).item()
 
             optimizer.step()
@@ -240,36 +249,48 @@ def main():
                             if w_rms > 0:
                                 update_ratios[name] = delta_rms / w_rms
 
-                val_loss, inf_latency = run_val(model, val_loader)
+                val_loss, inf_latency = run_val(model, val_loader, beta=smooth_l1_beta)
+
                 stats = {
-                    "train/loss": last_train_loss,
+                    "loss/train": last_train_loss,
                     "train/lr": scheduler.get_last_lr()[0],
                     "total_grad_norm": total_grad_norm,
-                    "val/loss": val_loss,
+                    "loss/val": val_loss,
                     "inf_latency_ms": inf_latency,
                     "epoch": global_step / len(train_loader),
                 }
                 log_diagnostics(model, stats, grad_rms, update_ratios)
                 model.train()
 
-    # Save model
-    final_val_loss, _ = run_val(model, val_loader)
+    # Final evaluation & checkpoint
+    final_val_loss, _ = run_val(model, val_loader, beta=smooth_l1_beta)
+
     ckpt_dir = PROJECT_ROOT / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    save_path = ckpt_dir / f"model_pretrain_{time.strftime('%Y%m%d_%H%M%S')}.pt"
-    checkpoint_data = {
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
-        "train_loss": last_train_loss,
-        "val_loss": final_val_loss,
-    }
-    torch.save(checkpoint_data, save_path)
-    print(f"\nModel checkpoint saved successfully to {save_path}\n")
+
+    if final_val_loss < _GLOBAL_BEST_VAL_LOSS:
+        _GLOBAL_BEST_VAL_LOSS = final_val_loss
+        best_save_path = ckpt_dir / "best_model.pt"
+        checkpoint_data = {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "train_loss": last_train_loss,
+            "val_loss": final_val_loss,
+            "config": dict(wandb.config),
+        }
+        torch.save(checkpoint_data, best_save_path)
+        print(f"\n[NEW BEST MODEL] Saved to {best_save_path} (val_loss: {final_val_loss:.4f})\n")
 
     wandb.finish()
 
 
 if __name__ == "__main__":
-    # raise Exception("dont forget to calc the seq len + deduplicate + find a good balance between dead and alive rollouts")
-    main()
+    sweep_cfg_file = CONFIG_PATH.parent / "sweep_config.json"
+    with sweep_cfg_file.open() as f:
+        sweep_cfg = json.load(f)
+    count = sweep_cfg.pop("count")
+    sweep_id = wandb.sweep(sweep_cfg, project="ai-doggie")
+    print(f"Sweep created with ID: {sweep_id}")
+    print(f"Starting agent ({count} iterations)...")
+    wandb.agent(sweep_id, function=main, count=count)
