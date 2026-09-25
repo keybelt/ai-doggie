@@ -1,8 +1,8 @@
 {
-    "name": "hparam_bayes_ablation",
+    "count": 80,
     "method": "bayes",
     "metric": {
-        "name": "best_val_loss",
+        "name": "loss/val",
         "goal": "minimize"
     },
     "parameters": {
